@@ -55,16 +55,16 @@ TEST_EXECS = \
   test_scheduler_cc
 
 # Setup parameters to build the library
-lib_LTLIBRARIES = libithe.la
-libithe_la_CFLAGS = $(AM_CFLAGS)
-libithe_la_CXXFLAGS = $(AM_CXXFLAGS)
-libithe_la_SOURCES = $(LIB_CFILES) $(LIB_HFILES)
-libithe_la_SOURCES += $(LIB_CXXFILES) $(LIB_HHFILES)
+lib_LTLIBRARIES = liblithe.la
+liblithe_la_CFLAGS = $(AM_CFLAGS)
+liblithe_la_CXXFLAGS = $(AM_CXXFLAGS)
+liblithe_la_SOURCES = $(LIB_CFILES) $(LIB_HFILES)
+liblithe_la_SOURCES += $(LIB_CXXFILES) $(LIB_HHFILES)
 if STATIC_ONLY 
-libithe_la_LIBADD = $(LPARLIB) -lpthread
-libithe_la_LDFLAGS = -all-static 
+liblithe_la_LIBADD = $(LPARLIB) -lpthread
+liblithe_la_LDFLAGS = -all-static 
 else
-libithe_la_LIBADD = $(LPARLIB)
+liblithe_la_LIBADD = $(LPARLIB)
 endif 
 
 # Setup a directory where all of the include files will be installed

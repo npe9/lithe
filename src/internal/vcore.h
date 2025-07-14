@@ -34,7 +34,7 @@ static inline void maybe_vcore_yield()
     cpu_relax();
 
   if (*flag && __sync_lock_test_and_set(flag, 0))
-    vcore_yield(false);
+    vcore_yield();
 }
 
 static inline void maybe_vcore_request(int k)

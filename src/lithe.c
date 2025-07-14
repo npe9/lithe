@@ -129,6 +129,7 @@ static __thread struct {
 
 void __attribute__((constructor)) lithe_lib_init()
 {
+  printf("LITHE: lib init\n"); fflush(stdout);
   init_once_racy(return);
 
   /* Create a lithe context for the main thread to run in */
@@ -395,6 +396,7 @@ void lithe_hart_grant(lithe_sched_t *child, void (*unlock_func) (void *), void *
 
 void lithe_hart_yield()
 {
+  printf("LITHE: hart yield\n"); fflush(stdout);
   assert(in_vcore_context());
   assert(current_sched);
   assert(current_sched != &base_sched);
@@ -461,6 +463,7 @@ static void __lithe_sched_enter(uthread_t *uthread, void *__arg)
 
 void lithe_sched_enter(lithe_sched_t *child)
 {
+  printf("LITHE: sched enter\n"); fflush(stdout);
   assert(!in_vcore_context());
   assert(current_sched);
   lithe_sched_t *parent = current_sched;
@@ -534,6 +537,7 @@ void __lithe_sched_exit(uthread_t *uthread, void *arg)
 
 void lithe_sched_exit()
 {
+  printf("LITHE: sched exit\n"); fflush(stdout);
   assert(!in_vcore_context());
   assert(current_sched);
 
@@ -705,6 +709,7 @@ int lithe_context_run(lithe_context_t *context)
 {
   assert(context);
   assert(in_vcore_context());
+  printf("LITHE: context run\n"); fflush(stdout);
 
   next_context = context;
   lithe_vcore_entry();
@@ -763,6 +768,7 @@ void lithe_context_yield()
   assert(!in_vcore_context());
   assert(current_sched);
   assert(current_context);
+  printf("LITHE: context yield\n"); fflush(stdout);
 
   uthread_yield(true, __lithe_context_yield, NULL);
 }
