@@ -154,18 +154,15 @@ am__objects_1 = src/liblithe_la-fatal.lo \
 	src/liblithe_la-futex.lo src/liblithe_la-mutex.lo \
 	src/liblithe_la-fork_join_sched.lo
 am__objects_2 =
-am__objects_3 = src/liblithe_la-sched.lo \
-	src/liblithe_la-context.lo
-am_liblithe_la_OBJECTS = $(am__objects_1) $(am__objects_2) \
-	$(am__objects_3) $(am__objects_2)
+am_liblithe_la_OBJECTS = $(am__objects_1) $(am__objects_2)
 liblithe_la_OBJECTS = $(am_liblithe_la_OBJECTS)
 AM_V_lt = $(am__v_lt_$(V))
 am__v_lt_ = $(am__v_lt_$(AM_DEFAULT_VERBOSITY))
 am__v_lt_0 = --silent
 am__v_lt_1 = 
-liblithe_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) \
-	$(LIBTOOLFLAGS) --mode=link $(CXXLD) $(liblithe_la_CXXFLAGS) \
-	$(CXXFLAGS) $(liblithe_la_LDFLAGS) $(LDFLAGS) -o $@
+liblithe_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) \
+	$(LIBTOOLFLAGS) --mode=link $(CCLD) $(liblithe_la_CFLAGS) \
+	$(CFLAGS) $(liblithe_la_LDFLAGS) $(LDFLAGS) -o $@
 am_test_cls_OBJECTS = tests/test_cls-test-cls.$(OBJEXT)
 test_cls_OBJECTS = $(am_test_cls_OBJECTS)
 test_cls_DEPENDENCIES = $(am__DEPENDENCIES_1)
@@ -267,14 +264,12 @@ depcomp = $(SHELL) $(top_srcdir)/build-aux/depcomp
 am__maybe_remake_depfiles = depfiles
 am__depfiles_remade = src/$(DEPDIR)/liblithe_la-barrier.Plo \
 	src/$(DEPDIR)/liblithe_la-condvar.Plo \
-	src/$(DEPDIR)/liblithe_la-context.Plo \
 	src/$(DEPDIR)/liblithe_la-defaults.Plo \
 	src/$(DEPDIR)/liblithe_la-fatal.Plo \
 	src/$(DEPDIR)/liblithe_la-fork_join_sched.Plo \
 	src/$(DEPDIR)/liblithe_la-futex.Plo \
 	src/$(DEPDIR)/liblithe_la-lithe.Plo \
 	src/$(DEPDIR)/liblithe_la-mutex.Plo \
-	src/$(DEPDIR)/liblithe_la-sched.Plo \
 	src/$(DEPDIR)/liblithe_la-semaphore.Plo \
 	tests/$(DEPDIR)/test-recursive-mutex.Po \
 	tests/$(DEPDIR)/test_cls-test-cls.Po \
@@ -410,13 +405,13 @@ AUTOMAKE = ${SHELL} /users/npe/src/lithe-docker/lithe/build-aux/missing automake
 AWK = gawk
 CC = gcc
 CCDEPMODE = depmode=gcc3
-CFLAGS = -g -O2 -I/tmp/parlib-install/include
+CFLAGS = -g -O2 -I/tmp/parlib-standard/include
 CPP = gcc -E
 CPPFLAGS = 
 CXX = g++
 CXXCPP = g++ -E
 CXXDEPMODE = depmode=gcc3
-CXXFLAGS = -g -O2 -I/tmp/parlib-install/include
+CXXFLAGS = -g -O2 -I/tmp/parlib-standard/include
 CYGPATH_W = echo
 DEFS = -DHAVE_CONFIG_H
 DEPDIR = .deps
@@ -436,7 +431,7 @@ INSTALL_PROGRAM = ${INSTALL}
 INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
 LD = /usr/bin/ld -m elf_x86_64
-LDFLAGS =  -L/tmp/parlib-install/lib
+LDFLAGS =  -L/tmp/parlib-standard/lib
 LIBOBJS = 
 LIBS = 
 LIBTOOL = $(SHELL) $(top_builddir)/libtool
@@ -503,22 +498,22 @@ htmldir = ${docdir}
 includedir = ${prefix}/include
 infodir = ${datarootdir}/info
 install_sh = ${SHELL} /users/npe/src/lithe-docker/lithe/build-aux/install-sh
-libdir = ${exec_prefix}/lib64
+libdir = ${exec_prefix}/lib
 libexecdir = ${exec_prefix}/libexec
 localedir = ${datarootdir}/locale
-localstatedir = /var
+localstatedir = ${prefix}/var
 mandir = ${datarootdir}/man
 mkdir_p = $(MKDIR_P)
 oldincludedir = /usr/include
 pdfdir = ${docdir}
-prefix = /usr
+prefix = /tmp/lithe-install
 program_transform_name = s,x,x,
 psdir = ${docdir}
 runstatedir = ${localstatedir}/run
 sbindir = ${exec_prefix}/sbin
-sharedstatedir = /var
+sharedstatedir = ${prefix}/com
 srcdir = .
-sysconfdir = /etc
+sysconfdir = ${prefix}/etc
 target_alias = 
 top_build_prefix = 
 top_builddir = .
@@ -583,9 +578,10 @@ TEST_EXECS = \
 lib_LTLIBRARIES = liblithe.la
 liblithe_la_CFLAGS = $(AM_CFLAGS)
 liblithe_la_CXXFLAGS = $(AM_CXXFLAGS)
-liblithe_la_SOURCES = $(LIB_CFILES) $(LIB_HFILES) $(LIB_CXXFILES) \
-	$(LIB_HHFILES)
+liblithe_la_SOURCES = $(LIB_CFILES) $(LIB_HFILES)
 liblithe_la_LIBADD = $(LPARLIB)
+# Exclude C++ files to make it a pure C library
+# liblithe_la_SOURCES += $(LIB_CXXFILES) $(LIB_HHFILES)
 #liblithe_la_LIBADD = $(LPARLIB) -lpthread
 #liblithe_la_LDFLAGS = -all-static 
 
@@ -767,13 +763,9 @@ src/liblithe_la-mutex.lo: src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
 src/liblithe_la-fork_join_sched.lo: src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
-src/liblithe_la-sched.lo: src/$(am__dirstamp) \
-	src/$(DEPDIR)/$(am__dirstamp)
-src/liblithe_la-context.lo: src/$(am__dirstamp) \
-	src/$(DEPDIR)/$(am__dirstamp)
 
 liblithe.la: $(liblithe_la_OBJECTS) $(liblithe_la_DEPENDENCIES) $(EXTRA_liblithe_la_DEPENDENCIES) 
-	$(AM_V_CXXLD)$(liblithe_la_LINK) -rpath $(libdir) $(liblithe_la_OBJECTS) $(liblithe_la_LIBADD) $(LIBS)
+	$(AM_V_CCLD)$(liblithe_la_LINK) -rpath $(libdir) $(liblithe_la_OBJECTS) $(liblithe_la_LIBADD) $(LIBS)
 tests/$(am__dirstamp):
 	@$(MKDIR_P) tests
 	@: > tests/$(am__dirstamp)
@@ -874,14 +866,12 @@ distclean-compile:
 
 include src/$(DEPDIR)/liblithe_la-barrier.Plo # am--include-marker
 include src/$(DEPDIR)/liblithe_la-condvar.Plo # am--include-marker
-include src/$(DEPDIR)/liblithe_la-context.Plo # am--include-marker
 include src/$(DEPDIR)/liblithe_la-defaults.Plo # am--include-marker
 include src/$(DEPDIR)/liblithe_la-fatal.Plo # am--include-marker
 include src/$(DEPDIR)/liblithe_la-fork_join_sched.Plo # am--include-marker
 include src/$(DEPDIR)/liblithe_la-futex.Plo # am--include-marker
 include src/$(DEPDIR)/liblithe_la-lithe.Plo # am--include-marker
 include src/$(DEPDIR)/liblithe_la-mutex.Plo # am--include-marker
-include src/$(DEPDIR)/liblithe_la-sched.Plo # am--include-marker
 include src/$(DEPDIR)/liblithe_la-semaphore.Plo # am--include-marker
 include tests/$(DEPDIR)/test-recursive-mutex.Po # am--include-marker
 include tests/$(DEPDIR)/test_cls-test-cls.Po # am--include-marker
@@ -1110,20 +1100,6 @@ tests/test_syscalls-test-syscalls.obj: tests/test-syscalls.c
 #	$(AM_V_CXX)source='$<' object='$@' libtool=yes \
 #	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
 #	$(AM_V_CXX_no)$(LTCXXCOMPILE) -c -o $@ $<
-
-src/liblithe_la-sched.lo: src/sched.cc
-	$(AM_V_CXX)$(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(liblithe_la_CXXFLAGS) $(CXXFLAGS) -MT src/liblithe_la-sched.lo -MD -MP -MF src/$(DEPDIR)/liblithe_la-sched.Tpo -c -o src/liblithe_la-sched.lo `test -f 'src/sched.cc' || echo '$(srcdir)/'`src/sched.cc
-	$(AM_V_at)$(am__mv) src/$(DEPDIR)/liblithe_la-sched.Tpo src/$(DEPDIR)/liblithe_la-sched.Plo
-#	$(AM_V_CXX)source='src/sched.cc' object='src/liblithe_la-sched.lo' libtool=yes \
-#	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
-#	$(AM_V_CXX_no)$(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(liblithe_la_CXXFLAGS) $(CXXFLAGS) -c -o src/liblithe_la-sched.lo `test -f 'src/sched.cc' || echo '$(srcdir)/'`src/sched.cc
-
-src/liblithe_la-context.lo: src/context.cc
-	$(AM_V_CXX)$(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(liblithe_la_CXXFLAGS) $(CXXFLAGS) -MT src/liblithe_la-context.lo -MD -MP -MF src/$(DEPDIR)/liblithe_la-context.Tpo -c -o src/liblithe_la-context.lo `test -f 'src/context.cc' || echo '$(srcdir)/'`src/context.cc
-	$(AM_V_at)$(am__mv) src/$(DEPDIR)/liblithe_la-context.Tpo src/$(DEPDIR)/liblithe_la-context.Plo
-#	$(AM_V_CXX)source='src/context.cc' object='src/liblithe_la-context.lo' libtool=yes \
-#	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
-#	$(AM_V_CXX_no)$(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(liblithe_la_CXXFLAGS) $(CXXFLAGS) -c -o src/liblithe_la-context.lo `test -f 'src/context.cc' || echo '$(srcdir)/'`src/context.cc
 
 tests/test_condvar_cc-test-condvar.o: tests/test-condvar.cc
 	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(test_condvar_cc_CXXFLAGS) $(CXXFLAGS) -MT tests/test_condvar_cc-test-condvar.o -MD -MP -MF tests/$(DEPDIR)/test_condvar_cc-test-condvar.Tpo -c -o tests/test_condvar_cc-test-condvar.o `test -f 'tests/test-condvar.cc' || echo '$(srcdir)/'`tests/test-condvar.cc
@@ -1539,14 +1515,12 @@ distclean: distclean-am
 	-rm -f $(am__CONFIG_DISTCLEAN_FILES)
 		-rm -f src/$(DEPDIR)/liblithe_la-barrier.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-condvar.Plo
-	-rm -f src/$(DEPDIR)/liblithe_la-context.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-defaults.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-fatal.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-fork_join_sched.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-futex.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-lithe.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-mutex.Plo
-	-rm -f src/$(DEPDIR)/liblithe_la-sched.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-semaphore.Plo
 	-rm -f tests/$(DEPDIR)/test-recursive-mutex.Po
 	-rm -f tests/$(DEPDIR)/test_cls-test-cls.Po
@@ -1610,14 +1584,12 @@ maintainer-clean: maintainer-clean-am
 	-rm -rf $(top_srcdir)/autom4te.cache
 		-rm -f src/$(DEPDIR)/liblithe_la-barrier.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-condvar.Plo
-	-rm -f src/$(DEPDIR)/liblithe_la-context.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-defaults.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-fatal.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-fork_join_sched.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-futex.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-lithe.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-mutex.Plo
-	-rm -f src/$(DEPDIR)/liblithe_la-sched.Plo
 	-rm -f src/$(DEPDIR)/liblithe_la-semaphore.Plo
 	-rm -f tests/$(DEPDIR)/test-recursive-mutex.Po
 	-rm -f tests/$(DEPDIR)/test_cls-test-cls.Po

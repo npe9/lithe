@@ -26,7 +26,9 @@ extern "C" {
  * default if not called manually.  It is portected to ensure taht it only runs
  * once, no matter how many times it is called.
  */
-void __attribute__((constructor)) lithe_lib_init();
+void lithe_lib_init();
+void lithe_lib_init_complete(lithe_context_t *context);
+void lithe_lib_init_real();
 
 /**
  * Passes control to a new child scheduler. The 'funcs' field and

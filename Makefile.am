@@ -59,7 +59,8 @@ lib_LTLIBRARIES = liblithe.la
 liblithe_la_CFLAGS = $(AM_CFLAGS)
 liblithe_la_CXXFLAGS = $(AM_CXXFLAGS)
 liblithe_la_SOURCES = $(LIB_CFILES) $(LIB_HFILES)
-liblithe_la_SOURCES += $(LIB_CXXFILES) $(LIB_HHFILES)
+# Exclude C++ files to make it a pure C library
+# liblithe_la_SOURCES += $(LIB_CXXFILES) $(LIB_HHFILES)
 if STATIC_ONLY 
 liblithe_la_LIBADD = $(LPARLIB) -lpthread
 liblithe_la_LDFLAGS = -all-static 

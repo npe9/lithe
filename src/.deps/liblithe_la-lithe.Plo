@@ -19,8 +19,8 @@ src/liblithe_la-lithe.lo: src/lithe.c /usr/include/stdc-predef.h \
  /usr/include/bits/floatn-common.h /usr/include/bits/stdio.h \
  /usr/include/string.h /usr/include/bits/types/locale_t.h \
  /usr/include/bits/types/__locale_t.h /usr/include/strings.h \
- /tmp/parlib-install/include/parlib/parlib.h \
- /tmp/parlib-install/include/parlib/common.h \
+ /tmp/parlib-standard/include/parlib/parlib.h \
+ /tmp/parlib-standard/include/parlib/common.h \
  /usr/lib/gcc/x86_64-redhat-linux/11/include/stdint.h \
  /usr/include/stdint.h /usr/include/bits/wchar.h \
  /usr/include/bits/stdint-intn.h /usr/include/bits/stdint-uintn.h \
@@ -43,9 +43,9 @@ src/liblithe_la-lithe.lo: src/lithe.c /usr/include/stdc-predef.h \
  /usr/include/bits/environments.h /usr/include/bits/confname.h \
  /usr/include/bits/getopt_posix.h /usr/include/bits/getopt_core.h \
  /usr/include/bits/unistd_ext.h /usr/include/sys/time.h \
- /tmp/parlib-install/include/parlib/parlib-config.h \
- /tmp/parlib-install/include/parlib/atomic.h \
- /tmp/parlib-install/include/parlib/arch.h /usr/include/asm/prctl.h \
+ /tmp/parlib-standard/include/parlib/parlib-config.h \
+ /tmp/parlib-standard/include/parlib/atomic.h \
+ /tmp/parlib-standard/include/parlib/arch.h /usr/include/asm/prctl.h \
  /usr/include/sys/prctl.h /usr/include/linux/prctl.h \
  /usr/include/linux/types.h /usr/include/asm/types.h \
  /usr/include/asm-generic/types.h /usr/include/asm-generic/int-ll64.h \
@@ -53,9 +53,9 @@ src/liblithe_la-lithe.lo: src/lithe.c /usr/include/stdc-predef.h \
  /usr/include/linux/posix_types.h /usr/include/linux/stddef.h \
  /usr/include/asm/posix_types.h /usr/include/asm/posix_types_64.h \
  /usr/include/asm-generic/posix_types.h \
- /tmp/parlib-install/include/parlib/context.h \
- /tmp/parlib-install/include/parlib/ucontext.h \
- /tmp/parlib-install/include/parlib/vcore.h /usr/include/sys/param.h \
+ /tmp/parlib-standard/include/parlib/context.h \
+ /tmp/parlib-standard/include/parlib/ucontext.h \
+ /tmp/parlib-standard/include/parlib/vcore.h /usr/include/sys/param.h \
  /usr/lib/gcc/x86_64-redhat-linux/11/include/limits.h \
  /usr/lib/gcc/x86_64-redhat-linux/11/include/syslimits.h \
  /usr/include/limits.h /usr/include/bits/posix1_lim.h \
@@ -75,16 +75,16 @@ src/liblithe_la-lithe.lo: src/lithe.c /usr/include/stdc-predef.h \
  /usr/include/bits/signal_ext.h /usr/include/bits/param.h \
  /usr/include/linux/param.h /usr/include/asm/param.h \
  /usr/include/asm-generic/param.h \
- /tmp/parlib-install/include/parlib/tls.h \
- /tmp/parlib-install/include/parlib/export.h \
- /tmp/parlib-install/include/parlib/event.h \
- /tmp/parlib-install/include/parlib/uthread.h \
- /tmp/parlib-install/include/parlib/mcs.h \
- /tmp/parlib-install/include/parlib/dtls.h \
- /tmp/parlib-install/include/parlib/spinlock.h src/lithe.h src/sched.h \
+ /tmp/parlib-standard/include/parlib/tls.h \
+ /tmp/parlib-standard/include/parlib/export.h \
+ /tmp/parlib-standard/include/parlib/event.h \
+ /tmp/parlib-standard/include/parlib/uthread.h \
+ /tmp/parlib-standard/include/parlib/mcs.h \
+ /tmp/parlib-standard/include/parlib/dtls.h \
+ /tmp/parlib-standard/include/parlib/spinlock.h src/lithe.h src/sched.h \
  src/context.h /usr/include/sys/queue.h \
- /tmp/parlib-install/include/parlib/uthread.h src/hart.h \
- /tmp/parlib-install/include/parlib/vcore.h src/fatal.h \
+ /tmp/parlib-standard/include/parlib/uthread.h src/hart.h \
+ /tmp/parlib-standard/include/parlib/vcore.h src/fatal.h \
  src/internal/assert.h /usr/include/assert.h src/internal/vcore.h \
  src/internal/assert.h
 /usr/include/stdc-predef.h:
@@ -124,8 +124,8 @@ src/liblithe_la-lithe.lo: src/lithe.c /usr/include/stdc-predef.h \
 /usr/include/bits/types/locale_t.h:
 /usr/include/bits/types/__locale_t.h:
 /usr/include/strings.h:
-/tmp/parlib-install/include/parlib/parlib.h:
-/tmp/parlib-install/include/parlib/common.h:
+/tmp/parlib-standard/include/parlib/parlib.h:
+/tmp/parlib-standard/include/parlib/common.h:
 /usr/lib/gcc/x86_64-redhat-linux/11/include/stdint.h:
 /usr/include/stdint.h:
 /usr/include/bits/wchar.h:
@@ -166,9 +166,9 @@ src/liblithe_la-lithe.lo: src/lithe.c /usr/include/stdc-predef.h \
 /usr/include/bits/getopt_core.h:
 /usr/include/bits/unistd_ext.h:
 /usr/include/sys/time.h:
-/tmp/parlib-install/include/parlib/parlib-config.h:
-/tmp/parlib-install/include/parlib/atomic.h:
-/tmp/parlib-install/include/parlib/arch.h:
+/tmp/parlib-standard/include/parlib/parlib-config.h:
+/tmp/parlib-standard/include/parlib/atomic.h:
+/tmp/parlib-standard/include/parlib/arch.h:
 /usr/include/asm/prctl.h:
 /usr/include/sys/prctl.h:
 /usr/include/linux/prctl.h:
@@ -183,9 +183,9 @@ src/liblithe_la-lithe.lo: src/lithe.c /usr/include/stdc-predef.h \
 /usr/include/asm/posix_types.h:
 /usr/include/asm/posix_types_64.h:
 /usr/include/asm-generic/posix_types.h:
-/tmp/parlib-install/include/parlib/context.h:
-/tmp/parlib-install/include/parlib/ucontext.h:
-/tmp/parlib-install/include/parlib/vcore.h:
+/tmp/parlib-standard/include/parlib/context.h:
+/tmp/parlib-standard/include/parlib/ucontext.h:
+/tmp/parlib-standard/include/parlib/vcore.h:
 /usr/include/sys/param.h:
 /usr/lib/gcc/x86_64-redhat-linux/11/include/limits.h:
 /usr/lib/gcc/x86_64-redhat-linux/11/include/syslimits.h:
@@ -221,20 +221,20 @@ src/liblithe_la-lithe.lo: src/lithe.c /usr/include/stdc-predef.h \
 /usr/include/linux/param.h:
 /usr/include/asm/param.h:
 /usr/include/asm-generic/param.h:
-/tmp/parlib-install/include/parlib/tls.h:
-/tmp/parlib-install/include/parlib/export.h:
-/tmp/parlib-install/include/parlib/event.h:
-/tmp/parlib-install/include/parlib/uthread.h:
-/tmp/parlib-install/include/parlib/mcs.h:
-/tmp/parlib-install/include/parlib/dtls.h:
-/tmp/parlib-install/include/parlib/spinlock.h:
+/tmp/parlib-standard/include/parlib/tls.h:
+/tmp/parlib-standard/include/parlib/export.h:
+/tmp/parlib-standard/include/parlib/event.h:
+/tmp/parlib-standard/include/parlib/uthread.h:
+/tmp/parlib-standard/include/parlib/mcs.h:
+/tmp/parlib-standard/include/parlib/dtls.h:
+/tmp/parlib-standard/include/parlib/spinlock.h:
 src/lithe.h:
 src/sched.h:
 src/context.h:
 /usr/include/sys/queue.h:
-/tmp/parlib-install/include/parlib/uthread.h:
+/tmp/parlib-standard/include/parlib/uthread.h:
 src/hart.h:
-/tmp/parlib-install/include/parlib/vcore.h:
+/tmp/parlib-standard/include/parlib/vcore.h:
 src/fatal.h:
 src/internal/assert.h:
 /usr/include/assert.h:
