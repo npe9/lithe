@@ -121,13 +121,13 @@ static __thread struct {
    * functions without using arguments */
   void *vcore_data;
 
-} lithe_tls = {NULL, NULL, NULL};
+} lithe_tls __attribute__((tls_model("initial-exec"))) = {NULL, NULL, NULL};
 #define next_context     (lithe_tls.next_context)
 #define current_sched    (lithe_tls.current_sched)
 #define vcore_data       (lithe_tls.vcore_data)
 #define current_context  ((lithe_context_t*)current_uthread)
 
-void __attribute__((constructor)) lithe_lib_init()
+void __attribute__((constructor(98))) lithe_lib_init()
 {
   init_once_racy(return);
 
@@ -774,5 +774,11 @@ void lithe_context_exit()
   assert(current_context);
 
   uthread_yield(false, __lithe_context_finished, NULL);
+}
+
+extern void uthread_default_vcore_entry(void);
+__attribute__((weak)) void vcore_entry(void)
+{
+  uthread_default_vcore_entry();
 }
 
