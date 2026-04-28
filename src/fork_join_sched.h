@@ -97,6 +97,13 @@ void lithe_fork_join_context_destroy(lithe_fork_join_context_t *context);
 void lithe_fork_join_sched_join_one(lithe_fork_join_sched_t *sched);
 void lithe_fork_join_sched_join_all(lithe_fork_join_sched_t *sched);
 
+/* Move a fork-join context between schedulers, updating runnable queues and
+ * num_contexts. Required when re-homing OpenMP workers: lithe_context_reassociate
+ * alone leaves stale TAILQ links on the old sched's per-vcore queues. */
+void lithe_fork_join_context_migrate(lithe_fork_join_sched_t *from,
+                                     lithe_fork_join_sched_t *to,
+                                     lithe_fork_join_context_t *ctx);
+
 /* Callback implementations that can be used by schedulers that "inherit" from
  * the lithe_fork_join_sched. */
 void lithe_fork_join_sched_hart_request(lithe_sched_t *__this,

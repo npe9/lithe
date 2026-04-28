@@ -5,10 +5,44 @@
  */
 
 #include <sys/mman.h>
+#include <stdlib.h>
 #include <parlib/waitfreelist.h>
+#include <parlib/reactor.h>
 #include "fork_join_sched.h"
 #include "lithe.h"
 #include "internal/assert.h"
+
+/* The legacy per-vcore nanosleep idle backoff is gone. Reasoning (per
+ * user directive: "the nanosleeps are wrong, a non-schedulable context
+ * should just wait. there should be a way for the scheduler to poll
+ * for system calls that have finished and serve the continuation that
+ * way."):
+ *
+ *   - nanosleep is the wrong primitive. Either we wait too long
+ *     (stalls MPI progress, ~37x slowdown observed at 200us) or we
+ *     wake too often (scheduler thrash, ~120x slowdown observed at
+ *     10us).
+ *   - The right primitive is epoll_wait on the parlib reactor. The
+ *     kernel parks the vcore pthread until EITHER a parked uthread's
+ *     fd fires OR a sibling vcore writes wake_efd (new context queued
+ *     or hart request from a child sched). Wakeup latency is one
+ *     syscall; idle cost is zero CPU.
+ *   - hart_enter handles the wait directly via parlib_reactor_drive.
+ *     There's no fallback path that uses nanosleep.
+ *
+ * lithe_fork_join_set_idle_nanosleep_usec is retained as a no-op for
+ * ABI compatibility with callers in OMPI's MPI_Finalize teardown that
+ * historically twiddled this knob. The argument is silently ignored. */
+void lithe_fork_join_set_idle_nanosleep_usec(long us)
+{
+    (void)us;
+}
+
+static inline void fjs_reactor_poll(void)
+{
+	if (parlib_reactor_initialized())
+		(void)parlib_reactor_drive(0);
+}
 
 static struct wfl sched_zombie_list = WFL_INITIALIZER(sched_zombie_list);
 static struct wfl context_zombie_list = WFL_INITIALIZER(context_zombie_list);
@@ -60,16 +94,14 @@ static void __ctx_free(lithe_fork_join_context_t *ctx)
 	}
 }
 
-static int get_next_queue_id()
+static int get_next_queue_id_for(lithe_fork_join_sched_t *sched)
 {
-	lithe_fork_join_sched_t *sched = (void *)lithe_sched_current();
-
 	/* Find the next available core from our list of online cores. */
 	int id, next_id;
 	while (1) {
 		id = sched->next_queue_id;
 		next_id = id + 1 == max_vcores() ? 0 : id + 1;
-		while (!vconline(next_id) && next_id != id)
+		while (!vconline_s(sched, next_id) && next_id != id)
 			next_id = next_id + 1 == max_vcores() ? 0 : next_id + 1;
 
 		if (__sync_bool_compare_and_swap(&sched->next_queue_id, id, next_id))
@@ -78,30 +110,52 @@ static int get_next_queue_id()
 	}
 }
 
+static int get_next_queue_id()
+{
+	lithe_fork_join_sched_t *sched = (void *)lithe_sched_current();
+	return get_next_queue_id_for(sched);
+}
+
+static int __thread_enqueue_on(lithe_fork_join_sched_t *sched,
+                               lithe_fork_join_context_t *ctx, bool athead)
+{
+	assert(ctx->context.sched == (lithe_sched_t *)sched);
+	ctx->state = FJS_CTX_RUNNABLE;
+
+	if (ctx->preferred_vcq == -1 || !vconline_s(sched, ctx->preferred_vcq))
+		ctx->preferred_vcq = get_next_queue_id_for(sched);
+
+	int vcoreid = ctx->preferred_vcq;
+	spin_pdr_lock(&tqlock_s(sched, vcoreid));
+	if (athead)
+		TAILQ_INSERT_HEAD(&tqueue_s(sched, vcoreid), &ctx->context, link);
+	else
+		TAILQ_INSERT_TAIL(&tqueue_s(sched, vcoreid), &ctx->context, link);
+	tqsize_s(sched, vcoreid)++;
+	spin_pdr_unlock(&tqlock_s(sched, vcoreid));
+
+	return vcoreid;
+}
+
 static int __thread_enqueue(lithe_fork_join_context_t *ctx, bool athead)
 {
 	assert(lithe_sched_current() == ctx->context.sched);
-	ctx->state = FJS_CTX_RUNNABLE;
-
-	if (ctx->preferred_vcq == -1 || !vconline(ctx->preferred_vcq))
-		ctx->preferred_vcq = get_next_queue_id();
-
-	int vcoreid = ctx->preferred_vcq;
-	spin_pdr_lock(&tqlock(vcoreid));
-	if (athead)
-		TAILQ_INSERT_HEAD(&tqueue(vcoreid), &ctx->context, link);
-	else
-		TAILQ_INSERT_TAIL(&tqueue(vcoreid), &ctx->context, link);
-	tqsize(vcoreid)++;
-	spin_pdr_unlock(&tqlock(vcoreid));
-
-	return vcoreid;
+	return __thread_enqueue_on((lithe_fork_join_sched_t *)ctx->context.sched,
+	                           ctx, athead);
 }
 
 static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 {
 	__thread_enqueue(ctx, athead);
 	lithe_hart_request(1);
+	/* Wake any sibling vcore parked in parlib_reactor_drive(-1). lithe's
+	 * own hart-grant pathway would normally do this via the parent
+	 * scheduler's kernel-level wakeup, but a vcore parked in epoll_wait
+	 * doesn't see those signals. The wake_efd registered in the central
+	 * reactor pops them out so they can pick up the work we just queued
+	 * (or yield the hart back to the parent if we get there first). */
+	if (parlib_reactor_pending() > 0)
+		parlib_reactor_wake();
 }
 
 static lithe_fork_join_context_t *__thread_dequeue()
@@ -264,6 +318,8 @@ void lithe_fork_join_context_init(lithe_fork_join_sched_t *sched,
   }
 
   lithe_context_init(&ctx->context, start_routine_wrapper, ctx);
+  /* lithe_context_init binds TLS current_sched; workers must belong to this FJ sched. */
+  lithe_context_reassociate(&ctx->context, &sched->sched);
   __sync_fetch_and_add(&sched->num_contexts, 1);
   schedule_context(ctx, false);
 }
@@ -293,6 +349,51 @@ static void block_main_context(lithe_context_t *c, void *arg)
 void lithe_fork_join_sched_join_all(lithe_fork_join_sched_t *sched)
 {
   lithe_context_block(block_main_context, sched);
+}
+
+void lithe_fork_join_context_migrate(lithe_fork_join_sched_t *from,
+                                     lithe_fork_join_sched_t *to,
+                                     lithe_fork_join_context_t *ctx)
+{
+	lithe_context_t *c;
+	int i;
+	int found;
+
+	if (!from || !to || !ctx || from == to)
+		return;
+	if (ctx->context.sched != (lithe_sched_t *)from)
+		return;
+
+	/* Runnable contexts live on from's per-vcore run queues; remove first. */
+	if (ctx->state == FJS_CTX_RUNNABLE) {
+		found = 0;
+		for (i = 0; i < max_vcores(); i++) {
+			spin_pdr_lock(&tqlock_s(from, i));
+			TAILQ_FOREACH(c, &tqueue_s(from, i), link) {
+				if (c == &ctx->context) {
+					TAILQ_REMOVE(&tqueue_s(from, i), c, link);
+					tqsize_s(from, i)--;
+					found = 1;
+					break;
+				}
+			}
+			spin_pdr_unlock(&tqlock_s(from, i));
+			if (found)
+				break;
+		}
+		assert(found && "migrate: RUNNABLE context not on from's queues");
+	}
+
+	__sync_fetch_and_add(&from->num_contexts, -1);
+	lithe_context_reassociate(&ctx->context, &to->sched);
+	__sync_fetch_and_add(&to->num_contexts, 1);
+
+	if (ctx->state == FJS_CTX_RUNNABLE) {
+		__thread_enqueue_on(to, ctx, false);
+		/* lithe_hart_request() uses lithe_sched_current() as the child; caller
+		 * must request harts after lithe_sched_enter(to) when migrating from
+		 * outside `to`. */
+	}
 }
 
 void lithe_fork_join_sched_hart_request(lithe_sched_t *__this,
@@ -362,6 +463,12 @@ void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
   if (!vconline(vcore_id()))
     vconline(vcore_id()) = true;
 
+restart:
+  /* Scheduler-driven netpoll: drain completed fd waits before selecting the
+   * next continuation. This keeps I/O readiness in the normal Lithe handoff
+   * path instead of requiring a helper pthread. */
+  fjs_reactor_poll();
+
   /* If I have any outstanding requests from my children, preferentially pass
    * this hart down to them. */
   if (!TAILQ_EMPTY(&sched->child_sched_list)) {
@@ -395,6 +502,7 @@ void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
   }
 
   /* Otherwise, if I have any contexts to run, grab one and run it. */
+  fjs_reactor_poll();
   lithe_fork_join_context_t *ctx = __thread_dequeue();
   if (ctx != NULL) {
     assert(ctx->state == FJS_CTX_RUNNABLE);
@@ -402,7 +510,15 @@ void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
     lithe_context_run(&ctx->context);
   }
 
-  /* Otherwise, yield. */
+  /* No runnable contexts. If any continuations are parked on fd readiness,
+   * this scheduler handoff blocks the vcore in epoll_wait until an fd fires
+   * or the reactor wake fd is poked by a newly-runnable context, then loops
+   * back through the full scheduler decision path. */
+  while (parlib_reactor_pending() > 0) {
+    (void)parlib_reactor_drive(-1);
+    goto restart;
+  }
+
   vconline(vcore_id()) = false;
   lithe_hart_yield();
 }

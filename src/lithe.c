@@ -13,11 +13,13 @@
 #endif
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
 #include <parlib/parlib.h>
+#include <parlib/reactor.h>
 #include "lithe.h"
 #include "fatal.h"
 #include "internal/assert.h"
@@ -127,10 +129,10 @@ static __thread struct {
 #define vcore_data       (lithe_tls.vcore_data)
 #define current_context  ((lithe_context_t*)current_uthread)
 
-void __attribute__((constructor(98))) lithe_lib_init()
-{
-  init_once_racy(return);
+static pthread_once_t lithe_lib_once = PTHREAD_ONCE_INIT;
 
+static void lithe_lib_init_impl(void)
+{
   /* Create a lithe context for the main thread to run in */
   lithe_context_t *context = &lithe_main_context;
   assert(context);
@@ -140,6 +142,15 @@ void __attribute__((constructor(98))) lithe_lib_init()
 
   /* Publish our sched_ops, overriding the defaults */
   sched_ops = &lithe_sched_ops;
+
+  /* Tell the parlib I/O reactor how to wake a uthread. The default
+   * (uthread_runnable) bypasses lithe's per-context scheduler routing,
+   * which trips FJS's "current_sched == ctx->sched" assertion in
+   * context_unblock when the draining vcore is running a different
+   * scheduler than the parked uthread. lithe_context_unblock already
+   * does the correct current_sched swap (see line ~758 of this file). */
+  parlib_reactor_set_unblock_fn(
+      (parlib_reactor_unblock_fn_t)lithe_context_unblock);
 
   /* Handle syscall events. */
   /* These functions are declared in parlib for simulating async syscalls on linux */
@@ -158,6 +169,11 @@ void __attribute__((constructor(98))) lithe_lib_init()
   /* Now that the library is initialized, a TLS should be set up for this
    * context, so set some of it */
   uthread_set_tls_var(&context->uth, current_sched, &base_sched);
+}
+
+void __attribute__((constructor(98))) lithe_lib_init()
+{
+  pthread_once(&lithe_lib_once, lithe_lib_init_impl);
 }
 
 static void __attribute__((noreturn)) __lithe_sched_reenter()
@@ -221,7 +237,11 @@ static void lithe_thread_runnable(uthread_t *uthread)
 
 static void lithe_thread_paused(struct uthread *uthread)
 {
-  uthread_runnable(uthread);
+  assert(uthread);
+  assert(current_sched);
+  assert(current_sched->funcs);
+  assert(current_sched->funcs->context_yield);
+  current_sched->funcs->context_yield(current_sched, (lithe_context_t*)uthread);
 }
 
 static void lithe_thread_has_blocked(struct uthread *uthread, int flags)
@@ -339,8 +359,23 @@ static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h
   assert(root_sched == child);
 
   __sync_fetch_and_add(&root_sched_harts_needed, h);
-  if (h > 0)
+  if (h > 0) {
+    /* Wake any vcore parked in parlib_reactor_drive(-1). The maybe_vcore_request
+     * path below only notices spinning vcores (via the wake_me_up flag set
+     * inside maybe_vcore_yield) and otherwise asks the kernel for a brand-new
+     * vcore. With the I/O reactor in place, idle vcores park in epoll_wait
+     * instead of spinning, so they need a separate poke (wake_efd write) to
+     * notice that someone wants harts. Without this, PMIx/libevent wireup
+     * deadlocks: the libevent progress uthread parks waiting for socket
+     * readiness, the daemon replies, the reactor sees fd ready and calls
+     * uthread_runnable -> schedule_context -> lithe_hart_request -> here.
+     * The fresh vcore from vcore_request(1) below picks up the work, but
+     * any already-running vcores parked in reactor_drive don't, so we burn
+     * extra OS pthreads on every wireup. parlib_reactor_wake() is a single
+     * eventfd write — cheap. */
+    parlib_reactor_wake();
     maybe_vcore_request(h);
+  }
 }
 
 static void base_context_block(lithe_sched_t *__this, lithe_context_t *context)

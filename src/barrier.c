@@ -84,9 +84,10 @@ void lithe_barrier_wait(lithe_barrier_t *barrier)
   
   /* wait for remaining to arrive */
   else {
-    /* spin for MAXSTALLS to wait for minor load imbalance */
-    /* release hart afterwards to avoid deadlock */
-    const int MAXSTALLS = 1000;
+    /* Spin only when the barrier is not oversubscribed. With more contexts
+     * than vcores, spinning burns the harts that should run the missing
+     * arrivals; parking lets the scheduler make progress. */
+    const int MAXSTALLS = (barrier->N <= max_vcores()) ? 1000 : 0;
     int nstalls = 0;
     while (barrier->signals[id].val == wait) { 
       nstalls++;

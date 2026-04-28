@@ -11,7 +11,6 @@
 #ifndef LITHE_H
 #define LITHE_H
 
-#include <stdarg.h>
 #include <parlib/parlib.h>
 #include "sched.h"
 #include "context.h"
