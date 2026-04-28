@@ -130,6 +130,7 @@ static __thread struct {
 #define current_context  ((lithe_context_t*)current_uthread)
 
 static pthread_once_t lithe_lib_once = PTHREAD_ONCE_INIT;
+static bool lithe_initialized = false;
 
 static void lithe_lib_init_impl(void)
 {
@@ -158,17 +159,69 @@ static void lithe_lib_init_impl(void)
 
   /* Once we have set things up for the main context, initialize the uthread
    * library with that main context */
-  uthread_lib_init(&context->uth);
+  /* Don't initialize uthread during library loading - wait for explicit initialization */
+  /* uthread_lib_init(&context->uth); */
 
   /* Fill in the main context stack info. */
   parlib_get_main_stack(&context->stack.bottom, &context->stack.size);
 
   /* Initialize vcore request/yield data structures */
-  lithe_vcore_init();
+  /* Don't initialize vcore during library loading - wait for explicit initialization */
+  /* lithe_vcore_init(); */
 
   /* Now that the library is initialized, a TLS should be set up for this
    * context, so set some of it */
   uthread_set_tls_var(&context->uth, current_sched, &base_sched);
+  
+  lithe_initialized = true;
+}
+
+void lithe_lib_init_complete(lithe_context_t *context)
+{
+  /* Complete the initialization that was deferred during library loading */
+  uthread_lib_init(&context->uth);
+  lithe_vcore_init();
+}
+
+void lithe_lib_init_real()
+{
+  if (lithe_initialized) {
+    return;
+  }
+  printf("LITHE: real lib init\n"); fflush(stdout);
+  init_once_racy(return);
+
+  /* Create a lithe context for the main thread to run in */
+  lithe_context_t *context = &lithe_main_context;
+  assert(context);
+
+  /* Set the scheduler associated with the context to be the base scheduler */
+  context->sched = &base_sched;
+
+  /* Publish our sched_ops, overriding the defaults */
+  sched_ops = &lithe_sched_ops;
+
+  /* Handle syscall events. */
+  /* These functions are declared in parlib for simulating async syscalls on linux */
+  ev_handlers[EV_SYSCALL] = lithe_handle_syscall;
+
+  /* Once we have set things up for the main context, initialize the uthread
+   * library with that main context */
+  /* Don't initialize uthread during library loading - wait for explicit initialization */
+  /* uthread_lib_init(&context->uth); */
+
+  /* Fill in the main context stack info. */
+  parlib_get_main_stack(&context->stack.bottom, &context->stack.size);
+
+  /* Initialize vcore request/yield data structures */
+  /* Don't initialize vcore during library loading - wait for explicit initialization */
+  /* lithe_vcore_init(); */
+
+  /* Now that the library is initialized, a TLS should be set up for this
+   * context, so set some of it */
+  uthread_set_tls_var(&context->uth, current_sched, &base_sched);
+  
+  lithe_initialized = true;
 }
 
 void __attribute__((constructor(98))) lithe_lib_init()
@@ -430,6 +483,7 @@ void lithe_hart_grant(lithe_sched_t *child, void (*unlock_func) (void *), void *
 
 void lithe_hart_yield()
 {
+  printf("LITHE: hart yield\n"); fflush(stdout);
   assert(in_vcore_context());
   assert(current_sched);
   assert(current_sched != &base_sched);
@@ -496,6 +550,7 @@ static void __lithe_sched_enter(uthread_t *uthread, void *__arg)
 
 void lithe_sched_enter(lithe_sched_t *child)
 {
+  printf("LITHE: sched enter\n"); fflush(stdout);
   assert(!in_vcore_context());
   assert(current_sched);
   lithe_sched_t *parent = current_sched;
@@ -569,6 +624,7 @@ void __lithe_sched_exit(uthread_t *uthread, void *arg)
 
 void lithe_sched_exit()
 {
+  printf("LITHE: sched exit\n"); fflush(stdout);
   assert(!in_vcore_context());
   assert(current_sched);
 
@@ -740,6 +796,7 @@ int lithe_context_run(lithe_context_t *context)
 {
   assert(context);
   assert(in_vcore_context());
+  printf("LITHE: context run\n"); fflush(stdout);
 
   next_context = context;
   lithe_vcore_entry();
@@ -798,6 +855,7 @@ void lithe_context_yield()
   assert(!in_vcore_context());
   assert(current_sched);
   assert(current_context);
+  printf("LITHE: context yield\n"); fflush(stdout);
 
   uthread_yield(true, __lithe_context_yield, NULL);
 }
