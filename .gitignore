@@ -17,3 +17,26 @@ build-aux/depcomp
 build-aux/install-sh
 build-aux/ltmain.sh
 build-aux/missing
+
+# --- In-tree `./configure && make` outputs (keep git pull/rebase usable) ---
+/Makefile
+/config.h
+/config.log
+/config.status
+/libtool
+/stamp-h1
+*.la
+*.lo
+*.o
+*.a
+.libs/
+.deps/
+**/.deps/
+**/.libs/
+**/.dirstamp
+# libtool names generated sources per dir
+**/lib*_la-*.lo
+**/lib*_la-*.o
+config.h.in~
+# Autoconf mkdtemp dirs like confk0qTCw (must not match /configure — fourth char is i)
+/conf[!i]*
