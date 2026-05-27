@@ -24,20 +24,45 @@
  * non-trivial slice of vcore_entry / __lithe_sched_reenter / lithe_hart_yield
  * (cf. the post-getenv-cache flame at 4N x 384 r).
  *
- * Mitigation: before yielding, do a bounded round of cpu_relax-with-checks.
+ * Mitigation: before yielding, do an adaptive round of cpu_relax-with-checks.
  * If the runqueue, child sched list, or reactor becomes non-empty we jump
- * back into the scheduler decision path; otherwise we yield. The spin is
- * tunable via LITHE_FJS_HART_ENTER_SPIN_LOOPS (default 1024 ~ a few us at
- * modern PAUSE rates; 0 disables the spin entirely and restores the prior
- * behavior of an immediate yield). The wait_freelist / reactor_pending /
- * tail head checks are all single-load fast paths.
+ * back into the scheduler decision path; otherwise we yield. Per-vcore
+ * adaptive counter (fjs_hart_enter_spin_cur[vcore_id()]) shrinks when the
+ * spin failed (we had to yield anyway -- the spin was wasted work) and
+ * grows when the spin succeeded (the next event arrived quickly -- worth
+ * spinning longer). Bounded to LITHE_FJS_HART_ENTER_SPIN_MIN/_MAX and
+ * initialized to LITHE_FJS_HART_ENTER_SPIN_LOOPS. Setting
+ * LITHE_FJS_HART_ENTER_SPIN_LOOPS=0 disables the spin entirely (the loop is
+ * skipped and we yield immediately, restoring the prior behavior).
  */
 #ifndef LITHE_FJS_HART_ENTER_SPIN_LOOPS_DEFAULT
-#define LITHE_FJS_HART_ENTER_SPIN_LOOPS_DEFAULT 1024
+#define LITHE_FJS_HART_ENTER_SPIN_LOOPS_DEFAULT 1024u
+#endif
+#ifndef LITHE_FJS_HART_ENTER_SPIN_MIN_DEFAULT
+#define LITHE_FJS_HART_ENTER_SPIN_MIN_DEFAULT 64u
+#endif
+#ifndef LITHE_FJS_HART_ENTER_SPIN_MAX_DEFAULT
+#define LITHE_FJS_HART_ENTER_SPIN_MAX_DEFAULT 16384u
 #endif
 
 static unsigned int fjs_hart_enter_spin_loops = LITHE_FJS_HART_ENTER_SPIN_LOOPS_DEFAULT;
+static unsigned int fjs_hart_enter_spin_min = LITHE_FJS_HART_ENTER_SPIN_MIN_DEFAULT;
+static unsigned int fjs_hart_enter_spin_max = LITHE_FJS_HART_ENTER_SPIN_MAX_DEFAULT;
 static int fjs_hart_enter_spin_loops_init = 0;
+
+/* Per-vcore current spin budget. Padded to a cache line to avoid false
+ * sharing across vcores in the adaptive update path. */
+#define FJS_SPIN_CL_SIZE 64
+struct fjs_spin_slot {
+	unsigned int cur;
+	char pad[FJS_SPIN_CL_SIZE - sizeof(unsigned int)];
+} __attribute__((aligned(FJS_SPIN_CL_SIZE)));
+
+#ifndef LITHE_FJS_HART_ENTER_SPIN_MAX_VCORES
+#define LITHE_FJS_HART_ENTER_SPIN_MAX_VCORES 4096
+#endif
+
+static struct fjs_spin_slot fjs_hart_enter_spin_cur[LITHE_FJS_HART_ENTER_SPIN_MAX_VCORES];
 
 static void fjs_hart_enter_spin_init(void)
 {
@@ -50,7 +75,54 @@ static void fjs_hart_enter_spin_init(void)
 		if (end != env && v <= 1u << 20)
 			fjs_hart_enter_spin_loops = (unsigned int)v;
 	}
+	env = getenv("LITHE_FJS_HART_ENTER_SPIN_MIN");
+	if (env != NULL && *env != '\0') {
+		char *end = NULL;
+		unsigned long v = strtoul(env, &end, 10);
+		if (end != env && v <= 1u << 20)
+			fjs_hart_enter_spin_min = (unsigned int)v;
+	}
+	env = getenv("LITHE_FJS_HART_ENTER_SPIN_MAX");
+	if (env != NULL && *env != '\0') {
+		char *end = NULL;
+		unsigned long v = strtoul(env, &end, 10);
+		if (end != env && v <= 1u << 20)
+			fjs_hart_enter_spin_max = (unsigned int)v;
+	}
+	if (fjs_hart_enter_spin_max < fjs_hart_enter_spin_min)
+		fjs_hart_enter_spin_max = fjs_hart_enter_spin_min;
+	if (fjs_hart_enter_spin_loops > fjs_hart_enter_spin_max)
+		fjs_hart_enter_spin_loops = fjs_hart_enter_spin_max;
+	for (size_t i = 0; i < LITHE_FJS_HART_ENTER_SPIN_MAX_VCORES; i++)
+		fjs_hart_enter_spin_cur[i].cur = fjs_hart_enter_spin_loops;
 	__atomic_store_n(&fjs_hart_enter_spin_loops_init, 1, __ATOMIC_RELEASE);
+}
+
+static inline unsigned int fjs_hart_enter_spin_budget(int vc)
+{
+	if (vc < 0 || vc >= LITHE_FJS_HART_ENTER_SPIN_MAX_VCORES)
+		return fjs_hart_enter_spin_loops;
+	return fjs_hart_enter_spin_cur[vc].cur;
+}
+
+/* AIMD-style update: success doubles (capped at max), failure halves
+ * (floor at min). One write per hart_enter idle path -- no atomics: the
+ * value is a per-vcore hint, not a correctness signal, and stale reads
+ * just produce a slightly stale spin budget for one round. */
+static inline void fjs_hart_enter_spin_update(int vc, int succeeded)
+{
+	if (vc < 0 || vc >= LITHE_FJS_HART_ENTER_SPIN_MAX_VCORES)
+		return;
+	unsigned int v = fjs_hart_enter_spin_cur[vc].cur;
+	if (succeeded) {
+		unsigned int nv = v ? (v * 2u) : fjs_hart_enter_spin_min;
+		if (nv > fjs_hart_enter_spin_max) nv = fjs_hart_enter_spin_max;
+		fjs_hart_enter_spin_cur[vc].cur = nv;
+	} else {
+		unsigned int nv = v / 2u;
+		if (nv < fjs_hart_enter_spin_min) nv = fjs_hart_enter_spin_min;
+		fjs_hart_enter_spin_cur[vc].cur = nv;
+	}
 }
 
 /* The legacy per-vcore nanosleep idle backoff is gone. Reasoning (per
@@ -574,26 +646,34 @@ restart:
     goto restart;
   }
 
-  /* Spin-then-yield: a bounded cpu_relax loop catches work that becomes
-   * runnable in the few hundred ns after we drained the runqueue. The check
-   * cost is two atomic-clean loads (TAILQ_EMPTY + reactor_pending), so a
-   * busy run loop pays at most fjs_hart_enter_spin_loops PAUSE-ish cycles
-   * before yielding. Set LITHE_FJS_HART_ENTER_SPIN_LOOPS=0 to disable. */
+  /* Adaptive spin-then-yield: a bounded cpu_relax loop catches work that
+   * becomes runnable in the few hundred ns after we drained the runqueue.
+   * The check cost is two integer-load checks per pause, so a busy run loop
+   * pays at most fjs_hart_enter_spin_cur[vc] PAUSE-ish cycles before
+   * yielding. Per-vcore counter doubles on success (work appeared during
+   * the spin) and halves on failure (had to yield anyway); bounded by
+   * LITHE_FJS_HART_ENTER_SPIN_{MIN,MAX}. LITHE_FJS_HART_ENTER_SPIN_LOOPS=0
+   * disables. */
   fjs_hart_enter_spin_init();
   if (fjs_hart_enter_spin_loops > 0) {
-    for (unsigned int i = 0; i < fjs_hart_enter_spin_loops; i++) {
+    int my_vc = vcore_id();
+    unsigned int budget = fjs_hart_enter_spin_budget(my_vc);
+    for (unsigned int i = 0; i < budget; i++) {
       cpu_relax();
       if (!TAILQ_EMPTY(&sched->child_sched_list) ||
           parlib_reactor_pending() > 0) {
+        fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
         goto restart;
       }
       /* Peek at this vcore's runqueue without dequeuing -- another vcore
        * may have just enqueued. __thread_dequeue inside restart will resolve
        * the race correctly (it will also try work-stealing). */
-      if (tqsize_s(sched, vcore_id()) > 0) {
+      if (tqsize_s(sched, my_vc) > 0) {
+        fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
         goto restart;
       }
     }
+    fjs_hart_enter_spin_update(my_vc, /*succeeded=*/0);
   }
 
   vconline(vcore_id()) = false;
