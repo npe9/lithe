@@ -8,9 +8,50 @@
 #include <stdlib.h>
 #include <parlib/waitfreelist.h>
 #include <parlib/reactor.h>
+#include <parlib/arch.h>
 #include "fork_join_sched.h"
 #include "lithe.h"
 #include "internal/assert.h"
+
+/* hart_enter idle path: spin briefly before falling through to lithe_hart_yield.
+ *
+ * Background: when the FJS finishes its work cycle (no children needing harts,
+ * empty runqueue, reactor idle) the vcore must yield back to parlib. The
+ * yield itself is fairly cheap (vcore_reenter + parent->hart_return + an
+ * eventual sys_yield/futex_wait in parlib), but a yield-then-reentry cycle
+ * triggered by a context becoming runnable a few hundred ns later wastes
+ * thousands of cycles per round. This shows up in lithified flames as a
+ * non-trivial slice of vcore_entry / __lithe_sched_reenter / lithe_hart_yield
+ * (cf. the post-getenv-cache flame at 4N x 384 r).
+ *
+ * Mitigation: before yielding, do a bounded round of cpu_relax-with-checks.
+ * If the runqueue, child sched list, or reactor becomes non-empty we jump
+ * back into the scheduler decision path; otherwise we yield. The spin is
+ * tunable via LITHE_FJS_HART_ENTER_SPIN_LOOPS (default 1024 ~ a few us at
+ * modern PAUSE rates; 0 disables the spin entirely and restores the prior
+ * behavior of an immediate yield). The wait_freelist / reactor_pending /
+ * tail head checks are all single-load fast paths.
+ */
+#ifndef LITHE_FJS_HART_ENTER_SPIN_LOOPS_DEFAULT
+#define LITHE_FJS_HART_ENTER_SPIN_LOOPS_DEFAULT 1024
+#endif
+
+static unsigned int fjs_hart_enter_spin_loops = LITHE_FJS_HART_ENTER_SPIN_LOOPS_DEFAULT;
+static int fjs_hart_enter_spin_loops_init = 0;
+
+static void fjs_hart_enter_spin_init(void)
+{
+	if (__atomic_load_n(&fjs_hart_enter_spin_loops_init, __ATOMIC_ACQUIRE))
+		return;
+	const char *env = getenv("LITHE_FJS_HART_ENTER_SPIN_LOOPS");
+	if (env != NULL && *env != '\0') {
+		char *end = NULL;
+		unsigned long v = strtoul(env, &end, 10);
+		if (end != env && v <= 1u << 20)
+			fjs_hart_enter_spin_loops = (unsigned int)v;
+	}
+	__atomic_store_n(&fjs_hart_enter_spin_loops_init, 1, __ATOMIC_RELEASE);
+}
 
 /* The legacy per-vcore nanosleep idle backoff is gone. Reasoning (per
  * user directive: "the nanosleeps are wrong, a non-schedulable context
@@ -61,13 +102,27 @@ const lithe_sched_funcs_t lithe_fork_join_sched_funcs = {
   .context_exit    = lithe_fork_join_sched_context_exit
 };
 
-static lithe_fork_join_context_t *__ctx_alloc(size_t stacksize)
+static lithe_fork_join_context_t *__ctx_alloc(lithe_fork_join_sched_t *sched,
+                                              size_t stacksize)
 {
     // TODO wfl currently assumes stacksize the same for all contexts
     lithe_fork_join_context_t *ctx = wfl_remove(&context_zombie_list);
     if (!ctx) {
 		int offset = ROUNDUP(sizeof(lithe_fork_join_context_t), ARCH_CL_SIZE);
-		offset += rand_r(&rseed(0)) % max_vcores() * ARCH_CL_SIZE;
+		/* Use the target sched's rseed instead of lithe_sched_current()'s
+		 * rseed: the caller (lithe_fork_join_context_create) passes the
+		 * sched explicitly, and the calling context may not have *any*
+		 * sched entered yet (e.g. PMIx progress-thread start during
+		 * MPI_Init, where main has been promoted to vcore 0 but the
+		 * OPAL sched has only been registered, not entered). Using
+		 * rseed(0) there dereferences a NULL lithe_sched_current() and
+		 * crashes. max_vcores() likewise needs vcore_lib_init()
+		 * complete, which is the case once the host has called
+		 * lithe_ensure_main_on_vcore0(); the caller of context_create is
+		 * responsible for that. */
+		int mv = max_vcores();
+		if (mv < 1) mv = 1;
+		offset += rand_r(&rseed_s(sched, 0)) % mv * ARCH_CL_SIZE;
 		stacksize = ROUNDUP(stacksize + offset, PGSIZE);
 		void *stackbot = mmap(
 			0, stacksize, PROT_READ|PROT_WRITE|PROT_EXEC,
@@ -295,7 +350,7 @@ lithe_fork_join_context_t*
                                  void (*start_routine)(void*),
                                  void *arg)
 {
-  lithe_fork_join_context_t *ctx = __ctx_alloc(stack_size);
+  lithe_fork_join_context_t *ctx = __ctx_alloc(sched, stack_size);
   lithe_fork_join_context_init(sched, ctx, start_routine, arg);
   return ctx;
 }
@@ -517,6 +572,28 @@ restart:
   while (parlib_reactor_pending() > 0) {
     (void)parlib_reactor_drive(-1);
     goto restart;
+  }
+
+  /* Spin-then-yield: a bounded cpu_relax loop catches work that becomes
+   * runnable in the few hundred ns after we drained the runqueue. The check
+   * cost is two atomic-clean loads (TAILQ_EMPTY + reactor_pending), so a
+   * busy run loop pays at most fjs_hart_enter_spin_loops PAUSE-ish cycles
+   * before yielding. Set LITHE_FJS_HART_ENTER_SPIN_LOOPS=0 to disable. */
+  fjs_hart_enter_spin_init();
+  if (fjs_hart_enter_spin_loops > 0) {
+    for (unsigned int i = 0; i < fjs_hart_enter_spin_loops; i++) {
+      cpu_relax();
+      if (!TAILQ_EMPTY(&sched->child_sched_list) ||
+          parlib_reactor_pending() > 0) {
+        goto restart;
+      }
+      /* Peek at this vcore's runqueue without dequeuing -- another vcore
+       * may have just enqueued. __thread_dequeue inside restart will resolve
+       * the race correctly (it will also try work-stealing). */
+      if (tqsize_s(sched, vcore_id()) > 0) {
+        goto restart;
+      }
+    }
   }
 
   vconline(vcore_id()) = false;
