@@ -30,6 +30,19 @@ void lithe_lib_init_complete(lithe_context_t *context);
 void lithe_lib_init_real();
 
 /**
+ * Idempotently complete the deferred lithe library initialization for the
+ * calling (main) OS thread, turning it into a parlib uthread bound to
+ * vcore 0 / the base scheduler. The lithe shared-library constructor
+ * (lithe_lib_init_impl) intentionally skips uthread_lib_init() and
+ * lithe_vcore_init() so that simply dlopen-ing liblithe.so cannot crash
+ * pure-pthread consumers (e.g. opal_wrapper / mpicxx); the deferred work
+ * is done here lazily, the first time OPAL/PMIx code paths that require
+ * a real Lithe context call in.  Safe to call repeatedly; after the first
+ * successful call, current_uthread != NULL and further calls are no-ops.
+ */
+void lithe_ensure_main_on_vcore0(void);
+
+/**
  * Passes control to a new child scheduler. The 'funcs' field and
  * 'main_context' field of the child scheduler must already be set up properly
  * or the call will fail. It hands the current hart over to this scheduler and

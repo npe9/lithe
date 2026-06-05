@@ -96,16 +96,16 @@ static const lithe_sched_funcs_t base_funcs = {
 /* Base scheduler itself */
 static lithe_sched_t base_sched = { 
   .funcs  = &base_funcs,
-  .harts  = ATOMIC_INITIALIZER(0),
+  .harts  = PARLIB_ATOMIC_INITIALIZER(0),
   .parent = NULL,
 };
 
 /* Root scheduler, i.e. the child scheduler of base. */
 static struct {
   lithe_sched_t CACHE_LINE_ALIGNED *sched;
-  atomic_t CACHE_LINE_ALIGNED ref_count;
-  atomic_t CACHE_LINE_ALIGNED harts_needed;
-} __root_sched = {NULL, ATOMIC_INITIALIZER(0), ATOMIC_INITIALIZER(0)};
+  parlib_atomic_t CACHE_LINE_ALIGNED ref_count;
+  parlib_atomic_t CACHE_LINE_ALIGNED harts_needed;
+} __root_sched = {NULL, PARLIB_ATOMIC_INITIALIZER(0), PARLIB_ATOMIC_INITIALIZER(0)};
 
 #define root_sched (__root_sched.sched)
 #define root_sched_ref_count (__root_sched.ref_count)
@@ -169,10 +169,18 @@ static void lithe_lib_init_impl(void)
   /* Don't initialize vcore during library loading - wait for explicit initialization */
   /* lithe_vcore_init(); */
 
-  /* Now that the library is initialized, a TLS should be set up for this
-   * context, so set some of it */
-  uthread_set_tls_var(&context->uth, current_sched, &base_sched);
-  
+  /* uthread_lib_init() above is intentionally deferred to
+   * lithe_lib_init_complete() (called from MPI_Init / sched_enter), so the
+   * main context has no TLS area yet. uthread_set_tls_var() expands to a
+   * %fs:offset store whose target is tls_desc + tls_offset(current_sched);
+   * with tls_desc==NULL that lands at a tiny absolute address and SIGSEGVs
+   * the very first user that dlopens liblithe (e.g. opal_wrapper). Skip
+   * the TLS seeding here; lithe_lib_init_complete() / sched_enter set
+   * current_sched on real TLS once uthread_lib_init has run. */
+  if (context->uth.tls_desc != NULL) {
+    uthread_set_tls_var(&context->uth, current_sched, &base_sched);
+  }
+
   lithe_initialized = true;
 }
 
@@ -181,6 +189,16 @@ void lithe_lib_init_complete(lithe_context_t *context)
   /* Complete the initialization that was deferred during library loading */
   uthread_lib_init(&context->uth);
   lithe_vcore_init();
+  /* uthread_lib_init() ran and assigned context->uth.tls_desc=get_main_tls().
+   * lithe_lib_init_impl() couldn't seed the TLS current_sched slot because
+   * tls_desc was NULL at constructor time; do it here so that when the
+   * uthread next runs (or is observed by code running as that uthread, i.e.
+   * the main thread), lithe_sched_current() returns &base_sched instead of
+   * NULL.  Without this, lithe_sched_enter() asserts (current_sched==NULL)
+   * during the OPAL sched_enter that pmix_thread_start indirectly forces. */
+  if (context->uth.tls_desc != NULL) {
+    uthread_set_tls_var(&context->uth, current_sched, &base_sched);
+  }
 }
 
 void lithe_lib_init_real()
@@ -188,7 +206,7 @@ void lithe_lib_init_real()
   if (lithe_initialized) {
     return;
   }
-  printf("LITHE: real lib init\n"); fflush(stdout);
+  /* debug print removed */
   init_once_racy(return);
 
   /* Create a lithe context for the main thread to run in */
@@ -217,16 +235,45 @@ void lithe_lib_init_real()
   /* Don't initialize vcore during library loading - wait for explicit initialization */
   /* lithe_vcore_init(); */
 
-  /* Now that the library is initialized, a TLS should be set up for this
-   * context, so set some of it */
-  uthread_set_tls_var(&context->uth, current_sched, &base_sched);
-  
+  /* Same NULL-tls_desc guard as lithe_lib_init_impl above. */
+  if (context->uth.tls_desc != NULL) {
+    uthread_set_tls_var(&context->uth, current_sched, &base_sched);
+  }
+
   lithe_initialized = true;
 }
 
 void __attribute__((constructor(98))) lithe_lib_init()
 {
   pthread_once(&lithe_lib_once, lithe_lib_init_impl);
+}
+
+/* Run-once guard for lithe_ensure_main_on_vcore0().  uthread_lib_init() and
+ * lithe_vcore_init() must each run exactly once for the main TCB; pthread_once
+ * gives us that and serializes racing constructors. */
+static pthread_once_t lithe_ensure_main_once = PTHREAD_ONCE_INIT;
+static void lithe_ensure_main_on_vcore0_impl(void)
+{
+  /* lithe_lib_init_impl() (constructor(98)) already ran via pthread_once and
+   * filled lithe_main_context except for the uthread/vcore bits. Complete
+   * them now: uthread_lib_init() sets current_uthread = &context->uth and
+   * gives it a TLS area; lithe_vcore_init() arms the vcore request path. */
+  lithe_lib_init_complete(&lithe_main_context);
+}
+
+void lithe_ensure_main_on_vcore0(void)
+{
+  /* Fast path: main has already been promoted to a uthread. */
+  if (current_uthread != NULL) {
+    return;
+  }
+  /* Make sure the .so constructor body has actually run.  pthread_once on a
+   * separate token from lithe_lib_once: lithe_lib_init() is normally driven
+   * by the dynamic linker's _dl_init, but we may be called from a context
+   * where that ordering is not guaranteed (e.g. weak OPAL hooks). */
+  pthread_once(&lithe_lib_once, lithe_lib_init_impl);
+  /* Do the deferred uthread/vcore bring-up exactly once for the main TCB. */
+  pthread_once(&lithe_ensure_main_once, lithe_ensure_main_on_vcore0_impl);
 }
 
 static void __attribute__((noreturn)) __lithe_sched_reenter()
@@ -345,12 +392,12 @@ static void base_hart_enter(lithe_sched_t *__this)
     // transfer control to it.
     // We down the refcount only after the hart returns to the base sched in
     // base_hart_return (or just below, if we didn't actually grant the hart).
-    if (atomic_add_not_zero(&root_sched_ref_count, 1)) {
+    if (parlib_atomic_add_not_zero(&root_sched_ref_count, 1)) {
       rmb(); // order operations below with the atomic_add() above
 
       assert(root_sched);
       size_t old_harts_granted = atomic_add(&root_sched->harts, 1);
-      if (old_harts_granted + 1 <= atomic_read(&root_sched_harts_needed)) {
+      if (old_harts_granted + 1 <= parlib_atomic_read(&root_sched_harts_needed)) {
         // Finish up our accounting
         atomic_add(&__this->harts, -1);
         // Reset the hart tls to its original state
@@ -394,8 +441,8 @@ static void base_child_entered(lithe_sched_t *__this, lithe_sched_t *child)
 {
   assert(root_sched == NULL);
   root_sched = child;
-  root_sched_ref_count = ATOMIC_INITIALIZER(2);
-  root_sched_harts_needed = ATOMIC_INITIALIZER(1);
+  root_sched_ref_count = PARLIB_ATOMIC_INITIALIZER(2);
+  root_sched_harts_needed = PARLIB_ATOMIC_INITIALIZER(1);
 }
 
 static void base_child_exited(lithe_sched_t *__this, lithe_sched_t *child)
@@ -483,7 +530,7 @@ void lithe_hart_grant(lithe_sched_t *child, void (*unlock_func) (void *), void *
 
 void lithe_hart_yield()
 {
-  printf("LITHE: hart yield\n"); fflush(stdout);
+  /* debug print removed */
   assert(in_vcore_context());
   assert(current_sched);
   assert(current_sched != &base_sched);
@@ -550,7 +597,7 @@ static void __lithe_sched_enter(uthread_t *uthread, void *__arg)
 
 void lithe_sched_enter(lithe_sched_t *child)
 {
-  printf("LITHE: sched enter\n"); fflush(stdout);
+  /* debug print removed */
   assert(!in_vcore_context());
   assert(current_sched);
   lithe_sched_t *parent = current_sched;
@@ -561,7 +608,7 @@ void lithe_sched_enter(lithe_sched_t *child)
   assert(child->main_context);
 
   /* Set-up child scheduler */
-  child->harts = ATOMIC_INITIALIZER(0);
+  child->harts = PARLIB_ATOMIC_INITIALIZER(0);
   child->parent = parent;
 
   /* Set up a function to run in vcore context to inform the parent that the
@@ -624,7 +671,7 @@ void __lithe_sched_exit(uthread_t *uthread, void *arg)
 
 void lithe_sched_exit()
 {
-  printf("LITHE: sched exit\n"); fflush(stdout);
+  /* debug print removed */
   assert(!in_vcore_context());
   assert(current_sched);
 
@@ -652,7 +699,7 @@ void lithe_sched_exit()
    * Also, do a full blown lithe context yield so that this hart can do useful
    * work while waiting */
   long n;
-  while ((n = atomic_read(&child->harts)) != 0) {
+  while ((n = parlib_atomic_read(&child->harts)) != 0) {
     assert(n >= 0);
     lithe_context_yield();
   }
@@ -796,7 +843,7 @@ int lithe_context_run(lithe_context_t *context)
 {
   assert(context);
   assert(in_vcore_context());
-  printf("LITHE: context run\n"); fflush(stdout);
+  /* debug print removed */
 
   next_context = context;
   lithe_vcore_entry();
@@ -811,7 +858,7 @@ void __lithe_context_block(uthread_t *uthread, void *__arg)
   struct { 
     void (*func) (lithe_context_t *, void *); 
     void *arg;
-    atomic_t safe_to_unblock;
+    parlib_atomic_t safe_to_unblock;
   } *arg = __arg;
 
   /* Inform the scheduler of the block first. */
@@ -824,7 +871,7 @@ void __lithe_context_block(uthread_t *uthread, void *__arg)
   if (arg->func)
     arg->func((lithe_context_t*)uthread, arg->arg);
 
-  atomic_set(&arg->safe_to_unblock, 1);
+  parlib_atomic_set(&arg->safe_to_unblock, 1);
 }
  
 void lithe_context_block(void (*func)(lithe_context_t *, void *), void *arg)
@@ -835,10 +882,10 @@ void lithe_context_block(void (*func)(lithe_context_t *, void *), void *arg)
   struct { 
     void (*func) (lithe_context_t *, void *); 
     void *arg;
-    atomic_t safe_to_unblock;
+    parlib_atomic_t safe_to_unblock;
   } __arg = {func, arg, 0};
   uthread_yield(true, __lithe_context_block, &__arg);
-  while(atomic_read(&__arg.safe_to_unblock) == 0);
+  while(parlib_atomic_read(&__arg.safe_to_unblock) == 0);
 }
 
 void lithe_context_unblock(lithe_context_t *context)
@@ -855,7 +902,7 @@ void lithe_context_yield()
   assert(!in_vcore_context());
   assert(current_sched);
   assert(current_context);
-  printf("LITHE: context yield\n"); fflush(stdout);
+  /* debug print removed */
 
   uthread_yield(true, __lithe_context_yield, NULL);
 }

@@ -11,6 +11,7 @@
 #ifndef LITHE_SCHED_H
 #define LITHE_SCHED_H
 
+#include <parlib/atomic.h>
 #include "context.h"
 
 #ifdef __cplusplus
@@ -113,7 +114,7 @@ struct lithe_sched {
   lithe_context_t *parent_context;
 
   /* Number of harts currently owned by this scheduler. */
-  atomic_t harts;
+  parlib_atomic_t harts;
 
   /* Scheduler's parent scheduler */
   lithe_sched_t *parent;

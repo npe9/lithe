@@ -78,62 +78,62 @@ check_PROGRAMS = $(TEST_EXECS)
 test_cls_SOURCES = @TESTSDIR@/test-cls.c
 test_cls_CFLAGS = $(AM_CFLAGS)
 test_cls_CFLAGS += -I$(srcdir)
-test_cls_LDADD = -lithe $(LPARLIB)
+test_cls_LDADD = -llithe $(LPARLIB)
 
 test_syscalls_SOURCES = @TESTSDIR@/test-syscalls.c
 test_syscalls_CFLAGS = $(AM_CFLAGS)
 test_syscalls_CFLAGS += -I$(srcdir)
-test_syscalls_LDADD = -lithe $(LPARLIB)
+test_syscalls_LDADD = -llithe $(LPARLIB)
 
 test_mutex_SOURCES = @TESTSDIR@/test-mutex.c
 test_mutex_CFLAGS = $(AM_CFLAGS)
 test_mutex_CFLAGS += -I$(srcdir)
-test_mutex_LDADD = -lithe $(LPARLIB)
+test_mutex_LDADD = -llithe $(LPARLIB)
 
 test_recursive_mutex_SOURCES = @TESTSDIR@/test-recursive-mutex.c
 test_recursive_mutex_CFLAGS = $(AM_CFLAGS)
 test_recursive_mutex_CFLAGS += -I$(srcdir)
-test_recursive_mutex_LDADD = -lithe $(LPARLIB)
+test_recursive_mutex_LDADD = -llithe $(LPARLIB)
 
 test_condvar_SOURCES = @TESTSDIR@/test-condvar.c
 test_condvar_CFLAGS = $(AM_CFLAGS)
 test_condvar_CFLAGS += -I$(srcdir)
-test_condvar_LDADD = -lithe $(LPARLIB)
+test_condvar_LDADD = -llithe $(LPARLIB)
 
 test_parent_SOURCES = @TESTSDIR@/test-parent.c
 test_parent_CFLAGS = $(AM_CFLAGS)
 test_parent_CFLAGS += -I$(srcdir)
-test_parent_LDADD = -lithe $(LPARLIB)
+test_parent_LDADD = -llithe $(LPARLIB)
 
 test_scheduler_SOURCES = @TESTSDIR@/test-scheduler.c
 test_scheduler_CFLAGS = $(AM_CFLAGS)
 test_scheduler_CFLAGS += -I$(srcdir)
-test_scheduler_LDADD = -lithe $(LPARLIB)
+test_scheduler_LDADD = -llithe $(LPARLIB)
 
 test_mutex_cc_SOURCES = @TESTSDIR@/test-mutex.cc
 test_mutex_cc_CXXFLAGS = $(AM_CXXFLAGS)
 test_mutex_cc_CXXFLAGS += -I$(srcdir)
-test_mutex_cc_LDADD = -lithe $(LPARLIB)
+test_mutex_cc_LDADD = -llithe $(LPARLIB)
 
 test_recursive_mutex_cc_SOURCES = @TESTSDIR@/test-recursive-mutex.cc
 test_recursive_mutex_cc_CFLAGS = $(AM_CFLAGS)
 test_recursive_mutex_cc_CFLAGS += -I$(srcdir)
-test_recursive_mutex_cc_LDADD = -lithe $(LPARLIB)
+test_recursive_mutex_cc_LDADD = -llithe $(LPARLIB)
 
 test_condvar_cc_SOURCES = @TESTSDIR@/test-condvar.cc
 test_condvar_cc_CXXFLAGS = $(AM_CXXFLAGS)
 test_condvar_cc_CXXFLAGS += -I$(srcdir)
-test_condvar_cc_LDADD = -lithe $(LPARLIB)
+test_condvar_cc_LDADD = -llithe $(LPARLIB)
 
 test_parent_cc_SOURCES = @TESTSDIR@/test-parent.cc
 test_parent_cc_CXXFLAGS = $(AM_CXXFLAGS)
 test_parent_cc_CXXFLAGS += -I$(srcdir)
-test_parent_cc_LDADD = -lithe $(LPARLIB)
+test_parent_cc_LDADD = -llithe $(LPARLIB)
 
 test_scheduler_cc_SOURCES = @TESTSDIR@/test-scheduler.cc
 test_scheduler_cc_CXXFLAGS = $(AM_CXXFLAGS)
 test_scheduler_cc_CXXFLAGS += -I$(srcdir)
-test_scheduler_cc_LDADD = -lithe $(LPARLIB)
+test_scheduler_cc_LDADD = -llithe $(LPARLIB)
 
 if SPHINX_BUILD
 man_MANS = \
