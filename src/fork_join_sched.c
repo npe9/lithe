@@ -153,7 +153,13 @@ void lithe_fork_join_set_idle_nanosleep_usec(long us)
 
 static inline void fjs_reactor_poll(void)
 {
-	if (parlib_reactor_initialized())
+	/* parlib_reactor_drive(0) is epoll_wait(..., 0). When no uthreads are
+	 * parked on fd readiness (pending==0), that syscall is pure overhead on
+	 * every hart_enter restart — dominant in MPI_Init/Finalize envelope
+	 * profiles at full-node rank count. hart_request still pokes wake_efd
+	 * for vcores blocked in drive(-1); runqueue work is found via dequeue
+	 * and the adaptive spin without needing a zero-timeout poll here. */
+	if (parlib_reactor_initialized() && parlib_reactor_pending() > 0)
 		(void)parlib_reactor_drive(0);
 }
 
@@ -629,7 +635,6 @@ restart:
   }
 
   /* Otherwise, if I have any contexts to run, grab one and run it. */
-  fjs_reactor_poll();
   lithe_fork_join_context_t *ctx = __thread_dequeue();
   if (ctx != NULL) {
     assert(ctx->state == FJS_CTX_RUNNABLE);
