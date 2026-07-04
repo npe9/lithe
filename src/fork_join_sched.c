@@ -796,6 +796,33 @@ int lithe_root_fork_join_sched_entered(void)
   return lithe_root_fj_entered;
 }
 
+/* Number of RUNNABLE-but-unscheduled contexts on the CURRENT fork-join sched,
+ * i.e. contexts sitting on this sched's per-vcore runqueues waiting for a hart.
+ *
+ * A context that is spinning while HOLDING its hart (e.g. a lithified-libomp
+ * worker hot-spinning on the team-local inner-barrier flag) must consult this
+ * to decide whether it is starving a peer: if any peer is RUNNABLE but has no
+ * hart, the spinner has to cooperatively donate its hart (lithe_context_yield)
+ * so the peer can run. Otherwise, when the number of OpenMP worker contexts
+ * exceeds the available harts/vcores (real oversubscription, e.g. OMP=192 on 96
+ * cores, or an under-provisioned VCORE_LIMIT), the hart-holders spin forever on
+ * a barrier flag that the never-scheduled peers can never advance -> a userspace
+ * hart-starvation livelock (no syscalls, "fewer kernel switches", process hangs
+ * and must be reaped). At proper width every worker owns a hart so the count is
+ * 0 and the fast hot-spin path is unaffected.
+ *
+ * Returns 0 when the current sched is not a fork-join sched (e.g. the base
+ * sched) or there is no current sched. One relaxed-acquire atomic load; safe to
+ * call from any lithe context. */
+long lithe_fork_join_current_runnable_count(void)
+{
+  lithe_sched_t *cur = lithe_sched_current();
+  if (cur == NULL || cur->funcs != &lithe_fork_join_sched_funcs)
+    return 0;
+  return __atomic_load_n(&((lithe_fork_join_sched_t *)cur)->runnable_count,
+                         __ATOMIC_ACQUIRE);
+}
+
 void lithe_fork_join_sched_destroy(lithe_fork_join_sched_t *sched)
 {
   lithe_fork_join_sched_cleanup(sched);

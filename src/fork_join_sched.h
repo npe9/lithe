@@ -175,6 +175,14 @@ lithe_fork_join_sched_t *lithe_ensure_root_fork_join_sched(void);
 /* Whether the root FJ sched has been entered (non-zero) yet. */
 int lithe_root_fork_join_sched_entered(void);
 
+/* Number of RUNNABLE-but-unscheduled contexts on the CURRENT fork-join sched
+ * (contexts waiting for a hart). Used by a hart-holding spinner (e.g. lithified
+ * libomp's inner-barrier hot-spin) to detect hart starvation of peers and yield
+ * its hart when >0. 0 at proper width (every context owns a hart) and 0 when the
+ * current sched is not a fork-join sched. See fork_join_sched.c for the full
+ * livelock rationale. */
+long lithe_fork_join_current_runnable_count(void);
+
 /* Scheduler creation, initialization, etc. for the lithe_fork_join_sched. */
 lithe_fork_join_sched_t *lithe_fork_join_sched_create();
 void lithe_fork_join_sched_init(lithe_fork_join_sched_t *sched,
