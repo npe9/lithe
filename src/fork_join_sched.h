@@ -20,6 +20,20 @@
 extern "C" {
 #endif
 
+/* Scheduler tradespace: steal policy (LITHE_FJS_STEAL env). */
+typedef enum {
+  LITHE_FJS_STEAL_DEFAULT = 0,
+  LITHE_FJS_STEAL_NONE,
+  LITHE_FJS_STEAL_LOCAL,
+} lithe_fjs_steal_mode_t;
+
+/* Scheduler tradespace: hart_enter child/self ordering (LITHE_FJS_HART_ORDER). */
+typedef enum {
+  LITHE_FJS_HART_ORDER_CHILD_FIRST = 0,
+  LITHE_FJS_HART_ORDER_PROGRESS_FIRST,
+  LITHE_FJS_HART_ORDER_SELF_FIRST,
+} lithe_fjs_hart_order_t;
+
 extern const lithe_sched_funcs_t lithe_fork_join_sched_funcs;
 
 /* Stack stuff. */
@@ -175,6 +189,16 @@ lithe_fork_join_sched_t *lithe_ensure_root_fork_join_sched(void);
 /* Whether the root FJ sched has been entered (non-zero) yet. */
 int lithe_root_fork_join_sched_entered(void);
 
+/* Progress-thread scheduler selection (LITHE_PROGRESS_SCHED=root|child).
+ * Returns root FJS by default; when child, lazily creates a dedicated progress
+ * child FJS registered on root via child_enter (lithe-multi-runtime-schedulers). */
+lithe_fork_join_sched_t *lithe_fork_join_sched_progress_sched(void);
+int lithe_fork_join_sched_is_progress_child(lithe_sched_t *sched);
+lithe_fjs_steal_mode_t lithe_fork_join_get_steal_mode(void);
+lithe_fjs_hart_order_t lithe_fork_join_get_hart_order(void);
+/* Bounded CQ/reactor spin before block (LITHE_PROGRESS_SPIN_MAX); 0 = disabled. */
+unsigned int lithe_progress_spin_max(void);
+
 /* Number of RUNNABLE-but-unscheduled contexts on the CURRENT fork-join sched
  * (contexts waiting for a hart). Used by a hart-holding spinner (e.g. lithified
  * libomp's inner-barrier hot-spin) to detect hart starvation of peers and yield
@@ -196,6 +220,11 @@ lithe_fork_join_context_t*
                                  size_t stack_size,
                                  void (*start_routine)(void*),
                                  void *arg);
+/* Create a progress/helper context on the sched selected by LITHE_PROGRESS_SCHED. */
+lithe_fork_join_context_t*
+  lithe_fork_join_context_create_progress(size_t stack_size,
+                                          void (*start_routine)(void*),
+                                          void *arg);
 void lithe_fork_join_context_init(lithe_fork_join_sched_t *sched,
                                   lithe_fork_join_context_t *ctx,
                                   void (*start_routine)(void*),

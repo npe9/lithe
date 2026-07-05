@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <parlib/waitfreelist.h>
 #include <parlib/reactor.h>
 #include <parlib/arch.h>
@@ -206,6 +207,127 @@ static inline void fjs_stats_run_leave(void)
 		return;
 	if (fjs_running > 0)
 		__sync_fetch_and_sub(&fjs_running, 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * Scheduler tradespace policy knobs (env parsed once at first use).
+ * LITHE_FJS_STEAL={default,none,local}
+ * LITHE_PROGRESS_SCHED={root,child}
+ * LITHE_FJS_HART_ORDER={child_first,progress_first,self_first}
+ * LITHE_PROGRESS_SPIN_MAX=N  (bounded spin before reactor block; see header)
+ * ------------------------------------------------------------------------- */
+static lithe_fjs_steal_mode_t fjs_steal_mode = LITHE_FJS_STEAL_DEFAULT;
+static lithe_fjs_hart_order_t fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
+static int fjs_progress_sched_child = 0;
+static int fjs_tradespace_init = 0;
+static unsigned int fjs_progress_spin_max = 0;
+
+static lithe_fork_join_sched_t *lithe_progress_child_sched;
+static int lithe_progress_child_registered;
+
+static void fjs_tradespace_init_once(void)
+{
+	if (__atomic_load_n(&fjs_tradespace_init, __ATOMIC_ACQUIRE))
+		return;
+
+	const char *e = getenv("LITHE_FJS_STEAL");
+	if (!e || !*e || strcmp(e, "default") == 0)
+		fjs_steal_mode = LITHE_FJS_STEAL_DEFAULT;
+	else if (strcmp(e, "none") == 0)
+		fjs_steal_mode = LITHE_FJS_STEAL_NONE;
+	else if (strcmp(e, "local") == 0)
+		fjs_steal_mode = LITHE_FJS_STEAL_LOCAL;
+	else
+		fjs_steal_mode = LITHE_FJS_STEAL_DEFAULT;
+
+	e = getenv("LITHE_PROGRESS_SCHED");
+	fjs_progress_sched_child = (e && strcmp(e, "child") == 0) ? 1 : 0;
+
+	e = getenv("LITHE_FJS_HART_ORDER");
+	if (!e || !*e || strcmp(e, "child_first") == 0)
+		fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
+	else if (strcmp(e, "progress_first") == 0)
+		fjs_hart_order = LITHE_FJS_HART_ORDER_PROGRESS_FIRST;
+	else if (strcmp(e, "self_first") == 0)
+		fjs_hart_order = LITHE_FJS_HART_ORDER_SELF_FIRST;
+	else
+		fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
+
+	e = getenv("LITHE_PROGRESS_SPIN_MAX");
+	if (e && *e) {
+		char *end = NULL;
+		unsigned long v = strtoul(e, &end, 10);
+		if (end != e && v <= (1u << 20))
+			fjs_progress_spin_max = (unsigned int)v;
+	}
+
+	__atomic_store_n(&fjs_tradespace_init, 1, __ATOMIC_RELEASE);
+}
+
+lithe_fjs_steal_mode_t lithe_fork_join_get_steal_mode(void)
+{
+	fjs_tradespace_init_once();
+	return fjs_steal_mode;
+}
+
+lithe_fjs_hart_order_t lithe_fork_join_get_hart_order(void)
+{
+	fjs_tradespace_init_once();
+	return fjs_hart_order;
+}
+
+unsigned int lithe_progress_spin_max(void)
+{
+	fjs_tradespace_init_once();
+	return fjs_progress_spin_max;
+}
+
+int lithe_fork_join_sched_is_progress_child(lithe_sched_t *sched)
+{
+	fjs_tradespace_init_once();
+	return lithe_progress_child_sched != NULL &&
+	       sched == (lithe_sched_t *)lithe_progress_child_sched;
+}
+
+lithe_fork_join_sched_t *lithe_fork_join_sched_progress_sched(void)
+{
+	fjs_tradespace_init_once();
+	lithe_fork_join_sched_t *root = lithe_ensure_root_fork_join_sched();
+	if (root == NULL)
+		return NULL;
+	if (!fjs_progress_sched_child)
+		return root;
+
+	if (lithe_progress_child_sched == NULL) {
+		lithe_fork_join_sched_t *s = lithe_fork_join_sched_create();
+		if (s == NULL)
+			return root;
+		if (!__sync_bool_compare_and_swap(&lithe_progress_child_sched, NULL, s))
+			lithe_fork_join_sched_destroy(s);
+	}
+
+	if (!lithe_progress_child_registered && lithe_progress_child_sched != NULL) {
+		lithe_fork_join_sched_child_enter((lithe_sched_t *)root,
+		                                  (lithe_sched_t *)lithe_progress_child_sched);
+		uint16_t *harts_needed =
+			(uint16_t *)&lithe_progress_child_sched->sched.parent_data + 1;
+		if (*harts_needed < 1)
+			*harts_needed = 1;
+		lithe_progress_child_registered = 1;
+	}
+
+	return lithe_progress_child_sched ? lithe_progress_child_sched : root;
+}
+
+lithe_fork_join_context_t *
+lithe_fork_join_context_create_progress(size_t stack_size,
+                                        void (*start_routine)(void*),
+                                        void *arg)
+{
+	lithe_fork_join_sched_t *sched = lithe_fork_join_sched_progress_sched();
+	if (sched == NULL)
+		return NULL;
+	return lithe_fork_join_context_create(sched, stack_size, start_routine, arg);
 }
 
 const lithe_sched_funcs_t lithe_fork_join_sched_funcs = {
@@ -646,6 +768,11 @@ static lithe_fork_join_context_t *__thread_dequeue()
 	/* Try and grab a thread from our queue */
 	ctx = tdequeue(vcoreid);
 
+	/* Tradespace: none/local => never steal from other vcores on this sched. */
+	fjs_tradespace_init_once();
+	if (fjs_steal_mode != LITHE_FJS_STEAL_DEFAULT)
+		return ctx;
+
 	/* If there isn't one, try and steal one from someone else's queue.
 	 *
 	 * CHANGE 1 (O(1) dispatch): first consult the global runnable indicator.
@@ -1038,55 +1165,61 @@ static void decrement(void *gh)
   __sync_fetch_and_add((size_t*)gh, -1);
 }
 
-void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
+/* Try to grant one hart to child; may not return if grant succeeds. */
+static void fjs_try_hart_grant_child(lithe_fork_join_sched_t *sched,
+                                     lithe_sched_t *child)
 {
-  lithe_fork_join_sched_t *sched = (void *)__this;
-  if (!vconline(vcore_id()))
-    vconline(vcore_id()) = true;
+  uint16_t *harts_granted = (uint16_t*)&child->parent_data;
+  uint16_t *harts_needed = (uint16_t*)&child->parent_data + 1;
+  if (atomic_add(harts_granted, 1) + 1 <= *harts_needed) {
+    vconline(vcore_id()) = false;
+    lithe_hart_grant(child, decrement, &sched->granting_harts);
+  }
+  atomic_add(harts_granted, -1);
+}
 
-restart:
-  /* Scheduler-driven netpoll: drain completed fd waits before selecting the
-   * next continuation. This keeps I/O readiness in the normal Lithe handoff
-   * path instead of requiring a helper pthread. */
-  fjs_reactor_poll();
+static void fjs_hart_grant_children(lithe_fork_join_sched_t *sched)
+{
+  if (TAILQ_EMPTY(&sched->child_sched_list))
+    return;
 
-  /* If I have any outstanding requests from my children, preferentially pass
-   * this hart down to them. */
-  if (!TAILQ_EMPTY(&sched->child_sched_list)) {
-    __sync_fetch_and_add(&sched->granting_harts, 1);
-    lithe_sched_t *first = NULL;
-    while (1) {
-      spin_pdr_lock(&sched->child_sched_list_lock);
-      lithe_sched_t *child = TAILQ_FIRST(&sched->child_sched_list);
-      if (child) {
-        TAILQ_REMOVE(&sched->child_sched_list, child, link);
-        TAILQ_INSERT_TAIL(&sched->child_sched_list, child, link);
-      }
-      spin_pdr_unlock(&sched->child_sched_list_lock);
-      if (!child)
-        break;
+  fjs_tradespace_init_once();
+  __sync_fetch_and_add(&sched->granting_harts, 1);
 
-      uint16_t *harts_granted = (uint16_t*)&child->parent_data;
-      uint16_t *harts_needed = (uint16_t*)&child->parent_data + 1;
-      if (atomic_add(harts_granted, 1) + 1 <= *harts_needed) {
-        vconline(vcore_id()) = false;
-        lithe_hart_grant(child, decrement, &sched->granting_harts);
-      }
-      atomic_add(harts_granted, -1);
-
-      if (first == NULL)
-        first = child;
-      else if (first == child)
-        break;
-    }
-    decrement(&sched->granting_harts);
+  /* progress_first: dedicated pass for the progress child sched before rotation. */
+  if (fjs_hart_order == LITHE_FJS_HART_ORDER_PROGRESS_FIRST &&
+      lithe_progress_child_sched != NULL) {
+    fjs_try_hart_grant_child(sched, (lithe_sched_t *)lithe_progress_child_sched);
   }
 
-  /* WARM VCORES fast path: a worker parked in-place on a vcore slot and has
-   * been marked GO by the master's fork. Resume it directly -- no runqueue
-   * dequeue, no work-steal scan, no per-worker re-route. Own slot first (same
-   * vcore => warm cache/TLS), then a bounded scan so a worker is never stranded
-   * if a different vcore got this hart. Cheap single atomic load when idle. */
+  lithe_sched_t *first = NULL;
+  while (1) {
+    spin_pdr_lock(&sched->child_sched_list_lock);
+    lithe_sched_t *child = TAILQ_FIRST(&sched->child_sched_list);
+    if (child) {
+      TAILQ_REMOVE(&sched->child_sched_list, child, link);
+      TAILQ_INSERT_TAIL(&sched->child_sched_list, child, link);
+    }
+    spin_pdr_unlock(&sched->child_sched_list_lock);
+    if (!child)
+      break;
+
+    if (fjs_hart_order == LITHE_FJS_HART_ORDER_PROGRESS_FIRST &&
+        child == (lithe_sched_t *)lithe_progress_child_sched)
+      continue;
+
+    fjs_try_hart_grant_child(sched, child);
+
+    if (first == NULL)
+      first = child;
+    else if (first == child)
+      break;
+  }
+  decrement(&sched->granting_harts);
+}
+
+static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
+{
   if (__atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0) {
     lithe_fork_join_context_t *w = fjs_warm_claim(sched, vcore_id());
     if (w != NULL) {
@@ -1097,7 +1230,6 @@ restart:
     }
   }
 
-  /* Otherwise, if I have any contexts to run, grab one and run it. */
   lithe_fork_join_context_t *ctx = __thread_dequeue();
   if (ctx != NULL) {
     if (ctx->start_routine == FJS_CTX_FREED_POISON) {
@@ -1119,6 +1251,30 @@ restart:
     fjs_stats_run_enter();
     lithe_context_run(&ctx->context);
   }
+}
+
+void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
+{
+  lithe_fork_join_sched_t *sched = (void *)__this;
+  if (!vconline(vcore_id()))
+    vconline(vcore_id()) = true;
+
+restart:
+  /* Scheduler-driven netpoll: drain completed fd waits before selecting the
+   * next continuation. This keeps I/O readiness in the normal Lithe handoff
+   * path instead of requiring a helper pthread. */
+  fjs_reactor_poll();
+
+  fjs_tradespace_init_once();
+
+  /* Default and progress_first: children before own work; self_first inverts. */
+  if (fjs_hart_order != LITHE_FJS_HART_ORDER_SELF_FIRST)
+    fjs_hart_grant_children(sched);
+
+  fjs_hart_run_warm_or_dequeue(sched);
+
+  if (fjs_hart_order == LITHE_FJS_HART_ORDER_SELF_FIRST)
+    fjs_hart_grant_children(sched);
 
   /* No runnable contexts. If any continuations are parked on fd readiness,
    * this scheduler handoff blocks the vcore in epoll_wait until an fd fires
