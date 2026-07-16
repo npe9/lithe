@@ -62,10 +62,24 @@ int lithe_mutex_init(lithe_mutex_t *mutex, lithe_mutexattr_t *attr)
   return 0;
 }
 
+/*
+ * Static initializers (e.g. OPAL_THREAD_INTERNAL_MUTEX_INITIALIZER) often set
+ * queue={NULL,NULL}. TAILQ_INSERT_TAIL requires tqh_last=&tqh_first; a NULL
+ * tqh_last SEGVs on the first contended wait (seen on OMPI wait_sync_lock under
+ * hosted multi-context Barrier/Allreduce). Repair under the MCS lock.
+ */
+static inline void lithe_mutex_ensure_queue(lithe_mutex_t *mutex)
+{
+  if (mutex->queue.tqh_last == NULL) {
+    TAILQ_INIT(&mutex->queue);
+  }
+}
+
 static void block(lithe_context_t *context, void *arg)
 {
   lithe_mutex_t *mutex = (lithe_mutex_t *) arg;
   assert(mutex);
+  lithe_mutex_ensure_queue(mutex);
   TAILQ_INSERT_TAIL(&mutex->queue, context, link);
   mcs_pdr_unlock(&mutex->lock, mutex->qnode);
 }
@@ -78,6 +92,7 @@ int lithe_mutex_trylock(lithe_mutex_t *mutex)
   int retval = 0;
   mcs_lock_qnode_t qnode = {0};
   mcs_pdr_lock(&mutex->lock, &qnode);
+  lithe_mutex_ensure_queue(mutex);
   if(mutex->attr.type == LITHE_MUTEX_RECURSIVE &&
      mutex->owner == lithe_context_self()) {
     mutex->locked++;
@@ -100,6 +115,7 @@ int lithe_mutex_lock(lithe_mutex_t *mutex)
 
   mcs_lock_qnode_t qnode = {0};
   mcs_pdr_lock(&mutex->lock, &qnode);
+  lithe_mutex_ensure_queue(mutex);
   if(mutex->attr.type == LITHE_MUTEX_RECURSIVE &&
      mutex->owner == lithe_context_self()) {
     mutex->locked++;
@@ -111,6 +127,7 @@ int lithe_mutex_lock(lithe_mutex_t *mutex)
 
       memset(&qnode, 0, sizeof(mcs_lock_qnode_t));
       mcs_pdr_lock(&mutex->lock, &qnode);
+      lithe_mutex_ensure_queue(mutex);
     }
     mutex->owner = lithe_context_self();
     mutex->locked++;
@@ -126,6 +143,7 @@ int lithe_mutex_unlock(lithe_mutex_t *mutex)
 
   mcs_lock_qnode_t qnode = {0};
   mcs_pdr_lock(&mutex->lock, &qnode);
+  lithe_mutex_ensure_queue(mutex);
   mutex->locked--;
   if(mutex->locked == 0) {
     lithe_context_t *context = TAILQ_FIRST(&mutex->queue);

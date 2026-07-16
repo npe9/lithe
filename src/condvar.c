@@ -17,6 +17,14 @@
 #include "mutex.h"
 #include "condvar.h"
 
+/* Same issue as lithe_mutex: static {NULL,NULL} queue is not a valid TAILQ. */
+static inline void lithe_condvar_ensure_queue(lithe_condvar_t *c)
+{
+  if (c->queue.tqh_last == NULL) {
+    TAILQ_INIT(&c->queue);
+  }
+}
+
 /* Initialize a condition variable. */
 int lithe_condvar_init(lithe_condvar_t* c) {
   if(c == NULL)
@@ -31,6 +39,7 @@ static void block(lithe_context_t *context, void *arg)
 {
   lithe_condvar_t *condvar = (lithe_condvar_t *) arg;
   assert(condvar);
+  lithe_condvar_ensure_queue(condvar);
   TAILQ_INSERT_TAIL(&condvar->queue, context, link);
   lithe_mutex_unlock(condvar->waiting_mutex);
   mcs_pdr_unlock(&condvar->lock, condvar->waiting_qnode);
@@ -45,6 +54,7 @@ int lithe_condvar_wait(lithe_condvar_t* c, lithe_mutex_t* m) {
 
   mcs_lock_qnode_t qnode = {0};
   mcs_pdr_lock(&c->lock, &qnode);
+  lithe_condvar_ensure_queue(c);
   c->waiting_mutex = m;
   c->waiting_qnode = &qnode;
   lithe_context_block(block, c);
@@ -58,6 +68,7 @@ int lithe_condvar_signal(lithe_condvar_t* c) {
 
   mcs_lock_qnode_t qnode = {0};
   mcs_pdr_lock(&c->lock, &qnode);
+  lithe_condvar_ensure_queue(c);
   lithe_context_t *context = TAILQ_FIRST(&c->queue);
   if(context)
     TAILQ_REMOVE(&c->queue, context, link);
@@ -77,6 +88,7 @@ int lithe_condvar_broadcast(lithe_condvar_t* c) {
   mcs_lock_qnode_t qnode = {0};
   while(1) {
     mcs_pdr_lock(&c->lock, &qnode);
+    lithe_condvar_ensure_queue(c);
     lithe_context_t *context = TAILQ_FIRST(&c->queue);
     if(context)
       TAILQ_REMOVE(&c->queue, context, link);
