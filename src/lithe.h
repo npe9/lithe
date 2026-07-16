@@ -72,6 +72,15 @@ lithe_sched_t *lithe_sched_current();
  * requested.
  */
 void lithe_hart_request(int h);
+
+/**
+ * Like lithe_hart_request(), but attribute the demand to @p sched rather than
+ * lithe_sched_current(). Required when enqueueing work on a different fork-join
+ * sched than the caller (e.g. CH4 progress context on the root FJS while rank
+ * contexts run under a hosted child FJS). Using lithe_hart_request() in that
+ * case inflates the caller's harts_needed and starves the owner sched.
+ */
+void lithe_hart_request_for(lithe_sched_t *sched, int h);
  
 /**
  * Grant the current hart to another scheduler.  Triggered by a previous call

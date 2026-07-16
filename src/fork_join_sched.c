@@ -541,11 +541,27 @@ static void fjs_request_harts(int h)
 
 static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 {
+	lithe_sched_t *owner;
+	lithe_sched_t *cur;
+
 	__thread_enqueue(ctx, athead);
 	/* CHANGE 2: when a team-wake batch is open (master's fork/join release
 	 * loop), enqueue all workers first and defer a single hart_request(N) +
-	 * reactor_wake to lithe_fork_join_wake_batch_end(). */
-	fjs_request_harts(1);
+	 * reactor_wake to lithe_fork_join_wake_batch_end().
+	 *
+	 * Cross-sched enqueue (progress ctx on root while caller is a hosted
+	 * child FJS): attribute hart demand to the OWNER sched. Otherwise
+	 * lithe_hart_request() inflates the caller's harts_needed and the
+	 * owner never runs — Allreduce/Finalize livelock under RPH>1. */
+	owner = ctx->context.sched;
+	cur = lithe_sched_current();
+	if (owner != NULL && owner != cur) {
+		lithe_hart_request_for(owner, 1);
+		if (parlib_reactor_pending() > 0)
+			parlib_reactor_wake();
+	} else {
+		fjs_request_harts(1);
+	}
 	if (lithe_sched_trace_enabled()) {
 		lithe_fork_join_sched_t *s =
 			(lithe_fork_join_sched_t *)ctx->context.sched;
@@ -1170,7 +1186,17 @@ void lithe_fork_join_sched_sched_enter(lithe_sched_t *__this)
 
 void lithe_fork_join_sched_sched_exit(lithe_sched_t *__this)
 {
+	lithe_fork_join_sched_t *sched = (void *)__this;
+	uint16_t *harts_needed;
+
 	vconline(vcore_id()) = false;
+	/*
+	 * Stop demanding harts from the parent. Otherwise idle grants can keep
+	 * child->harts > 0 forever and lithe_sched_exit()'s drain loop never
+	 * finishes (hosted RPH>1: MPI_Finalize OK, hang in sched_exit).
+	 */
+	harts_needed = (uint16_t *)&sched->sched.parent_data + 1;
+	*harts_needed = 0;
 }
 
 void lithe_fork_join_sched_child_enter(lithe_sched_t *__this,
@@ -1195,6 +1221,8 @@ void lithe_fork_join_sched_child_exit(lithe_sched_t *__this,
                                       lithe_sched_t *child)
 {
   lithe_fork_join_sched_t *sched = (void *)__this;
+  int spins = 0;
+
   spin_pdr_lock(&sched->child_sched_list_lock);
   TAILQ_REMOVE(&sched->child_sched_list, child, link);
   spin_pdr_unlock(&sched->child_sched_list_lock);
@@ -1203,7 +1231,9 @@ void lithe_fork_join_sched_child_exit(lithe_sched_t *__this,
 	  lithe_sched_trace_emit(LITHE_ST_CHILD_EXIT, sched, 0, LITHE_ST_DEC_OK,
 	                         (int32_t)(uintptr_t)child);
 
-  while (sched->granting_harts)
+  /* Bound the wait: a stuck in-flight grant must not freeze sched_exit
+   * (hosted RPH>1 saw MPI_Finalize OK then hang here). */
+  while (sched->granting_harts && spins++ < 10000000)
     cpu_relax();
 }
 

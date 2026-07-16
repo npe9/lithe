@@ -697,9 +697,12 @@ void lithe_sched_exit()
    * value in lithe_hart_grant() as protected by a parent-scheduler-specific
    * locking function. 
    * Also, do a full blown lithe context yield so that this hart can do useful
-   * work while waiting */
+   * work while waiting.
+   * Bound the drain: hosted RPH>1 teardown can leave a stray child hart
+   * count that never reaches 0; continuing is preferable to wedging Finalize. */
   long n;
-  while ((n = parlib_atomic_read(&child->harts)) != 0) {
+  int drain_spins = 0;
+  while ((n = parlib_atomic_read(&child->harts)) != 0 && drain_spins++ < 2000000) {
     assert(n >= 0);
     lithe_context_yield();
   }
@@ -715,6 +718,23 @@ void lithe_hart_request(int h)
   assert(parent->funcs->hart_request);
   parent->funcs->hart_request(parent, child, h);
   current_sched = child;
+}
+
+void lithe_hart_request_for(lithe_sched_t *sched, int h)
+{
+  lithe_sched_t *saved;
+
+  assert(sched);
+  if (sched == current_sched) {
+    lithe_hart_request(h);
+    return;
+  }
+  /* Temporarily attribute demand to @sched so parent->hart_request and any
+   * recursive lithe_hart_request() see the owning child, not the caller. */
+  saved = current_sched;
+  current_sched = sched;
+  lithe_hart_request(h);
+  current_sched = saved;
 }
 
 static void __lithe_context_yield(uthread_t *uthread, void *arg)

@@ -1,6 +1,6 @@
 #! /bin/sh
 # Generated automatically by config.status (lithe) 1.0
-# Libtool was configured on host easley:
+# Libtool was configured on host tuolumne2149:
 # NOTE: Changes made to this file will be lost: look at ltmain.sh.
 
 # Provide generalized library-building support services.
@@ -91,13 +91,13 @@ EGREP="/usr/bin/grep -E"
 FGREP="/usr/bin/grep -F"
 
 # A BSD- or MS-compatible name lister.
-NM="/usr/bin/nm -B"
+NM="/opt/cray/pe/cce/20.0.0/binutils/x86_64/x86_64-pc-linux-gnu/bin/nm -B"
 
 # Whether we need soft or hard links.
 LN_S="ln -s"
 
 # What is the maximum length of a command?
-max_cmd_len=4718592
+max_cmd_len=3458764513820540925
 
 # Object file suffix (normally "o").
 objext=o
@@ -162,16 +162,16 @@ old_postuninstall_cmds=""
 lock_old_archive_extraction=no
 
 # A C compiler.
-LTCC="gcc"
+LTCC="/p/lustre5/evans117/lithe-docker/src/lithe/build-aux/compile gcc"
 
 # LTCC compiler flags.
-LTCFLAGS="-g -O2 -I/tmp/parlib-standard/include"
+LTCFLAGS="-O2 -g -fno-omit-frame-pointer -I/p/lustre5/evans117/lithe-docker/install-lithe/include"
 
 # Take the output of nm and produce a listing of raw symbols and C names.
-global_symbol_pipe="sed -n -e 's/^.*[	 ]\\([ABCDGIRSTW][ABCDGIRSTW]*\\)[	 ][	 ]*\\([_A-Za-z][_A-Za-z0-9]*\\)\$/\\1 \\2 \\2/p' | sed '/ __gnu_lto/d'"
+global_symbol_pipe=""
 
 # Transform the output of nm in a proper C declaration.
-global_symbol_to_cdecl="sed -n -e 's/^T .* \\(.*\\)\$/extern int \\1();/p' -e 's/^[ABCDGIRSTW][ABCDGIRSTW]* .* \\(.*\\)\$/extern char \\1;/p'"
+global_symbol_to_cdecl=""
 
 # Transform the output of nm into a list of symbols to manually relocate.
 global_symbol_to_import=""
@@ -192,7 +192,7 @@ nm_file_list_spec="@"
 lt_sysroot=
 
 # Command to truncate a binary pipe.
-lt_truncate_bin="/usr/bin/dd bs=4096 count=1"
+lt_truncate_bin="/usr/bin/sed -e 4q"
 
 # The name of the directory that contains temporary libtool files.
 objdir=.libs
@@ -282,10 +282,10 @@ finish_eval=""
 hardcode_into_libs=yes
 
 # Compile-time system search path for libraries.
-sys_lib_search_path_spec="/usr/lib/gcc/x86_64-redhat-linux/11 /usr/lib64 /lib64 /usr/lib /lib "
+sys_lib_search_path_spec="/collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc/x86_64-redhat-linux/13 /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib64 /lib64 /usr/lib64 /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib /lib /usr/lib "
 
 # Detected run-time system search path for libraries.
-sys_lib_dlsearch_path_spec="/lib64 /usr/lib64 /lib /usr/lib /usr/lib64/R/lib /usr/lib64/dyninst /opt/mellanox/hcoll/lib /usr/lib64/pipewire-0.3/jack/ /opt/mellanox/sharp/lib "
+sys_lib_dlsearch_path_spec="/lib64 /usr/lib64 /lib /usr/lib /usr/local/cuda/targets/x86_64-linux/lib /usr/local/cuda-12/targets/x86_64-linux/lib /usr/lib64/R/lib /usr/lib64/atlas /usr/lib64//bind9-export/ /usr/lib64/dyninst      /usr/lib64/iscsi /usr/lib64/ldapotp /usr/lib64/llvm17/lib/ /usr/lib64/mysql /usr/lib64/octave/5.2.0 /opt/mellanox/sharp/lib /opt/dell/srvadmin/lib64 /opt/dell/srvadmin/lib64 /opt/dell/srvadmin/lib64/srvadmin-idrac7 /usr/lib64/tcl8.6 "
 
 # Explicit LT_SYS_LIBRARY_PATH set during ./configure time.
 configure_time_lt_sys_library_path=""
@@ -305,7 +305,7 @@ striplib="strip --strip-unneeded"
 
 
 # The linker used to build libraries.
-LD="/usr/bin/ld -m elf_x86_64"
+LD="/collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/libexec/gcc/x86_64-redhat-linux/13/ld -m elf_x86_64"
 
 # How to create reloadable object files.
 reload_flag=" -r"
@@ -315,7 +315,7 @@ reload_cmds="\$LD\$reload_flag -o \$output\$reload_objs"
 old_archive_cmds="\$AR \$AR_FLAGS \$oldlib\$oldobjs~\$RANLIB \$tool_oldlib"
 
 # A language specific compiler.
-CC="gcc"
+CC="/p/lustre5/evans117/lithe-docker/src/lithe/build-aux/compile gcc"
 
 # Is the compiler the GNU compiler?
 with_gcc=yes
@@ -2636,7 +2636,7 @@ fi
 # a configuration failure hint, and exit.
 func_fatal_configuration ()
 {
-    func_fatal_error ${1+"$@"} \
+    func__fatal_error ${1+"$@"} \
       "See the $PACKAGE documentation for more information." \
       "Fatal configuration error."
 }
@@ -11663,7 +11663,7 @@ build_old_libs=`case $build_libtool_libs in yes) echo no;; *) echo yes;; esac`
 # ### BEGIN LIBTOOL TAG CONFIG: CXX
 
 # The linker used to build libraries.
-LD="/usr/bin/ld -m elf_x86_64"
+LD="/collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/libexec/gcc/x86_64-redhat-linux/13/ld -m elf_x86_64"
 
 # How to create reloadable object files.
 reload_flag=" -r"
@@ -11688,7 +11688,7 @@ pic_flag=" -fPIC -DPIC"
 wl="-Wl,"
 
 # Compiler flag to prevent dynamic linking.
-link_static_flag=""
+link_static_flag="-static"
 
 # Does compiler simultaneously support -c and -o options?
 compiler_c_o="yes"
@@ -11794,17 +11794,17 @@ file_list_spec=""
 hardcode_action=immediate
 
 # The directories searched by this compiler when creating a shared library.
-compiler_lib_search_dirs="/usr/lib/gcc/x86_64-redhat-linux/11 /usr/lib/gcc/x86_64-redhat-linux/11/../../../../lib64 /lib/../lib64 /usr/lib/../lib64 /usr/lib/gcc/x86_64-redhat-linux/11/../../.."
+compiler_lib_search_dirs="/collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc/x86_64-redhat-linux/13 /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc/x86_64-redhat-linux/13/../../../../lib64 /lib/../lib64 /usr/lib/../lib64 /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc/x86_64-redhat-linux/13/../../.."
 
 # Dependencies to place before and after the objects being linked to
 # create a shared library.
-predep_objects="/usr/lib/gcc/x86_64-redhat-linux/11/../../../../lib64/crti.o /usr/lib/gcc/x86_64-redhat-linux/11/crtbeginS.o"
-postdep_objects="/usr/lib/gcc/x86_64-redhat-linux/11/crtendS.o /usr/lib/gcc/x86_64-redhat-linux/11/../../../../lib64/crtn.o"
+predep_objects="/lib/../lib64/crti.o /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc/x86_64-redhat-linux/13/crtbeginS.o"
+postdep_objects="/collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc/x86_64-redhat-linux/13/crtendS.o /lib/../lib64/crtn.o"
 predeps=""
 postdeps="-lstdc++ -lm -lgcc_s -lc -lgcc_s"
 
 # The library search path used internally by the compiler when linking
 # a shared library.
-compiler_lib_search_path="-L/usr/lib/gcc/x86_64-redhat-linux/11 -L/usr/lib/gcc/x86_64-redhat-linux/11/../../../../lib64 -L/lib/../lib64 -L/usr/lib/../lib64 -L/usr/lib/gcc/x86_64-redhat-linux/11/../../.."
+compiler_lib_search_path="-L/collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc/x86_64-redhat-linux/13 -L/collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc -L/collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc/x86_64-redhat-linux/13/../../../../lib64 -L/lib/../lib64 -L/usr/lib/../lib64 -L/collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/bin/../lib/gcc/x86_64-redhat-linux/13/../../.."
 
 # ### END LIBTOOL TAG CONFIG: CXX
