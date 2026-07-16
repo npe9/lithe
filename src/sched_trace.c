@@ -308,7 +308,8 @@ int lithe_sched_trace_dump(void)
 	lithe_sched_trace_counters_t ctrs;
 	ssize_t n;
 
-	if (st_enabled != 1 || !st_inited)
+	/* Finalize-wrap / SIGUSR2 may run before any emit; arm from env. */
+	if (!lithe_sched_trace_enabled() || !st_inited)
 		return -1;
 
 	st_resolve_path();
