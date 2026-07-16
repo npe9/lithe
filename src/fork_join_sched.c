@@ -14,6 +14,7 @@
 #include "fork_join_sched.h"
 #include "lithe.h"
 #include "mutex.h"   /* WARM VCORES: park_warm atomically unlocks a lithe_mutex_t */
+#include "sched_trace.h"
 #include "internal/assert.h"
 
 /* hart_enter idle path: spin briefly before falling through to lithe_hart_yield.
@@ -545,6 +546,14 @@ static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 	 * loop), enqueue all workers first and defer a single hart_request(N) +
 	 * reactor_wake to lithe_fork_join_wake_batch_end(). */
 	fjs_request_harts(1);
+	if (lithe_sched_trace_enabled()) {
+		lithe_fork_join_sched_t *s =
+			(lithe_fork_join_sched_t *)ctx->context.sched;
+		lithe_sched_trace_emit(LITHE_ST_PROGRESS_WAKE, s,
+		                       (uint32_t)ctx->context.id, LITHE_ST_DEC_OK,
+		                       (int32_t)__atomic_load_n(&s->runnable_count,
+		                                                 __ATOMIC_RELAXED));
+	}
 }
 
 /* ===================== WARM VCORES (persistent worker dispatch) ============
@@ -662,6 +671,13 @@ static void warm_park_cb(lithe_context_t *c, void *arg)
 
 void lithe_fork_join_park_warm(void *mx)
 {
+	if (lithe_sched_trace_enabled()) {
+		lithe_context_t *c = lithe_context_self();
+		lithe_sched_trace_emit(LITHE_ST_WARM_PARK,
+		                       c ? c->sched : NULL,
+		                       c ? (uint32_t)c->id : 0,
+		                       LITHE_ST_DEC_OK, 0);
+	}
 	/* lithe_context_block runs the FJS context_block (state=BLOCKED,
 	 * hart_request(-1)) then warm_park_cb, then deschedules the worker. */
 	lithe_context_block(warm_park_cb, mx);
@@ -764,9 +780,17 @@ static lithe_fork_join_context_t *__thread_dequeue()
 
 	int vcoreid = vcore_id();
 	lithe_fork_join_context_t *ctx = NULL;
+	int local_tq;
 
 	/* Try and grab a thread from our queue */
+	local_tq = tqsize(vcoreid);
 	ctx = tdequeue(vcoreid);
+	if (ctx && lithe_sched_trace_enabled()) {
+		lithe_sched_trace_emit(LITHE_ST_DEQUEUE_LOCAL, cur,
+		                       (uint32_t)ctx->context.id, LITHE_ST_DEC_OK,
+		                       (int32_t)__atomic_load_n(&cur->runnable_count,
+		                                                 __ATOMIC_RELAXED));
+	}
 
 	/* Tradespace: none/local => never steal from other vcores on this sched. */
 	fjs_tradespace_init_once();
@@ -809,6 +833,15 @@ static lithe_fork_join_context_t *__thread_dequeue()
 			return ctx;
 		}
 
+		if (lithe_sched_trace_enabled()) {
+			uint8_t dec = LITHE_ST_DEC_OK;
+			/* Incorrect if we steal while our local queue was nonempty. */
+			if (local_tq > 0)
+				dec |= LITHE_ST_DEC_STEAL_LOCAL_NONEMPTY;
+			lithe_sched_trace_emit(LITHE_ST_STEAL_ATTEMPT, cur, 0, dec,
+			                       (int32_t)local_tq);
+		}
+
 		/* First try doing power of two choices. */
 		int choice[2] = { rand_r(&rseed(vcoreid)) % num_vcores(),
 		                  rand_r(&rseed(vcoreid)) % num_vcores()};
@@ -829,6 +862,20 @@ static lithe_fork_join_context_t *__thread_dequeue()
 				if (ctx) break;
 				i = (i + 1) % max_vcores();
 			}
+		}
+
+		if (lithe_sched_trace_enabled()) {
+			if (ctx)
+				lithe_sched_trace_emit(LITHE_ST_STEAL_SUCCESS, cur,
+				                       (uint32_t)ctx->context.id,
+				                       LITHE_ST_DEC_OK,
+				                       (int32_t)ctx->preferred_vcq);
+			else
+				lithe_sched_trace_emit(LITHE_ST_STEAL_FAIL, cur, 0,
+				                       LITHE_ST_DEC_OK,
+				                       (int32_t)__atomic_load_n(
+					                       &cur->runnable_count,
+					                       __ATOMIC_RELAXED));
 		}
 	}
 	return ctx;
@@ -978,6 +1025,7 @@ void lithe_fork_join_sched_init(lithe_fork_join_sched_t *sched,
 
   sched->num_contexts = 1;
   sched->granting_harts = 0;
+  sched->teardown_quiesce = 0;
   sched->runnable_count = 0;  /* CHANGE 1: O(1) any-runnable indicator */
   sched->warm_ready_count = 0;  /* WARM VCORES: GO-and-unclaimed warm workers */
   TAILQ_INIT(&sched->child_sched_list);
@@ -1137,6 +1185,10 @@ void lithe_fork_join_sched_child_enter(lithe_sched_t *__this,
 	spin_pdr_lock(&sched->child_sched_list_lock);
 	TAILQ_INSERT_TAIL(&sched->child_sched_list, child, link);
 	spin_pdr_unlock(&sched->child_sched_list_lock);
+
+	if (lithe_sched_trace_enabled())
+		lithe_sched_trace_emit(LITHE_ST_CHILD_ENTER, sched, 0, LITHE_ST_DEC_OK,
+		                       (int32_t)(uintptr_t)child);
 }
 
 void lithe_fork_join_sched_child_exit(lithe_sched_t *__this,
@@ -1146,6 +1198,10 @@ void lithe_fork_join_sched_child_exit(lithe_sched_t *__this,
   spin_pdr_lock(&sched->child_sched_list_lock);
   TAILQ_REMOVE(&sched->child_sched_list, child, link);
   spin_pdr_unlock(&sched->child_sched_list_lock);
+
+  if (lithe_sched_trace_enabled())
+	  lithe_sched_trace_emit(LITHE_ST_CHILD_EXIT, sched, 0, LITHE_ST_DEC_OK,
+	                         (int32_t)(uintptr_t)child);
 
   while (sched->granting_harts)
     cpu_relax();
@@ -1158,11 +1214,25 @@ void lithe_fork_join_sched_hart_return(lithe_sched_t *__this,
 	uint16_t *harts_granted = (uint16_t*)&child->parent_data;
 	atomic_add(harts_granted, -1);
 	vconline(vcore_id()) = true;
+	if (lithe_sched_trace_enabled())
+		lithe_sched_trace_emit(LITHE_ST_HART_RETURN, __this, 0, LITHE_ST_DEC_OK,
+		                       (int32_t)(uintptr_t)child);
 }
 
 static void decrement(void *gh)
 {
   __sync_fetch_and_add((size_t*)gh, -1);
+}
+
+/* Hint: child FJS runnable+warm, or -1 if child is not FJS. */
+static int fjs_child_work_hint(lithe_sched_t *child)
+{
+	if (!child || child->funcs != &lithe_fork_join_sched_funcs)
+		return -1;
+	lithe_fork_join_sched_t *cs = (lithe_fork_join_sched_t *)child;
+	long r = __atomic_load_n(&cs->runnable_count, __ATOMIC_RELAXED);
+	long w = __atomic_load_n(&cs->warm_ready_count, __ATOMIC_RELAXED);
+	return (int)(r + w);
 }
 
 /* Try to grant one hart to child; may not return if grant succeeds. */
@@ -1172,6 +1242,18 @@ static void fjs_try_hart_grant_child(lithe_fork_join_sched_t *sched,
   uint16_t *harts_granted = (uint16_t*)&child->parent_data;
   uint16_t *harts_needed = (uint16_t*)&child->parent_data + 1;
   if (atomic_add(harts_granted, 1) + 1 <= *harts_needed) {
+    if (lithe_sched_trace_enabled()) {
+      uint8_t dec = LITHE_ST_DEC_OK;
+      long parent_r =
+          __atomic_load_n(&sched->runnable_count, __ATOMIC_RELAXED);
+      int child_w = fjs_child_work_hint(child);
+      if (parent_r > 0)
+        dec |= LITHE_ST_DEC_GRANT_PARENT_RUNNABLE;
+      if (child_w == 0)
+        dec |= LITHE_ST_DEC_GRANT_EMPTY_CHILD;
+      lithe_sched_trace_emit(LITHE_ST_HART_GRANT, sched, 0, dec,
+                             child_w >= 0 ? child_w : (int32_t)*harts_needed);
+    }
     vconline(vcore_id()) = false;
     lithe_hart_grant(child, decrement, &sched->granting_harts);
   }
@@ -1225,6 +1307,9 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
     if (w != NULL) {
       assert(w->context.uth.tls_desc != NULL);
       w->state = FJS_CTX_RUNNING;
+      if (lithe_sched_trace_enabled())
+        lithe_sched_trace_emit(LITHE_ST_WARM_CLAIM, sched,
+                               (uint32_t)w->context.id, LITHE_ST_DEC_OK, 0);
       fjs_stats_run_enter();
       lithe_context_run(&w->context);
     }
@@ -1259,6 +1344,12 @@ void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
   if (!vconline(vcore_id()))
     vconline(vcore_id()) = true;
 
+  if (lithe_sched_trace_enabled()) {
+    lithe_sched_trace_emit(LITHE_ST_HART_ENTER, sched, 0, LITHE_ST_DEC_OK,
+                           (int32_t)__atomic_load_n(&sched->runnable_count,
+                                                     __ATOMIC_RELAXED));
+  }
+
 restart:
   /* Scheduler-driven netpoll: drain completed fd waits before selecting the
    * next continuation. This keeps I/O readiness in the normal Lithe handoff
@@ -1281,6 +1372,9 @@ restart:
    * or the reactor wake fd is poked by a newly-runnable context, then loops
    * back through the full scheduler decision path. */
   while (parlib_reactor_pending() > 0) {
+    if (lithe_sched_trace_enabled())
+      lithe_sched_trace_emit(LITHE_ST_REACTOR_BLOCK, sched, 0, LITHE_ST_DEC_OK,
+                             (int32_t)parlib_reactor_pending());
     (void)parlib_reactor_drive(-1);
     goto restart;
   }
@@ -1302,6 +1396,9 @@ restart:
       if (!TAILQ_EMPTY(&sched->child_sched_list) ||
           parlib_reactor_pending() > 0) {
         fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
+        if (lithe_sched_trace_enabled())
+          lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0, LITHE_ST_DEC_OK,
+                                 1);
         goto restart;
       }
       /* Peek at this vcore's runqueue without dequeuing -- another vcore
@@ -1309,12 +1406,26 @@ restart:
        * the race correctly (it will also try work-stealing). */
       if (tqsize_s(sched, my_vc) > 0) {
         fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
+        if (lithe_sched_trace_enabled())
+          lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0, LITHE_ST_DEC_OK,
+                                 2);
         goto restart;
       }
     }
     fjs_hart_enter_spin_update(my_vc, /*succeeded=*/0);
   }
 
+  {
+    long rc = __atomic_load_n(&sched->runnable_count, __ATOMIC_RELAXED);
+    uint8_t dec = LITHE_ST_DEC_OK;
+    if (rc > 0)
+      dec |= LITHE_ST_DEC_IDLE_WITH_RUNNABLE;
+    /* Rapid idle under VCORE_LIMIT=1: flag for offline rate analysis. */
+    if (max_vcores() <= 1)
+      dec |= LITHE_ST_DEC_SELF_RESCHED_HOT;
+    if (lithe_sched_trace_enabled())
+      lithe_sched_trace_emit(LITHE_ST_IDLE_YIELD, sched, 0, dec, (int32_t)rc);
+  }
   vconline(vcore_id()) = false;
   lithe_hart_yield();
 }
@@ -1326,6 +1437,9 @@ void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
 	assert(ctx->state == FJS_CTX_RUNNING);
 	ctx->state = FJS_CTX_BLOCKED;
 	fjs_stats_run_leave();
+	if (lithe_sched_trace_enabled())
+		lithe_sched_trace_emit(LITHE_ST_CTX_BLOCK, __this,
+		                       (uint32_t)c->id, LITHE_ST_DEC_OK, 0);
 	lithe_hart_request(-1);
 }
 
@@ -1334,6 +1448,9 @@ void lithe_fork_join_sched_context_unblock(lithe_sched_t *__this,
 {
 	lithe_fork_join_context_t *ctx = (void*)c;
 	assert(ctx->state == FJS_CTX_BLOCKED);
+	if (lithe_sched_trace_enabled())
+		lithe_sched_trace_emit(LITHE_ST_CTX_UNBLOCK, __this,
+		                       (uint32_t)c->id, LITHE_ST_DEC_OK, 0);
 	schedule_context(ctx, false);
 }
 
@@ -1343,6 +1460,17 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 	lithe_fork_join_context_t *ctx = (void*)c;
 	assert(ctx->state == FJS_CTX_RUNNING);
 	fjs_stats_run_leave();
+	if (lithe_sched_trace_enabled()) {
+		lithe_fork_join_sched_t *s = (lithe_fork_join_sched_t *)__this;
+		long rc = __atomic_load_n(&s->runnable_count, __ATOMIC_RELAXED);
+		uint8_t dec = LITHE_ST_DEC_OK;
+		/* After enqueue below, peers waiting include this context; flag if
+		 * others were already runnable (starvation / yield-instead-of-park). */
+		if (rc > 0)
+			dec |= LITHE_ST_DEC_YIELD_WITH_PEERS;
+		lithe_sched_trace_emit(LITHE_ST_CTX_YIELD, __this,
+		                       (uint32_t)c->id, dec, (int32_t)rc);
+	}
 	__thread_enqueue(ctx, false);
 }
 

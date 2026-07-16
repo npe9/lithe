@@ -105,6 +105,8 @@ typedef struct {
    * the offset-0 embedded lithe_sched_t), so appending it is ABI-safe for
    * libomp/OMPI which link liblithe.so dynamically. */
   long runnable_count;
+  /* When set, hart_enter yields immediately (process teardown). */
+  volatile int teardown_quiesce;
   /* WARM VCORES: number of warm-parked workers (FJS_WARM_SLOT) that have been
    * marked GO by a fork (lithe_fork_join_resume_warm) and not yet claimed by a
    * hart_enter. A vcore reads this once: if 0, no warm worker is resumable, so
