@@ -81,13 +81,40 @@ static void st_resolve_path(void)
 static void st_on_sigusr2(int sig)
 {
 	(void)sig;
-	(void)lithe_sched_trace_dump();
+	/* Safe no-op if tracing never armed — must not terminate the process. */
+	if (st_enabled == 1 && st_inited)
+		(void)lithe_sched_trace_dump();
 }
 
 static void st_atexit_dump(void)
 {
 	if (st_enabled == 1)
 		(void)lithe_sched_trace_dump();
+}
+
+static void st_init_once(void);
+
+/* Install SIGUSR2 early when LITHE_SCHED_TRACE is set so a launcher's
+ * kill -USR2 cannot hit the default terminate disposition (exit 140)
+ * before the first FJS emit. Defer ring alloc to st_init_once (needs
+ * max_vcores). Lithified exits often skip atexit via _exit. */
+static void st_ctor_early_arm(void) __attribute__((constructor(101)));
+static void st_ctor_early_arm(void)
+{
+	const char *e = getenv("LITHE_SCHED_TRACE");
+	struct sigaction sa;
+
+	if (!(e && *e && atoi(e)))
+		return;
+	st_enabled = 1;
+	if (st_sigusr2_installed)
+		return;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = st_on_sigusr2;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	if (sigaction(SIGUSR2, &sa, &st_old_sigusr2) == 0)
+		st_sigusr2_installed = 1;
 }
 
 static void st_init_once(void)
@@ -153,9 +180,10 @@ int lithe_sched_trace_enabled(void)
 	if (st_enabled < 0) {
 		const char *e = getenv("LITHE_SCHED_TRACE");
 		st_enabled = (e && *e && atoi(e)) ? 1 : 0;
-		if (st_enabled)
-			st_init_once();
 	}
+	/* ctor may set st_enabled=1 before rings exist */
+	if (st_enabled == 1 && !st_inited)
+		st_init_once();
 	return st_enabled == 1;
 }
 
