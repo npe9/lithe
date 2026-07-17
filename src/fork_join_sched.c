@@ -68,6 +68,41 @@ struct fjs_spin_slot {
 
 static struct fjs_spin_slot fjs_hart_enter_spin_cur[LITHE_FJS_HART_ENTER_SPIN_MAX_VCORES];
 
+/* Harts currently blocked in parlib_reactor_drive (infinite or timed). Used so
+ * schedule_context only writes wake_efd when a sibling is actually parked —
+ * unconditional wake on every enqueue was a syscall tax on the hot path.
+ *
+ * Lost-wakeup protocol: parker fetch_adds, then rechecks runqueue/pending
+ * before drive(); waker enqueues then calls fjs_maybe_reactor_wake(). If the
+ * waker races before the add, the recheck sees runnable and skips park; if
+ * after drive starts, wake_efd unblocks epoll_wait. */
+static int fjs_reactor_parked_harts = 0;
+
+static inline void fjs_maybe_reactor_wake(void)
+{
+	if (__atomic_load_n(&fjs_reactor_parked_harts, __ATOMIC_ACQUIRE) > 0 ||
+	    parlib_reactor_pending() > 0)
+		parlib_reactor_wake();
+}
+
+/* Returns 1 if work appeared before park (caller should restart), 0 after drive. */
+static inline int fjs_reactor_drive_parked(lithe_fork_join_sched_t *sched,
+                                          int my_vc, int timeout_ms)
+{
+	__atomic_fetch_add(&fjs_reactor_parked_harts, 1, __ATOMIC_ACQ_REL);
+	if (timeout_ms >= 0 &&
+	    (parlib_reactor_pending() > 0 ||
+	     tqsize_s(sched, my_vc) > 0 ||
+	     __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
+	     __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0)) {
+		__atomic_fetch_sub(&fjs_reactor_parked_harts, 1, __ATOMIC_ACQ_REL);
+		return 1;
+	}
+	(void)parlib_reactor_drive(timeout_ms);
+	__atomic_fetch_sub(&fjs_reactor_parked_harts, 1, __ATOMIC_ACQ_REL);
+	return 0;
+}
+
 static void fjs_hart_enter_spin_init(void)
 {
 	if (__atomic_load_n(&fjs_hart_enter_spin_loops_init, __ATOMIC_ACQUIRE))
@@ -221,7 +256,15 @@ static lithe_fjs_steal_mode_t fjs_steal_mode = LITHE_FJS_STEAL_DEFAULT;
 static lithe_fjs_hart_order_t fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
 static int fjs_progress_sched_child = 0;
 static int fjs_tradespace_init = 0;
-static unsigned int fjs_progress_spin_max = 0;
+/* Default: spin before CQ park. 0 meant every empty progress tick paid
+ * parlib_reactor_wait/epoll — ~0.5–0.8ms Barrier+Allreduce for hosted P1K2
+ * vs ~8us vanilla. MTL CQ spin now yields when runnable_count>0 so this is
+ * safe under oversubscription (hosted ranks / OMP>harts). Override with
+ * LITHE_PROGRESS_SPIN_MAX=0 to restore immediate park. */
+#ifndef LITHE_PROGRESS_SPIN_MAX_DEFAULT
+#define LITHE_PROGRESS_SPIN_MAX_DEFAULT 4096u
+#endif
+static unsigned int fjs_progress_spin_max = LITHE_PROGRESS_SPIN_MAX_DEFAULT;
 
 static lithe_fork_join_sched_t *lithe_progress_child_sched;
 static int lithe_progress_child_registered;
@@ -512,8 +555,8 @@ void lithe_fork_join_wake_batch_end(void)
 	 * one reactor poke for any vcores parked in parlib_reactor_drive(-1). */
 	if (h > 0)
 		lithe_hart_request(h);
-	if (w && parlib_reactor_pending() > 0)
-		parlib_reactor_wake();
+	if (w)
+		fjs_maybe_reactor_wake();
 }
 
 /* Issue (or batch) a hart request + reactor poke. Factored out of
@@ -529,14 +572,10 @@ static void fjs_request_harts(int h)
 		return;
 	}
 	lithe_hart_request(h);
-	/* Wake any sibling vcore parked in parlib_reactor_drive(-1). lithe's
-	 * own hart-grant pathway would normally do this via the parent
-	 * scheduler's kernel-level wakeup, but a vcore parked in epoll_wait
-	 * doesn't see those signals. The wake_efd registered in the central
-	 * reactor pops them out so they can pick up the work we just queued
-	 * (or yield the hart back to the parent if we get there first). */
-	if (parlib_reactor_pending() > 0)
-		parlib_reactor_wake();
+	/* Wake siblings parked in reactor_drive (incl. timed idle park on
+	 * wake_efd when pending==0). Gating only on pending>0 left surplus
+	 * vcores yield-thrashing through empty tdequeue/spinlock. */
+	fjs_maybe_reactor_wake();
 }
 
 static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
@@ -557,8 +596,7 @@ static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 	cur = lithe_sched_current();
 	if (owner != NULL && owner != cur) {
 		lithe_hart_request_for(owner, 1);
-		if (parlib_reactor_pending() > 0)
-			parlib_reactor_wake();
+		fjs_maybe_reactor_wake();
 	} else {
 		fjs_request_harts(1);
 	}
@@ -1013,6 +1051,16 @@ long lithe_fork_join_current_runnable_count(void)
                          __ATOMIC_ACQUIRE);
 }
 
+int lithe_fork_join_should_yield_to_runnable(void)
+{
+  long r = lithe_fork_join_current_runnable_count();
+  if (r <= 0)
+    return 0;
+  /* Self is RUNNING on a hart; peers on the runqueue need a hart only if
+   * there are not enough vcores for (self + runnable). */
+  return (r + 1) > (long)num_vcores();
+}
+
 void lithe_fork_join_sched_destroy(lithe_fork_join_sched_t *sched)
 {
   lithe_fork_join_sched_cleanup(sched);
@@ -1265,12 +1313,44 @@ static int fjs_child_work_hint(lithe_sched_t *child)
 	return (int)(r + w);
 }
 
+/* True if child has outstanding hart demand (harts_needed > harts_granted). */
+static int fjs_child_needs_hart(lithe_sched_t *child)
+{
+	uint16_t *harts_granted = (uint16_t *)&child->parent_data;
+	uint16_t *harts_needed = (uint16_t *)&child->parent_data + 1;
+	return *harts_granted < *harts_needed;
+}
+
+/* Peek whether any registered child still wants a hart. Used to avoid
+ * idle-spin → hart_enter restart thrash when the child list is non-empty
+ * but nobody needs a grant (profile: fjs_try_hart_grant_child / spinlock). */
+static int fjs_any_child_needs_hart(lithe_fork_join_sched_t *sched)
+{
+	int need = 0;
+	lithe_sched_t *child;
+
+	if (TAILQ_EMPTY(&sched->child_sched_list))
+		return 0;
+	spin_pdr_lock(&sched->child_sched_list_lock);
+	TAILQ_FOREACH(child, &sched->child_sched_list, link) {
+		if (fjs_child_needs_hart(child)) {
+			need = 1;
+			break;
+		}
+	}
+	spin_pdr_unlock(&sched->child_sched_list_lock);
+	return need;
+}
+
 /* Try to grant one hart to child; may not return if grant succeeds. */
 static void fjs_try_hart_grant_child(lithe_fork_join_sched_t *sched,
                                      lithe_sched_t *child)
 {
   uint16_t *harts_granted = (uint16_t*)&child->parent_data;
   uint16_t *harts_needed = (uint16_t*)&child->parent_data + 1;
+  /* Cheap reject before atomic_add: empty demand still paid spinlock tax. */
+  if (*harts_granted >= *harts_needed)
+    return;
   if (atomic_add(harts_granted, 1) + 1 <= *harts_needed) {
     if (lithe_sched_trace_enabled()) {
       uint8_t dec = LITHE_ST_DEC_OK;
@@ -1293,6 +1373,9 @@ static void fjs_try_hart_grant_child(lithe_fork_join_sched_t *sched,
 static void fjs_hart_grant_children(lithe_fork_join_sched_t *sched)
 {
   if (TAILQ_EMPTY(&sched->child_sched_list))
+    return;
+  /* No child with harts_needed > harts_granted: skip list rotate + atomics. */
+  if (!fjs_any_child_needs_hart(sched))
     return;
 
   fjs_tradespace_init_once();
@@ -1405,16 +1488,17 @@ restart:
     if (lithe_sched_trace_enabled())
       lithe_sched_trace_emit(LITHE_ST_REACTOR_BLOCK, sched, 0, LITHE_ST_DEC_OK,
                              (int32_t)parlib_reactor_pending());
-    (void)parlib_reactor_drive(-1);
+    /* timeout_ms < 0: must drain waiters; skip empty-runqueue recheck. */
+    (void)fjs_reactor_drive_parked(sched, vcore_id(), -1);
     goto restart;
   }
 
-  /* Adaptive spin-then-yield: a bounded cpu_relax loop catches work that
+  /* Adaptive spin-then-park: a bounded cpu_relax loop catches work that
    * becomes runnable in the few hundred ns after we drained the runqueue.
    * The check cost is two integer-load checks per pause, so a busy run loop
    * pays at most fjs_hart_enter_spin_cur[vc] PAUSE-ish cycles before
-   * yielding. Per-vcore counter doubles on success (work appeared during
-   * the spin) and halves on failure (had to yield anyway); bounded by
+   * parking. Per-vcore counter doubles on success (work appeared during
+   * the spin) and halves on failure (had to park); bounded by
    * LITHE_FJS_HART_ENTER_SPIN_{MIN,MAX}. LITHE_FJS_HART_ENTER_SPIN_LOOPS=0
    * disables. */
   fjs_hart_enter_spin_init();
@@ -1423,18 +1507,25 @@ restart:
     unsigned int budget = fjs_hart_enter_spin_budget(my_vc);
     for (unsigned int i = 0; i < budget; i++) {
       cpu_relax();
-      if (!TAILQ_EMPTY(&sched->child_sched_list) ||
-          parlib_reactor_pending() > 0) {
+      /* Reactor fd readiness is real work. A non-empty child_sched_list is
+       * NOT — registered children with harts_needed==0 used to make every
+       * idle spin "succeed" and restart into fjs_hart_grant_children forever
+       * (hosted P1K2 perf: ~25% spinlock_lock + ~15% fjs_try_hart_grant_child).
+       * Peek child demand every 64th iter (spinlock) so the hot pause path
+       * stays cheap when the list is idle. */
+      if (parlib_reactor_pending() > 0 ||
+          ((i & 63u) == 0 && fjs_any_child_needs_hart(sched))) {
         fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
         if (lithe_sched_trace_enabled())
           lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0, LITHE_ST_DEC_OK,
                                  1);
         goto restart;
       }
-      /* Peek at this vcore's runqueue without dequeuing -- another vcore
-       * may have just enqueued. __thread_dequeue inside restart will resolve
-       * the race correctly (it will also try work-stealing). */
-      if (tqsize_s(sched, my_vc) > 0) {
+      /* Peek local runqueue OR any sched-wide RUNNABLE/WARM (stealable on
+       * other vcores). Checking only tqsize(my_vc) missed ready peers. */
+      if (tqsize_s(sched, my_vc) > 0 ||
+          __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
+          __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0) {
         fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
         if (lithe_sched_trace_enabled())
           lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0, LITHE_ST_DEC_OK,
@@ -1443,6 +1534,59 @@ restart:
       }
     }
     fjs_hart_enter_spin_update(my_vc, /*succeeded=*/0);
+  }
+
+  /* Adaptive idle park on wake_efd (pending==0): epoll_wait with a short
+   * growing timeout so a small spare of idle harts stop burning empty
+   * tdequeue/spinlock cycles. Infinite drive(-1) here deadlocks Finalize
+   * when nobody pokes wake_efd; pending>0 still uses the infinite drive
+   * above. Clearly-surplus harts (owned >> demand) skip park and yield:
+   * eventfd wakes every parked sibling, so parking dozens of surplus
+   * vcores stampedes them on every schedule_context (VCORE=96 P1K2). */
+  {
+    long rc = __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE);
+    long wc = __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE);
+    long owned = (long)parlib_atomic_read(&sched->sched.harts);
+    long demand = rc + wc + 1; /* +1 spare hart for latency */
+    if (parlib_reactor_pending() > 0)
+      demand += 1;
+    if (owned > demand + 1) {
+      /* Surplus: yield immediately (base may futex-park the OS thread). */
+    } else if (parlib_reactor_ensure_init() == 0) {
+      static __thread unsigned idle_park_streak;
+      int my_vc = vcore_id();
+idle_park_again:
+      {
+        int ms = 1;
+        if (idle_park_streak >= 2u)
+          ms = 4;
+        if (idle_park_streak >= 8u)
+          ms = 16;
+        if (idle_park_streak >= 16u)
+          ms = 64;
+        if (lithe_sched_trace_enabled())
+          lithe_sched_trace_emit(LITHE_ST_REACTOR_BLOCK, sched, 0,
+                                 LITHE_ST_DEC_OK, ms);
+        if (fjs_reactor_drive_parked(sched, my_vc, ms)) {
+          idle_park_streak = 0;
+          goto restart;
+        }
+        if (parlib_reactor_pending() > 0 ||
+            tqsize_s(sched, my_vc) > 0 ||
+            __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
+            __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0 ||
+            ((idle_park_streak & 3u) == 0 &&
+             fjs_any_child_needs_hart(sched))) {
+          idle_park_streak = 0;
+          goto restart;
+        }
+        if (idle_park_streak < 24u) {
+          idle_park_streak++;
+          goto idle_park_again;
+        }
+        idle_park_streak = 0;
+      }
+    }
   }
 
   {

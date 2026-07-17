@@ -198,7 +198,9 @@ lithe_fork_join_sched_t *lithe_fork_join_sched_progress_sched(void);
 int lithe_fork_join_sched_is_progress_child(lithe_sched_t *sched);
 lithe_fjs_steal_mode_t lithe_fork_join_get_steal_mode(void);
 lithe_fjs_hart_order_t lithe_fork_join_get_hart_order(void);
-/* Bounded CQ/reactor spin before block (LITHE_PROGRESS_SPIN_MAX); 0 = disabled. */
+/* Bounded CQ/reactor spin before block (LITHE_PROGRESS_SPIN_MAX).
+ * Default 4096 when unset; 0 disables (immediate park). Spin loops must
+ * yield only when lithe_fork_join_should_yield_to_runnable() (hart scarcity). */
 unsigned int lithe_progress_spin_max(void);
 
 /* Number of RUNNABLE-but-unscheduled contexts on the CURRENT fork-join sched
@@ -208,6 +210,15 @@ unsigned int lithe_progress_spin_max(void);
  * current sched is not a fork-join sched. See fork_join_sched.c for the full
  * livelock rationale. */
 long lithe_fork_join_current_runnable_count(void);
+
+/*
+ * True when a waiting context should lithe_context_yield() to drain RUNNABLE
+ * peers. Only under hart scarcity: (runnable_count + 1) > num_vcores().
+ * When VCORE >= concurrent waiters, yielding creates a yield-storm (each waiter
+ * enqueues itself RUNNABLE, the peer yields back, forever) — profile hotspot
+ * on hosted P1K2. In that case callers should CQ-spin / opal_progress_block.
+ */
+int lithe_fork_join_should_yield_to_runnable(void);
 
 /* Scheduler creation, initialization, etc. for the lithe_fork_join_sched. */
 lithe_fork_join_sched_t *lithe_fork_join_sched_create();
