@@ -361,8 +361,10 @@ static void fjs_tradespace_init_once(void)
 		if (e && *e) {
 			char *end = NULL;
 			unsigned long v = strtoul(e, &end, 10);
-			if (end != e && v >= 1 && v <= (unsigned long)max_vcores())
+			if (end != e && v >= 1 && v <= (unsigned long)max_vcores()) {
+				/* soft_cap = RPH (LITHE_FJS_MAX_ONLINE_HARTS still wins above). */
 				fjs_soft_hart_cap = (int)v;
+			}
 		}
 	}
 

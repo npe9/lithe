@@ -31,9 +31,9 @@ src/liblithe_la-fork_join_sched.lo: src/fork_join_sched.c \
  /usr/include/bits/stdio.h /usr/include/string.h \
  /usr/include/bits/types/locale_t.h /usr/include/bits/types/__locale_t.h \
  /usr/include/strings.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/waitfreelist.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/waitfreelist.h \
  /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc/x86_64-redhat-linux/13/include/stdbool.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/arch.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/arch.h \
  /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc/x86_64-redhat-linux/13/include/stdint.h \
  /usr/include/stdint.h /usr/include/bits/wchar.h \
  /usr/include/bits/stdint-uintn.h /usr/include/unistd.h \
@@ -47,17 +47,17 @@ src/liblithe_la-fork_join_sched.lo: src/fork_join_sched.c \
  /usr/include/asm-generic/bitsperlong.h /usr/include/linux/posix_types.h \
  /usr/include/linux/stddef.h /usr/include/asm/posix_types.h \
  /usr/include/asm/posix_types_64.h /usr/include/asm-generic/posix_types.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/parlib-config.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/reactor.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/arch.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/parlib-config.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/reactor.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/arch.h \
  src/fork_join_sched.h src/sched.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/atomic.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/atomic.h \
  src/context.h /usr/include/sys/queue.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/uthread.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/context.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/ucontext.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/common.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/vcore.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/uthread.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/context.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/ucontext.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/common.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/vcore.h \
  /usr/include/sys/param.h \
  /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc/x86_64-redhat-linux/13/include/limits.h \
  /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc/x86_64-redhat-linux/13/include/syslimits.h \
@@ -76,24 +76,24 @@ src/liblithe_la-fork_join_sched.lo: src/fork_join_sched.c \
  /usr/include/bits/sigthread.h /usr/include/bits/param.h \
  /usr/include/linux/param.h /usr/include/asm/param.h \
  /usr/include/asm-generic/param.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/tls.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/export.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/atomic.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/event.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/spinlock.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/tls.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/export.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/atomic.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/event.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/spinlock.h \
  /usr/include/errno.h /usr/include/bits/errno.h \
  /usr/include/linux/errno.h /usr/include/asm/errno.h \
  /usr/include/asm-generic/errno.h /usr/include/asm-generic/errno-base.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/uthread.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/uthread.h \
  src/lithe.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/parlib.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/mcs.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/dtls.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/spinlock.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/parlib.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/mcs.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/dtls.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/spinlock.h \
  src/hart.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/vcore.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/vcore.h \
  src/mutex.h \
- /p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/mcs.h \
+ /usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/mcs.h \
  src/sched_trace.h src/internal/assert.h /usr/include/assert.h
 /usr/include/stdc-predef.h:
 /usr/include/sys/mman.h:
@@ -152,9 +152,9 @@ src/liblithe_la-fork_join_sched.lo: src/fork_join_sched.c \
 /usr/include/bits/types/locale_t.h:
 /usr/include/bits/types/__locale_t.h:
 /usr/include/strings.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/waitfreelist.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/waitfreelist.h:
 /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc/x86_64-redhat-linux/13/include/stdbool.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/arch.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/arch.h:
 /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc/x86_64-redhat-linux/13/include/stdint.h:
 /usr/include/stdint.h:
 /usr/include/bits/wchar.h:
@@ -180,19 +180,19 @@ src/liblithe_la-fork_join_sched.lo: src/fork_join_sched.c \
 /usr/include/asm/posix_types.h:
 /usr/include/asm/posix_types_64.h:
 /usr/include/asm-generic/posix_types.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/parlib-config.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/reactor.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/arch.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/parlib-config.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/reactor.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/arch.h:
 src/fork_join_sched.h:
 src/sched.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/atomic.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/atomic.h:
 src/context.h:
 /usr/include/sys/queue.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/uthread.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/context.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/ucontext.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/common.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/vcore.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/uthread.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/context.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/ucontext.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/common.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/vcore.h:
 /usr/include/sys/param.h:
 /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc/x86_64-redhat-linux/13/include/limits.h:
 /collab/usr/global/tools/tce4/packages/gcc/gcc-13.3.1/lib/gcc/x86_64-redhat-linux/13/include/syslimits.h:
@@ -224,27 +224,27 @@ src/context.h:
 /usr/include/linux/param.h:
 /usr/include/asm/param.h:
 /usr/include/asm-generic/param.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/tls.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/export.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/atomic.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/event.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/spinlock.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/tls.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/export.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/atomic.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/event.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/spinlock.h:
 /usr/include/errno.h:
 /usr/include/bits/errno.h:
 /usr/include/linux/errno.h:
 /usr/include/asm/errno.h:
 /usr/include/asm-generic/errno.h:
 /usr/include/asm-generic/errno-base.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/uthread.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/uthread.h:
 src/lithe.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/parlib.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/mcs.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/dtls.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/spinlock.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/parlib.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/mcs.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/dtls.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/spinlock.h:
 src/hart.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/vcore.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/vcore.h:
 src/mutex.h:
-/p/lustre5/evans117/lithe-docker/install-lithe/include/parlib/mcs.h:
+/usr/workspace/evans117/lithe-docker/install-lithe/include/parlib/mcs.h:
 src/sched_trace.h:
 src/internal/assert.h:
 /usr/include/assert.h:
