@@ -458,8 +458,32 @@ static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h
 {
   assert(root_sched == child);
 
+  if (h < 0) {
+    /* Floor at 0: idle-yield release must not underflow the demand ceiling. */
+    for (;;) {
+      long cur = parlib_atomic_read(&root_sched_harts_needed);
+      long neu = cur + (long)h;
+      if (neu < 0)
+        neu = 0;
+      if (parlib_atomic_cas(&root_sched_harts_needed, cur, neu))
+        break;
+    }
+    return;
+  }
+
   __sync_fetch_and_add(&root_sched_harts_needed, h);
   if (h > 0) {
+    /* Only wake/claim idle vcores when we still have a grant deficit.
+     * Unconditional maybe_vcore_request(h) false-claims wake_me_up flags on
+     * surplus base-idle vcores even when root already holds enough harts:
+     * they exit maybe_vcore_yield, fail the grant check, and grow adaptive
+     * park_spin (up to ~2M) — a VCORE=96 stampede around every enqueue. */
+    long have = root_sched ? parlib_atomic_read(&root_sched->harts) : 0;
+    long need = parlib_atomic_read(&root_sched_harts_needed);
+    long deficit = need - have;
+    if (deficit < 1)
+      return;
+    int wake_n = (deficit < (long)h) ? (int)deficit : h;
     /* Wake any vcore parked in parlib_reactor_drive(-1). The maybe_vcore_request
      * path below only notices spinning vcores (via the wake_me_up flag set
      * inside maybe_vcore_yield) and otherwise asks the kernel for a brand-new
@@ -474,8 +498,13 @@ static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h
      * extra OS pthreads on every wireup. parlib_reactor_wake() is a single
      * eventfd write — cheap. */
     parlib_reactor_wake();
-    maybe_vcore_request(h);
+    maybe_vcore_request(wake_n);
   }
+}
+
+long lithe_root_harts_needed(void)
+{
+  return parlib_atomic_read(&root_sched_harts_needed);
 }
 
 static void base_context_block(lithe_sched_t *__this, lithe_context_t *context)

@@ -81,6 +81,9 @@ void lithe_hart_request(int h);
  * case inflates the caller's harts_needed and starves the owner sched.
  */
 void lithe_hart_request_for(lithe_sched_t *sched, int h);
+
+/** Current root-scheduler hart demand ceiling (base grants while harts < this). */
+long lithe_root_harts_needed(void);
  
 /**
  * Grant the current hart to another scheduler.  Triggered by a previous call

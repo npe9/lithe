@@ -78,6 +78,42 @@ static struct fjs_spin_slot fjs_hart_enter_spin_cur[LITHE_FJS_HART_ENTER_SPIN_MA
  * after drive starts, wake_efd unblocks epoll_wait. */
 static int fjs_reactor_parked_harts = 0;
 
+/* Interferer counters (LITHE_FJS_INTERFERE=1): who burns surplus vcores. */
+static int fjs_interfere_enabled = -1;
+static unsigned long fjs_cnt_idle_yield;
+static unsigned long fjs_cnt_surplus_yield;
+static unsigned long fjs_cnt_idle_park;
+static unsigned long fjs_cnt_hart_request_release;
+static long fjs_sample_owned;
+static long fjs_sample_demand;
+static long fjs_sample_runnable;
+
+static inline int fjs_interfere_on(void)
+{
+	if (fjs_interfere_enabled < 0) {
+		const char *e = getenv("LITHE_FJS_INTERFERE");
+		fjs_interfere_enabled = (e && *e && atoi(e)) ? 1 : 0;
+		if (fjs_interfere_enabled)
+			fprintf(stderr,
+			        "[FJS_INTERFERE] enabled (surplus/idle hart accounting)\n");
+	}
+	return fjs_interfere_enabled;
+}
+
+static void fjs_interfere_atexit(void)
+{
+	if (fjs_interfere_enabled != 1)
+		return;
+	fprintf(stderr,
+	        "[FJS_INTERFERE] idle_yield=%lu surplus_yield=%lu idle_park=%lu "
+	        "hart_request_release=%lu sample_owned=%ld sample_demand=%ld "
+	        "sample_runnable=%ld root_harts_needed=%ld\n",
+	        fjs_cnt_idle_yield, fjs_cnt_surplus_yield, fjs_cnt_idle_park,
+	        fjs_cnt_hart_request_release, fjs_sample_owned, fjs_sample_demand,
+	        fjs_sample_runnable, lithe_root_harts_needed());
+	fflush(stderr);
+}
+
 static inline void fjs_maybe_reactor_wake(void)
 {
 	if (__atomic_load_n(&fjs_reactor_parked_harts, __ATOMIC_ACQUIRE) > 0 ||
@@ -256,6 +292,11 @@ static lithe_fjs_steal_mode_t fjs_steal_mode = LITHE_FJS_STEAL_DEFAULT;
 static lithe_fjs_hart_order_t fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
 static int fjs_progress_sched_child = 0;
 static int fjs_tradespace_init = 0;
+/* Soft cap on FJS online harts (0 = unset). From LITHE_FJS_MAX_ONLINE_HARTS
+ * or LITHE_CONTEXT_RANKS_PER_HOST. Wait-spinners yield when owned > cap+1 so
+ * PMIx/OPAL progress helpers multiplex instead of CQ-contending on surplus
+ * vcores (P1K2 peak concurrent=4 whenever VCORE≥4). */
+static int fjs_soft_hart_cap = 0;
 /* Default: spin before CQ park. 0 meant every empty progress tick paid
  * parlib_reactor_wait/epoll — ~0.5–0.8ms Barrier+Allreduce for hosted P1K2
  * vs ~8us vanilla. MTL CQ spin now yields when runnable_count>0 so this is
@@ -303,6 +344,22 @@ static void fjs_tradespace_init_once(void)
 		unsigned long v = strtoul(e, &end, 10);
 		if (end != e && v <= (1u << 20))
 			fjs_progress_spin_max = (unsigned int)v;
+	}
+
+	e = getenv("LITHE_FJS_MAX_ONLINE_HARTS");
+	if (e && *e) {
+		char *end = NULL;
+		unsigned long v = strtoul(e, &end, 10);
+		if (end != e && v >= 1 && v <= (unsigned long)max_vcores())
+			fjs_soft_hart_cap = (int)v;
+	} else {
+		e = getenv("LITHE_CONTEXT_RANKS_PER_HOST");
+		if (e && *e) {
+			char *end = NULL;
+			unsigned long v = strtoul(e, &end, 10);
+			if (end != e && v >= 1 && v <= (unsigned long)max_vcores())
+				fjs_soft_hart_cap = (int)v;
+		}
 	}
 
 	__atomic_store_n(&fjs_tradespace_init, 1, __ATOMIC_RELEASE);
@@ -1054,11 +1111,48 @@ long lithe_fork_join_current_runnable_count(void)
 int lithe_fork_join_should_yield_to_runnable(void)
 {
   long r = lithe_fork_join_current_runnable_count();
-  if (r <= 0)
+  lithe_sched_t *cur = lithe_sched_current();
+  lithe_fork_join_sched_t *s;
+  long owned, wc, demand;
+  int soft_cap;
+
+  /* Self is RUNNING on a hart. Peers on the runqueue need a hart under
+   * true scarcity ((r+1) > num_vcores). That alone is wrong for VCORE>>K:
+   * with VCORE=96, scarcity never trips, so K ranks + PMIx/OPAL progress
+   * helpers each keep a hart and CQ-spin together (P1K2 peak concurrent=4
+   * whenever VCORE≥4 → ~4–5× Barrier+Allreduce vs VCORE=2).
+   *
+   * Also yield when this FJS is oversubscribed vs demand, or when owned
+   * harts exceed the hosted rank soft cap (LITHE_FJS_MAX_ONLINE_HARTS or
+   * LITHE_CONTEXT_RANKS_PER_HOST + 1 spare). When owned≈K the oversub
+   * check is false — preserves the anti yield-storm gate for VCORE≈K. */
+  fjs_tradespace_init_once();
+  soft_cap = fjs_soft_hart_cap;
+  if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs) {
+    s = (lithe_fork_join_sched_t *)cur;
+    owned = (long)parlib_atomic_read(&s->sched.harts);
+    wc = __atomic_load_n(&s->warm_ready_count, __ATOMIC_ACQUIRE);
+  } else {
+    owned = 0;
+    wc = 0;
+  }
+
+  if (r > 0) {
+    if ((r + 1) > (long)num_vcores())
+      return 1;
+    demand = r + wc + 1;
+    if (owned > demand + 1)
+      return 1;
+    if (soft_cap > 0 && owned > (long)soft_cap + 1)
+      return 1;
     return 0;
-  /* Self is RUNNING on a hart; peers on the runqueue need a hart only if
-   * there are not enough vcores for (self + runnable). */
-  return (r + 1) > (long)num_vcores();
+  }
+
+  /* No runnable peers: still force wait-spinners off surplus harts so
+   * progress helpers park/multiplex instead of CQ-contending with ranks. */
+  if (soft_cap > 0 && owned > (long)soft_cap + 1)
+    return 1;
+  return 0;
 }
 
 void lithe_fork_join_sched_destroy(lithe_fork_join_sched_t *sched)
@@ -1542,16 +1636,34 @@ restart:
    * when nobody pokes wake_efd; pending>0 still uses the infinite drive
    * above. Clearly-surplus harts (owned >> demand) skip park and yield:
    * eventfd wakes every parked sibling, so parking dozens of surplus
-   * vcores stampedes them on every schedule_context (VCORE=96 P1K2). */
+   * vcores stampedes them on every schedule_context (VCORE=96 P1K2).
+   *
+   * Critical: release hart demand before yield. schedule_context only
+   * hart_request(+1); without a matching -1 on idle yield,
+   * root_sched_harts_needed stays inflated and base_hart_enter immediately
+   * re-grants every surplus vcore → empty hart_enter/tdequeue/spinlock
+   * stampede (P1K2 VCORE=96 ~85µs vs VCORE=2 ~13µs). */
   {
     long rc = __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE);
     long wc = __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE);
     long owned = (long)parlib_atomic_read(&sched->sched.harts);
     long demand = rc + wc + 1; /* +1 spare hart for latency */
+    int is_surplus;
     if (parlib_reactor_pending() > 0)
       demand += 1;
-    if (owned > demand + 1) {
-      /* Surplus: yield immediately (base may futex-park the OS thread). */
+    is_surplus = (owned > demand + 1);
+    if (fjs_interfere_on()) {
+      static int once;
+      if (!once && __sync_bool_compare_and_swap(&once, 0, 1))
+        atexit(fjs_interfere_atexit);
+      fjs_sample_owned = owned;
+      fjs_sample_demand = demand;
+      fjs_sample_runnable = rc;
+      if (is_surplus)
+        __sync_fetch_and_add(&fjs_cnt_surplus_yield, 1);
+    }
+    if (is_surplus) {
+      /* Surplus: yield immediately after demand release (below). */
     } else if (parlib_reactor_ensure_init() == 0) {
       static __thread unsigned idle_park_streak;
       int my_vc = vcore_id();
@@ -1564,6 +1676,8 @@ idle_park_again:
           ms = 16;
         if (idle_park_streak >= 16u)
           ms = 64;
+        if (fjs_interfere_on())
+          __sync_fetch_and_add(&fjs_cnt_idle_park, 1);
         if (lithe_sched_trace_enabled())
           lithe_sched_trace_emit(LITHE_ST_REACTOR_BLOCK, sched, 0,
                                  LITHE_ST_DEC_OK, ms);
@@ -1599,6 +1713,25 @@ idle_park_again:
       dec |= LITHE_ST_DEC_SELF_RESCHED_HOT;
     if (lithe_sched_trace_enabled())
       lithe_sched_trace_emit(LITHE_ST_IDLE_YIELD, sched, 0, dec, (int32_t)rc);
+  }
+  if (fjs_interfere_on())
+    __sync_fetch_and_add(&fjs_cnt_idle_yield, 1);
+  /* Surplus-only demand release: dropping -1 on every idle yield regresses
+   * the fair VCORE≈K case (extra request/wake round-trips). When owned >>
+   * demand, release so base_hart_enter will not immediately re-grant this
+   * hart into an empty FJS hart_enter/tdequeue stampede. */
+  {
+    long rc2 = __atomic_load_n(&sched->runnable_count, __ATOMIC_RELAXED);
+    long wc2 = __atomic_load_n(&sched->warm_ready_count, __ATOMIC_RELAXED);
+    long owned2 = (long)parlib_atomic_read(&sched->sched.harts);
+    long demand2 = rc2 + wc2 + 1;
+    if (parlib_reactor_pending() > 0)
+      demand2 += 1;
+    if (owned2 > demand2 + 1) {
+      lithe_hart_request(-1);
+      if (fjs_interfere_on())
+        __sync_fetch_and_add(&fjs_cnt_hart_request_release, 1);
+    }
   }
   vconline(vcore_id()) = false;
   lithe_hart_yield();
