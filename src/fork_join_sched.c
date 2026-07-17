@@ -295,11 +295,14 @@ static lithe_fjs_hart_order_t fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
 static int fjs_progress_sched_child = 0;
 static int fjs_tradespace_init = 0;
 /* Soft cap on FJS online harts (0 = unset). From LITHE_FJS_MAX_ONLINE_HARTS
- * or LITHE_CONTEXT_RANKS_PER_HOST. Positive hart requests are clamped so
- * owned never exceeds the cap; wait-spinners yield when owned >= cap with
- * RUNNABLE peers. Progress helpers then multiplex on the same hart budget as
- * hosted ranks (P1K2: peak=2 at any VCORE, matching VCORE=2) instead of
- * CQ-contending on surplus vcores (was peak=4 whenever VCORE≥4). */
+ * or LITHE_CONTEXT_RANKS_PER_HOST. This is an implementation knob that clamps
+ * *helper* hart demand so progress contexts multiplex instead of claiming
+ * surplus vcores (diagnostic: LITHE_FJS_STATS peak RUNNING inflated from
+ * helper misuse, e.g. peak=4 on P1K2 when VCORE≥4). It is NOT the product
+ * model of "what ranks are" — ranks are Lithe contexts; Flux OS processes
+ * are quiesced onto vcores. Positive hart requests are clamped so owned
+ * never exceeds the cap; wait-spinners yield when owned >= cap with
+ * RUNNABLE peers. */
 static int fjs_soft_hart_cap = 0;
 /* Default: spin before CQ park. 0 meant every empty progress tick paid
  * parlib_reactor_wait/epoll — ~0.5–0.8ms Barrier+Allreduce for hosted P1K2
