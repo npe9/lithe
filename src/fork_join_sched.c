@@ -84,6 +84,7 @@ static unsigned long fjs_cnt_idle_yield;
 static unsigned long fjs_cnt_surplus_yield;
 static unsigned long fjs_cnt_idle_park;
 static unsigned long fjs_cnt_hart_request_release;
+static unsigned long fjs_cnt_hart_cap_clamp;
 static long fjs_sample_owned;
 static long fjs_sample_demand;
 static long fjs_sample_runnable;
@@ -106,11 +107,12 @@ static void fjs_interfere_atexit(void)
 		return;
 	fprintf(stderr,
 	        "[FJS_INTERFERE] idle_yield=%lu surplus_yield=%lu idle_park=%lu "
-	        "hart_request_release=%lu sample_owned=%ld sample_demand=%ld "
-	        "sample_runnable=%ld root_harts_needed=%ld\n",
+	        "hart_request_release=%lu hart_cap_clamp=%lu sample_owned=%ld "
+	        "sample_demand=%ld sample_runnable=%ld root_harts_needed=%ld\n",
 	        fjs_cnt_idle_yield, fjs_cnt_surplus_yield, fjs_cnt_idle_park,
-	        fjs_cnt_hart_request_release, fjs_sample_owned, fjs_sample_demand,
-	        fjs_sample_runnable, lithe_root_harts_needed());
+	        fjs_cnt_hart_request_release, fjs_cnt_hart_cap_clamp,
+	        fjs_sample_owned, fjs_sample_demand, fjs_sample_runnable,
+	        lithe_root_harts_needed());
 	fflush(stderr);
 }
 
@@ -293,9 +295,11 @@ static lithe_fjs_hart_order_t fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
 static int fjs_progress_sched_child = 0;
 static int fjs_tradespace_init = 0;
 /* Soft cap on FJS online harts (0 = unset). From LITHE_FJS_MAX_ONLINE_HARTS
- * or LITHE_CONTEXT_RANKS_PER_HOST. Wait-spinners yield when owned > cap+1 so
- * PMIx/OPAL progress helpers multiplex instead of CQ-contending on surplus
- * vcores (P1K2 peak concurrent=4 whenever VCORE≥4). */
+ * or LITHE_CONTEXT_RANKS_PER_HOST. Positive hart requests are clamped so
+ * owned never exceeds the cap; wait-spinners yield when owned >= cap with
+ * RUNNABLE peers. Progress helpers then multiplex on the same hart budget as
+ * hosted ranks (P1K2: peak=2 at any VCORE, matching VCORE=2) instead of
+ * CQ-contending on surplus vcores (was peak=4 whenever VCORE≥4). */
 static int fjs_soft_hart_cap = 0;
 /* Default: spin before CQ park. 0 meant every empty progress tick paid
  * parlib_reactor_wait/epoll — ~0.5–0.8ms Barrier+Allreduce for hosted P1K2
@@ -588,6 +592,8 @@ static __thread int fjs_wake_batch_depth;
 static __thread int fjs_wake_batch_harts;
 static __thread int fjs_wake_batch_wake;
 
+static int fjs_clamp_hart_request(lithe_fork_join_sched_t *s, int h);
+
 void lithe_fork_join_wake_batch_begin(void)
 {
 	if (fjs_wake_batch_depth++ == 0) {
@@ -606,14 +612,48 @@ void lithe_fork_join_wake_batch_end(void)
 		return;
 	int h = fjs_wake_batch_harts;
 	int w = fjs_wake_batch_wake;
+	lithe_sched_t *cur;
 	fjs_wake_batch_harts = 0;
 	fjs_wake_batch_wake = 0;
 	/* One hart request for the whole team release (parent grants N harts), then
 	 * one reactor poke for any vcores parked in parlib_reactor_drive(-1). */
-	if (h > 0)
-		lithe_hart_request(h);
+	if (h > 0) {
+		cur = lithe_sched_current();
+		if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs)
+			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)cur, h);
+		if (h > 0)
+			lithe_hart_request(h);
+	}
 	if (w)
 		fjs_maybe_reactor_wake();
+}
+
+/* Clamp positive hart demand to soft_cap - owned. Returns 0 when at/over
+ * cap (caller still enqueues; existing harts must multiplex via yield). */
+static int fjs_clamp_hart_request(lithe_fork_join_sched_t *s, int h)
+{
+	long owned, room;
+	int cap;
+
+	if (h <= 0 || s == NULL)
+		return h;
+	fjs_tradespace_init_once();
+	cap = fjs_soft_hart_cap;
+	if (cap <= 0)
+		return h;
+	owned = (long)parlib_atomic_read(&s->sched.harts);
+	room = (long)cap - owned;
+	if (room <= 0) {
+		if (fjs_interfere_on())
+			__sync_fetch_and_add(&fjs_cnt_hart_cap_clamp, 1);
+		return 0;
+	}
+	if (h > room) {
+		if (fjs_interfere_on())
+			__sync_fetch_and_add(&fjs_cnt_hart_cap_clamp, 1);
+		return (int)room;
+	}
+	return h;
 }
 
 /* Issue (or batch) a hart request + reactor poke. Factored out of
@@ -623,6 +663,21 @@ void lithe_fork_join_wake_batch_end(void)
  * a single lithe_hart_request(N) + one reactor_wake at batch end. */
 static void fjs_request_harts(int h)
 {
+	lithe_sched_t *cur;
+
+	if (h > 0) {
+		cur = lithe_sched_current();
+		if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs) {
+			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)cur, h);
+			if (h <= 0) {
+				/* At soft cap: wake parked siblings so they notice
+				 * the new RUNNABLE and multiplex; do not inflate
+				 * root_sched_harts_needed past the rank budget. */
+				fjs_maybe_reactor_wake();
+				return;
+			}
+		}
+	}
 	if (fjs_wake_batch_depth > 0) {
 		fjs_wake_batch_harts += h;
 		fjs_wake_batch_wake = 1;
@@ -652,7 +707,11 @@ static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 	owner = ctx->context.sched;
 	cur = lithe_sched_current();
 	if (owner != NULL && owner != cur) {
-		lithe_hart_request_for(owner, 1);
+		int h = 1;
+		if (owner->funcs == &lithe_fork_join_sched_funcs)
+			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)owner, 1);
+		if (h > 0)
+			lithe_hart_request_for(owner, h);
 		fjs_maybe_reactor_wake();
 	} else {
 		fjs_request_harts(1);
@@ -1113,7 +1172,7 @@ int lithe_fork_join_should_yield_to_runnable(void)
   long r = lithe_fork_join_current_runnable_count();
   lithe_sched_t *cur = lithe_sched_current();
   lithe_fork_join_sched_t *s;
-  long owned, wc, demand;
+  long owned, wc, demand, budget;
   int soft_cap;
 
   /* Self is RUNNING on a hart. Peers on the runqueue need a hart under
@@ -1122,12 +1181,17 @@ int lithe_fork_join_should_yield_to_runnable(void)
    * helpers each keep a hart and CQ-spin together (P1K2 peak concurrent=4
    * whenever VCORE≥4 → ~4–5× Barrier+Allreduce vs VCORE=2).
    *
-   * Also yield when this FJS is oversubscribed vs demand, or when owned
-   * harts exceed the hosted rank soft cap (LITHE_FJS_MAX_ONLINE_HARTS or
-   * LITHE_CONTEXT_RANKS_PER_HOST + 1 spare). When owned≈K the oversub
-   * check is false — preserves the anti yield-storm gate for VCORE≈K. */
+   * Effective budget = min(num_vcores, soft_cap) when soft_cap is set from
+   * LITHE_FJS_MAX_ONLINE_HARTS or LITHE_CONTEXT_RANKS_PER_HOST. Hart requests
+   * are also clamped to that budget (see fjs_clamp_hart_request). Yield when
+   * owned >= budget with RUNNABLE peers, or when owned > soft_cap (surplus).
+   * Soft_cap+1 spare was removed: at VCORE=4/owned=4 it caused yield churn
+   * worse than VCORE=96. When soft_cap unset, classic scarcity only. */
   fjs_tradespace_init_once();
   soft_cap = fjs_soft_hart_cap;
+  budget = (long)num_vcores();
+  if (soft_cap > 0 && (long)soft_cap < budget)
+    budget = (long)soft_cap;
   if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs) {
     s = (lithe_fork_join_sched_t *)cur;
     owned = (long)parlib_atomic_read(&s->sched.harts);
@@ -1138,19 +1202,20 @@ int lithe_fork_join_should_yield_to_runnable(void)
   }
 
   if (r > 0) {
-    if ((r + 1) > (long)num_vcores())
+    if ((r + 1) > budget)
+      return 1;
+    /* Cap reached: must multiplex — another hart will not appear. */
+    if (owned >= budget)
       return 1;
     demand = r + wc + 1;
     if (owned > demand + 1)
-      return 1;
-    if (soft_cap > 0 && owned > (long)soft_cap + 1)
       return 1;
     return 0;
   }
 
   /* No runnable peers: still force wait-spinners off surplus harts so
    * progress helpers park/multiplex instead of CQ-contending with ranks. */
-  if (soft_cap > 0 && owned > (long)soft_cap + 1)
+  if (soft_cap > 0 && owned > (long)soft_cap)
     return 1;
   return 0;
 }
@@ -1648,10 +1713,16 @@ restart:
     long wc = __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE);
     long owned = (long)parlib_atomic_read(&sched->sched.harts);
     long demand = rc + wc + 1; /* +1 spare hart for latency */
+    int soft_cap;
     int is_surplus;
+    fjs_tradespace_init_once();
+    soft_cap = fjs_soft_hart_cap;
     if (parlib_reactor_pending() > 0)
       demand += 1;
-    is_surplus = (owned > demand + 1);
+    /* Soft-cap surplus: any hart above the rank budget is excess even when
+     * demand+1 would tolerate owned==4 at VCORE=4 (the VCORE=4 churn case). */
+    is_surplus = (owned > demand + 1) ||
+                 (soft_cap > 0 && owned > (long)soft_cap);
     if (fjs_interfere_on()) {
       static int once;
       if (!once && __sync_bool_compare_and_swap(&once, 0, 1))
@@ -1725,9 +1796,13 @@ idle_park_again:
     long wc2 = __atomic_load_n(&sched->warm_ready_count, __ATOMIC_RELAXED);
     long owned2 = (long)parlib_atomic_read(&sched->sched.harts);
     long demand2 = rc2 + wc2 + 1;
+    int soft_cap2;
+    fjs_tradespace_init_once();
+    soft_cap2 = fjs_soft_hart_cap;
     if (parlib_reactor_pending() > 0)
       demand2 += 1;
-    if (owned2 > demand2 + 1) {
+    if (owned2 > demand2 + 1 ||
+        (soft_cap2 > 0 && owned2 > (long)soft_cap2)) {
       lithe_hart_request(-1);
       if (fjs_interfere_on())
         __sync_fetch_and_add(&fjs_cnt_hart_request_release, 1);
