@@ -1692,19 +1692,17 @@ restart:
     unsigned int budget = fjs_hart_enter_spin_budget(my_vc);
     for (unsigned int i = 0; i < budget; i++) {
       cpu_relax();
-      /* Reactor fd readiness is real work. A non-empty child_sched_list is
-       * NOT — registered children with harts_needed==0 used to make every
-       * idle spin "succeed" and restart into fjs_hart_grant_children forever
-       * (hosted P1K2 perf: ~25% spinlock_lock + ~15% fjs_try_hart_grant_child).
-       * Peek child demand every 64th iter (spinlock) so the hot pause path
-       * stays cheap when the list is idle. */
-      if (parlib_reactor_pending() > 0 ||
-          ((i & 63u) == 0 && fjs_any_child_needs_hart(sched))) {
-        fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
-        if (lithe_sched_trace_enabled())
-          lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0, LITHE_ST_DEC_OK,
-                                 1);
-        goto restart;
+      /* Hot path: only cheap atomics every iter. parlib_reactor_pending() and
+       * child-list peeks go through PLT/spinlock — every-iter pending was
+       * ~32% of hosted P1K4 cycles. Sample those every 64th pause. */
+      if ((i & 63u) == 0u) {
+        if (parlib_reactor_pending() > 0 || fjs_any_child_needs_hart(sched)) {
+          fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
+          if (lithe_sched_trace_enabled())
+            lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0,
+                                   LITHE_ST_DEC_OK, 1);
+          goto restart;
+        }
       }
       /* Peek local runqueue OR any sched-wide RUNNABLE/WARM (stealable on
        * other vcores). Checking only tqsize(my_vc) missed ready peers. */
