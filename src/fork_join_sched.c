@@ -295,15 +295,23 @@ static lithe_fjs_hart_order_t fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
 static int fjs_progress_sched_child = 0;
 static int fjs_tradespace_init = 0;
 /* Soft cap on FJS online harts (0 = unset). From LITHE_FJS_MAX_ONLINE_HARTS
- * or LITHE_CONTEXT_RANKS_PER_HOST. This is an implementation knob that clamps
- * *helper* hart demand so progress contexts multiplex instead of claiming
- * surplus vcores (diagnostic: LITHE_FJS_STATS peak RUNNING inflated from
- * helper misuse, e.g. peak=4 on P1K2 when VCORE≥4). It is NOT the product
- * model of "what ranks are" — ranks are Lithe contexts; Flux OS processes
- * are quiesced onto vcores. Positive hart requests are clamped so owned
- * never exceeds the cap; wait-spinners yield when owned >= cap with
- * RUNNABLE peers. */
+ * or LITHE_CONTEXT_RANKS_PER_HOST (+ helper budget). Clamps *helper* hart
+ * demand so progress contexts do not claim the full VCORE pool (diagnostic:
+ * LITHE_FJS_STATS peak RUNNING inflated from helper misuse, e.g. peak=4 on
+ * P1K2 when VCORE≥4 with no cap). It is NOT the product model of "what ranks
+ * are" — ranks are Lithe contexts; Flux OS processes are quiesced onto
+ * vcores. Positive hart requests are clamped so owned never exceeds the cap;
+ * wait-spinners yield when owned >= cap with RUNNABLE peers.
+ *
+ * Default when only RPH is set: soft_cap = RPH + LITHE_FJS_HELPER_HARTS
+ * (default helper budget 0). After MTL unlock-around-park, soft_cap==RPH
+ * multiplexes correctly without the old lock-hold serialization; raising
+ * helpers (RPH+1) helps some single-OS shapes but regresses multi-OS
+ * park+pump (P2K2 ~2ms). Opt in via LITHE_FJS_HELPER_HARTS=1.
+ * LITHE_FJS_MAX_ONLINE_HARTS still wins when set. */
 static int fjs_soft_hart_cap = 0;
+/* Extra harts above RPH reserved for progress/helpers (default 0). */
+static int fjs_helper_harts = 0;
 /* Default: spin before CQ park. 0 meant every empty progress tick paid
  * parlib_reactor_wait/epoll — ~0.5–0.8ms Barrier+Allreduce for hosted P1K2
  * vs ~8us vanilla. MTL CQ spin now yields when runnable_count>0 so this is
@@ -353,6 +361,16 @@ static void fjs_tradespace_init_once(void)
 			fjs_progress_spin_max = (unsigned int)v;
 	}
 
+	e = getenv("LITHE_FJS_HELPER_HARTS");
+	if (e && *e) {
+		char *end = NULL;
+		unsigned long v = strtoul(e, &end, 10);
+		/* 0 = strict RPH (old multiplex-only); clamp to a small budget so
+		 * soft_cap never tracks 2×RPH (that reintroduces surplus tax). */
+		if (end != e && v <= 8ul)
+			fjs_helper_harts = (int)v;
+	}
+
 	e = getenv("LITHE_FJS_MAX_ONLINE_HARTS");
 	if (e && *e) {
 		char *end = NULL;
@@ -365,8 +383,11 @@ static void fjs_tradespace_init_once(void)
 			char *end = NULL;
 			unsigned long v = strtoul(e, &end, 10);
 			if (end != e && v >= 1 && v <= (unsigned long)max_vcores()) {
-				/* soft_cap = RPH (LITHE_FJS_MAX_ONLINE_HARTS still wins above). */
-				fjs_soft_hart_cap = (int)v;
+				unsigned long cap = v + (unsigned long)fjs_helper_harts;
+				if (cap > (unsigned long)max_vcores())
+					cap = (unsigned long)max_vcores();
+				/* soft_cap = RPH + helper budget (MAX_ONLINE_HARTS wins above). */
+				fjs_soft_hart_cap = (int)cap;
 			}
 		}
 	}

@@ -213,12 +213,14 @@ long lithe_fork_join_current_runnable_count(void);
 
 /*
  * True when a waiting context should lithe_context_yield() to drain RUNNABLE
- * peers. Scarcity uses effective budget = min(num_vcores,
- * LITHE_FJS_MAX_ONLINE_HARTS / LITHE_CONTEXT_RANKS_PER_HOST soft cap).
+ * peers. Scarcity uses effective budget = min(num_vcores, soft_cap) where
+ * soft_cap is LITHE_FJS_MAX_ONLINE_HARTS, or else
+ * LITHE_CONTEXT_RANKS_PER_HOST + LITHE_FJS_HELPER_HARTS (default helpers=0).
  * Without a soft cap, only (runnable_count + 1) > num_vcores() — when VCORE
  * >= waiters, yielding creates a yield-storm on hosted P1K2; callers should
  * CQ-spin / opal_progress_block. With soft cap, also yield when owned >= cap
- * so progress helpers multiplex instead of occupying surplus harts.
+ * so surplus helpers park. Set LITHE_FJS_HELPER_HARTS=1 to allow one extra
+ * progress hart on single-OS shapes (multi-OS park+pump may regress).
  */
 int lithe_fork_join_should_yield_to_runnable(void);
 
