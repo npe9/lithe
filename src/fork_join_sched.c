@@ -1038,25 +1038,35 @@ static lithe_fork_join_context_t *__thread_dequeue()
 			                       (int32_t)local_tq);
 		}
 
-		/* First try doing power of two choices. */
-		int choice[2] = { rand_r(&rseed(vcoreid)) % num_vcores(),
-		                  rand_r(&rseed(vcoreid)) % num_vcores()};
-		int size[2] = { tqsize(choice[0]),
-		                tqsize(choice[1])};
+		/* First try doing power of two choices. Prefer sampling within
+		 * max_vcores(); under HOSTED_FULLCORE num_vcores()≈max and most
+		 * queues are empty — PoT still helps when a peer queue is hot. */
+		int span = (int)max_vcores();
+		if (span < 1)
+			span = 1;
+		int choice[2] = { rand_r(&rseed(vcoreid)) % span,
+		                  rand_r(&rseed(vcoreid)) % span};
+		int size[2] = { tqsize_s(cur, choice[0]),
+		                tqsize_s(cur, choice[1])};
 		int id = (size[0] > size[1]) ? 0 : 1;
-		if (vcoreid != choice[id])
+		if (size[id] > 0 && vcoreid != choice[id])
 			ctx = steal_threads(choice[id]);
-		else
+		else if (size[!id] > 0 && vcoreid != choice[!id])
 			ctx = steal_threads(choice[!id]);
 
-		/* Fall back to looping through all vcores. This time I go through
-		 * max_vcores() just to make sure I don't miss anything. */
+		/* Fall back: walk all vcores but only lock/dequeue nonempty
+		 * queues. Calling steal_threads on 90+ empty HOSTED_FULLCORE
+		 * queues was pure FJS idle tax. Do NOT filter on vconline alone
+		 * (that missed preferred_vcq work and blew P1K2 to ~0.5ms). */
 		if (!ctx) {
-			int i = (vcoreid + 1) % max_vcores();
-			while(i != vcoreid) {
-				ctx = steal_threads(i);
-				if (ctx) break;
-				i = (i + 1) % max_vcores();
+			int mv = (int)max_vcores();
+			int i = (vcoreid + 1) % mv;
+			while (i != vcoreid) {
+				if (tqsize_s(cur, i) > 0) {
+					ctx = steal_threads(i);
+					if (ctx) break;
+				}
+				i = (i + 1) % mv;
 			}
 		}
 
@@ -1690,6 +1700,9 @@ restart:
   if (fjs_hart_enter_spin_loops > 0) {
     int my_vc = vcore_id();
     unsigned int budget = fjs_hart_enter_spin_budget(my_vc);
+    /* NOTE: clamping budget to spin_min when empty+soft_cap was tried with
+     * wake-on-yield and still regressed P1K2 (timeouts / ~0.5–1ms). Keep
+     * full adaptive spin before timed park. */
     for (unsigned int i = 0; i < budget; i++) {
       cpu_relax();
       /* Hot path: only cheap atomics every iter. parlib_reactor_pending() and
@@ -1877,7 +1890,11 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 		lithe_sched_trace_emit(LITHE_ST_CTX_YIELD, __this,
 		                       (uint32_t)c->id, dec, (int32_t)rc);
 	}
+	/* Enqueue only (no hart_request): the yielding hart reenters. Siblings
+	 * may be in timed idle park on wake_efd; without a poke they wait out
+	 * the timeout (HOSTED_FULLCORE soft_cap idle → ms-scale floors). */
 	__thread_enqueue(ctx, false);
+	fjs_maybe_reactor_wake();
 }
 
 void lithe_fork_join_sched_context_exit(lithe_sched_t *__this,
