@@ -1243,6 +1243,20 @@ int lithe_fork_join_should_yield_to_runnable(void)
     /* Cap reached: must multiplex — another hart will not appear. */
     if (owned >= budget)
       return 1;
+    /*
+     * Helper spare (soft_cap=RPH+HELPER): when owned is already at RPH,
+     * do not wait for the spare hart to run a RUNNABLE peer — that stranded
+     * pairwise stragglers vs flat Barrier (P1K8/P1K16). Do NOT use
+     * owned+r>=budget: multi-OS park+pump leaves a helper RUNNABLE and
+     * would suppress CQ park (P2K2 hang).
+     */
+    if (fjs_helper_harts > 0 && soft_cap > fjs_helper_harts) {
+      long rank_budget = (long) soft_cap - (long) fjs_helper_harts;
+      if (rank_budget < 1)
+        rank_budget = 1;
+      if (owned >= rank_budget)
+        return 1;
+    }
     demand = r + wc + 1;
     if (owned > demand + 1)
       return 1;
