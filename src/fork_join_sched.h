@@ -128,6 +128,16 @@ typedef struct {
    * miniFE P1K4 nx=80 CG stall). Plain C11 atomics; appended field is
    * ABI-safe (FJS-internal, callers hold opaque pointers). */
   long leaving_harts;
+  /* HART-LEDGER SYMMETRY: wake-side hart requests that fjs_request_harts
+   * suppressed at soft_cap (clamp returned less than asked). context_block
+   * consumes one credit instead of issuing lithe_hart_request(-1), so the
+   * parent's harts_needed ledger cannot drift below true demand. Without
+   * this, every clamped-wake/block cycle drains needed by one; once
+   * needed <= granted the parent stops granting forever while the child
+   * still has RUNNABLE contexts and its busy harts never yield (single-OS
+   * wait_sync spin policy) — observed as hosted miniFE P1K4 nx=80
+   * make_local/CG stall with child needed=1 < granted=2, runnable=1. */
+  long suppressed_hart_requests;
 } lithe_fork_join_sched_t;
 
 typedef struct {
