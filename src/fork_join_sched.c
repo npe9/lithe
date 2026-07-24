@@ -668,6 +668,18 @@ static int fjs_clamp_hart_request(lithe_fork_join_sched_t *s, int h)
 	if (cap <= 0)
 		return h;
 	owned = (long)parlib_atomic_read(&s->sched.harts);
+	/* LOST-WAKEUP GUARD: harts committed to yield (leaving_harts) are still
+	 * counted in sched.harts until lithe_hart_yield's decrement lands, but
+	 * they will never dequeue this enqueue. Treat them as not-owned so the
+	 * request is granted instead of clamped to a reactor poke that a fully
+	 * yielded hart never sees (single-OS P1K4 nx=80 CG stall). */
+	{
+		long leaving = __atomic_load_n(&s->leaving_harts, __ATOMIC_SEQ_CST);
+		if (leaving > 0)
+			owned -= leaving;
+		if (owned < 0)
+			owned = 0;
+	}
 	room = (long)cap - owned;
 	if (room <= 0) {
 		if (fjs_interfere_on())
@@ -1301,6 +1313,7 @@ void lithe_fork_join_sched_init(lithe_fork_join_sched_t *sched,
   sched->teardown_quiesce = 0;
   sched->runnable_count = 0;  /* CHANGE 1: O(1) any-runnable indicator */
   sched->warm_ready_count = 0;  /* WARM VCORES: GO-and-unclaimed warm workers */
+  sched->leaving_harts = 0;  /* LOST-WAKEUP GUARD: committed-to-yield harts */
   TAILQ_INIT(&sched->child_sched_list);
   spin_pdr_init(&sched->child_sched_list_lock);
   /* sched->next_queue_id initialized in sched_enter() */
@@ -1666,6 +1679,19 @@ void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
   if (!vconline(vcore_id()))
     vconline(vcore_id()) = true;
 
+  /* LOST-WAKEUP GUARD: consume one leaving-hart credit (bounded at 0). Each
+   * idle yield adds exactly one credit before its final runnable re-check;
+   * each hart entering here consumes at most one, so credits track harts
+   * whose sched.harts decrement may still be in flight. */
+  {
+    long lv = __atomic_load_n(&sched->leaving_harts, __ATOMIC_SEQ_CST);
+    while (lv > 0 &&
+           !__atomic_compare_exchange_n(&sched->leaving_harts, &lv, lv - 1,
+                                        false, __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST))
+      ;
+  }
+
   if (lithe_sched_trace_enabled()) {
     lithe_sched_trace_emit(LITHE_ST_HART_ENTER, sched, 0, LITHE_ST_DEC_OK,
                            (int32_t)__atomic_load_n(&sched->runnable_count,
@@ -1858,6 +1884,33 @@ idle_park_again:
       if (fjs_interfere_on())
         __sync_fetch_and_add(&fjs_cnt_hart_request_release, 1);
     }
+  }
+  /* LOST-WAKEUP GUARD (single-OS P1K4 nx=80 CG stall): a context enqueued
+   * after our last runnable_count read but before lithe_hart_yield's harts
+   * decrement gets its hart_request clamped at soft_cap (we are still
+   * counted as owned) and its reactor poke is invisible to a fully-yielded
+   * hart -- RUNNABLE forever while remaining harts spin inside their own
+   * contexts. Protocol: publish the yield commitment (leaving_harts++,
+   * SEQ_CST) FIRST, then re-check for work. Enqueue bumps runnable_count
+   * (SEQ_CST, under tqlock) before its clamp reads leaving_harts, so either
+   * we see the new context here and restart, or the enqueuer sees our
+   * leaving credit and its hart request is granted. Never yield after
+   * observing runnable work (the old path logged IDLE_WITH_RUNNABLE and
+   * yielded anyway). */
+  __atomic_fetch_add(&sched->leaving_harts, 1, __ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 0 ||
+      __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) > 0 ||
+      tqsize_s(sched, vcore_id()) > 0 ||
+      parlib_reactor_pending() > 0) {
+    long lv = __atomic_load_n(&sched->leaving_harts, __ATOMIC_SEQ_CST);
+    while (lv > 0 &&
+           !__atomic_compare_exchange_n(&sched->leaving_harts, &lv, lv - 1,
+                                        false, __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST))
+      ;
+    if (lithe_sched_trace_enabled())
+      lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0, LITHE_ST_DEC_OK, 3);
+    goto restart;
   }
   vconline(vcore_id()) = false;
   lithe_hart_yield();

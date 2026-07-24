@@ -115,6 +115,19 @@ typedef struct {
    * paired hart_request, decremented on claim), so a hart woken for a warm
    * resume always observes count>0 and finds the worker -- no lost wakeup. */
   long warm_ready_count;
+  /* LOST-WAKEUP GUARD: harts that have committed to lithe_hart_yield() from
+   * the idle path but whose sched.harts decrement may not yet be visible.
+   * Incremented (SEQ_CST) BEFORE the idler's final runnable re-check;
+   * consumed (bounded decrement) by the next hart entering hart_enter.
+   * fjs_clamp_hart_request treats these harts as not-owned so a concurrent
+   * schedule_context at soft_cap issues a real lithe_hart_request instead of
+   * clamping to a reactor poke that a fully-yielded hart never sees. Without
+   * this, a context enqueued in the window between the idler's last
+   * runnable_count read and its harts decrement is RUNNABLE forever while
+   * the remaining harts spin inside their own contexts (single-OS hosted
+   * miniFE P1K4 nx=80 CG stall). Plain C11 atomics; appended field is
+   * ABI-safe (FJS-internal, callers hold opaque pointers). */
+  long leaving_harts;
 } lithe_fork_join_sched_t;
 
 typedef struct {
