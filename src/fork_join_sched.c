@@ -645,33 +645,13 @@ void lithe_fork_join_wake_batch_end(void)
 	 * one reactor poke for any vcores parked in parlib_reactor_drive(-1). */
 	if (h > 0) {
 		cur = lithe_sched_current();
-		if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs) {
-			int h0 = h;
+		if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs)
 			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)cur, h);
-			/* HART-LEDGER SYMMETRY: see fjs_request_harts. */
-			if (h < h0)
-				__atomic_fetch_add(
-					&((lithe_fork_join_sched_t *)cur)->suppressed_hart_requests,
-					(long)(h0 - h), __ATOMIC_SEQ_CST);
-		}
 		if (h > 0)
 			lithe_hart_request(h);
 	}
 	if (w)
 		fjs_maybe_reactor_wake();
-}
-
-/* HART-LEDGER SYMMETRY: consume one suppressed wake-side +1. Returns nonzero
- * if a credit was consumed and the caller must skip lithe_hart_request(-1). */
-static int fjs_consume_suppressed_request(lithe_fork_join_sched_t *s)
-{
-	long sv = __atomic_load_n(&s->suppressed_hart_requests, __ATOMIC_SEQ_CST);
-	while (sv > 0 &&
-	       !__atomic_compare_exchange_n(&s->suppressed_hart_requests, &sv,
-	                                    sv - 1, false, __ATOMIC_SEQ_CST,
-	                                    __ATOMIC_SEQ_CST))
-		;
-	return sv > 0;
 }
 
 /* Clamp positive hart demand to soft_cap - owned. Returns 0 when at/over
@@ -726,16 +706,7 @@ static void fjs_request_harts(int h)
 	if (h > 0) {
 		cur = lithe_sched_current();
 		if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs) {
-			int h0 = h;
 			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)cur, h);
-			/* HART-LEDGER SYMMETRY: record every wake-side +1 the clamp
-			 * swallowed so the matching context_block skips its -1.
-			 * Otherwise harts_needed drifts below true demand and the
-			 * parent stops granting while RUNNABLE work is queued. */
-			if (h < h0)
-				__atomic_fetch_add(
-					&((lithe_fork_join_sched_t *)cur)->suppressed_hart_requests,
-					(long)(h0 - h), __ATOMIC_SEQ_CST);
 			if (h <= 0) {
 				/* At soft cap: wake parked siblings so they notice
 				 * the new RUNNABLE and multiplex; do not inflate
@@ -775,14 +746,8 @@ static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 	cur = lithe_sched_current();
 	if (owner != NULL && owner != cur) {
 		int h = 1;
-		if (owner->funcs == &lithe_fork_join_sched_funcs) {
+		if (owner->funcs == &lithe_fork_join_sched_funcs)
 			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)owner, 1);
-			/* HART-LEDGER SYMMETRY: see fjs_request_harts. */
-			if (h < 1)
-				__atomic_fetch_add(
-					&((lithe_fork_join_sched_t *)owner)->suppressed_hart_requests,
-					1, __ATOMIC_SEQ_CST);
-		}
 		if (h > 0)
 			lithe_hart_request_for(owner, h);
 		fjs_maybe_reactor_wake();
@@ -1349,7 +1314,6 @@ void lithe_fork_join_sched_init(lithe_fork_join_sched_t *sched,
   sched->runnable_count = 0;  /* CHANGE 1: O(1) any-runnable indicator */
   sched->warm_ready_count = 0;  /* WARM VCORES: GO-and-unclaimed warm workers */
   sched->leaving_harts = 0;  /* LOST-WAKEUP GUARD: committed-to-yield harts */
-  sched->suppressed_hart_requests = 0;  /* HART-LEDGER SYMMETRY credits */
   TAILQ_INIT(&sched->child_sched_list);
   spin_pdr_init(&sched->child_sched_list_lock);
   /* sched->next_queue_id initialized in sched_enter() */
@@ -1572,22 +1536,82 @@ static int fjs_child_work_hint(lithe_sched_t *child)
 }
 
 /* True if child has outstanding hart demand (harts_needed > harts_granted).
- * SELF-HEAL: also true when a fork-join child visibly has queued RUNNABLE /
- * warm work below the soft hart cap — a drifted ledger (needed <= granted
- * with work queued) must not strand contexts forever. */
+ * Ledger-only on purpose: this runs in the hot hart_enter spin/park loops;
+ * adding a work-hint probe here made every transient enqueue (yield
+ * re-enqueue that the yielding hart itself re-dequeues) restart idle harts
+ * and stampede grants (~2x P2K2 nx=80 CG). Drift healing lives in
+ * fjs_heal_grant_starved_child, called only at the hart's final exit. */
 static int fjs_child_needs_hart(lithe_sched_t *child)
 {
 	uint16_t *harts_granted = (uint16_t *)&child->parent_data;
 	uint16_t *harts_needed = (uint16_t *)&child->parent_data + 1;
+	return *harts_granted < *harts_needed;
+}
+
+/* SELF-HEAL (last-exit only): a fork-join child whose ledger says satisfied
+ * (needed <= granted) but which has queued RUNNABLE/warm work below the soft
+ * hart cap. With a drifted ledger nothing ever grants again and the child's
+ * busy harts may never yield (single-OS wait_sync spin policy) — permanent
+ * stall (hosted miniFE P1K4 nx=80, live gdb: needed=1 < granted=2,
+ * runnable=1). Called only when a hart is about to lithe_hart_yield() away
+ * from the parent, so the probe costs nothing in steady state but the last
+ * departing hart always rescues stranded child work. */
+static int fjs_child_ledger_starved(lithe_sched_t *child)
+{
+	uint16_t *harts_granted = (uint16_t *)&child->parent_data;
+	uint16_t *harts_needed = (uint16_t *)&child->parent_data + 1;
 	if (*harts_granted < *harts_needed)
-		return 1;
-	if (fjs_child_work_hint(child) > 0) {
+		return 0; /* normal grant path will serve it */
+	if (fjs_child_work_hint(child) <= 0)
+		return 0;
+	{
 		long owned = (long)parlib_atomic_read(
 			&((lithe_fork_join_sched_t *)child)->sched.harts);
-		if (fjs_soft_hart_cap <= 0 || owned < (long)fjs_soft_hart_cap)
-			return 1;
+		if (fjs_soft_hart_cap > 0 && owned >= (long)fjs_soft_hart_cap)
+			return 0;
 	}
-	return 0;
+	return 1;
+}
+
+static int fjs_any_child_ledger_starved(lithe_fork_join_sched_t *sched)
+{
+	int starved = 0;
+	lithe_sched_t *child;
+
+	if (TAILQ_EMPTY(&sched->child_sched_list))
+		return 0;
+	spin_pdr_lock(&sched->child_sched_list_lock);
+	TAILQ_FOREACH(child, &sched->child_sched_list, link) {
+		if (fjs_child_ledger_starved(child)) {
+			starved = 1;
+			break;
+		}
+	}
+	spin_pdr_unlock(&sched->child_sched_list_lock);
+	return starved;
+}
+
+/* Lift each starved child's needed to granted+1 so the normal grant path
+ * re-opens; caller then loops back through hart_enter (grant_children). */
+static void fjs_heal_starved_children(lithe_fork_join_sched_t *sched)
+{
+	lithe_sched_t *child;
+
+	spin_pdr_lock(&sched->child_sched_list_lock);
+	TAILQ_FOREACH(child, &sched->child_sched_list, link) {
+		if (!fjs_child_ledger_starved(child))
+			continue;
+		{
+			uint16_t *harts_granted = (uint16_t *)&child->parent_data;
+			uint16_t *harts_needed = (uint16_t *)&child->parent_data + 1;
+			int16_t delta =
+				(int16_t)(*harts_granted - *harts_needed) + 1;
+			if (delta > 0)
+				__sync_fetch_and_add(harts_needed,
+				                     (uint16_t)delta);
+		}
+	}
+	spin_pdr_unlock(&sched->child_sched_list_lock);
 }
 
 /* Peek whether any registered child still wants a hart. Used to avoid
@@ -1617,28 +1641,12 @@ static void fjs_try_hart_grant_child(lithe_fork_join_sched_t *sched,
 {
   uint16_t *harts_granted = (uint16_t*)&child->parent_data;
   uint16_t *harts_needed = (uint16_t*)&child->parent_data + 1;
-  /* Cheap reject before atomic_add: empty demand still paid spinlock tax. */
-  if (*harts_granted >= *harts_needed) {
-    /* SELF-HEAL: ledger satisfied but the child has queued RUNNABLE/warm
-     * work and room under the soft cap. A drifted ledger otherwise strands
-     * that work forever (child's busy harts may never yield — single-OS
-     * wait_sync spin policy). Re-open the grant window by lifting needed
-     * to granted+1; the normal guarded grant below then proceeds. */
-    int heal = 0;
-    if (fjs_child_work_hint(child) > 0) {
-      long owned = (long)parlib_atomic_read(
-          &((lithe_fork_join_sched_t *)child)->sched.harts);
-      if (fjs_soft_hart_cap <= 0 || owned < (long)fjs_soft_hart_cap) {
-        int16_t delta = (int16_t)(*harts_granted - *harts_needed) + 1;
-        if (delta > 0) {
-          __sync_fetch_and_add(harts_needed, (uint16_t)delta);
-          heal = 1;
-        }
-      }
-    }
-    if (!heal)
-      return;
-  }
+  /* Cheap reject before atomic_add: empty demand still paid spinlock tax.
+   * (Drift healing is NOT done here: this runs on every grant rotation and
+   * an inline work-hint heal stampeded extra grants on transient enqueues.
+   * See fjs_heal_starved_children, driven from the hart's final exit.) */
+  if (*harts_granted >= *harts_needed)
+    return;
   if (atomic_add(harts_granted, 1) + 1 <= *harts_needed) {
     if (lithe_sched_trace_enabled()) {
       uint8_t dec = LITHE_ST_DEC_OK;
@@ -1909,6 +1917,21 @@ idle_park_again:
           idle_park_streak = 0;
           goto restart;
         }
+        /* STARVED-CHILD HEAL (parked-hart cadence): the last-exit heal at
+         * the bottom of hart_enter is unreachable when reactor activity
+         * (PMIx timers, event fds) keeps restarting this hart before
+         * idle_park_streak runs out — it loops 1-64ms parks forever while
+         * a child sits at needed==granted with RUNNABLE work (P1K4 nx=80
+         * CG stall: child needed=granted=2, runnable=2, busy harts spin in
+         * the CQ enter gate / cxi ep lock held by a descheduled context).
+         * A parked hart is off the hot path, so probing/healing here costs
+         * one child-list walk per park round at worst. */
+        if ((idle_park_streak & 3u) == 0 &&
+            fjs_any_child_ledger_starved(sched)) {
+          fjs_heal_starved_children(sched);
+          idle_park_streak = 0;
+          goto restart;
+        }
         if (idle_park_streak < 24u) {
           idle_park_streak++;
           goto idle_park_again;
@@ -1948,10 +1971,12 @@ idle_park_again:
       demand2 += 1;
     if (owned2 > demand2 + 1 ||
         (soft_cap2 > 0 && owned2 > (long)soft_cap2)) {
-      lithe_hart_request(-1);
+      /* Deferred to after the LOST-WAKEUP GUARD below: releasing here and
+       * then restarting either drains the needed ledger (no rebalance) or
+       * pays a full lithe_hart_request(+1) tree walk + reactor-wake
+       * stampede per transient-work restart (~2x P2K2 nx=80 CG). Only a
+       * hart truly committed to yield releases demand. */
       idle_yield_released_demand = 1;
-      if (fjs_interfere_on())
-        __sync_fetch_and_add(&fjs_cnt_hart_request_release, 1);
     }
   }
   /* LOST-WAKEUP GUARD (single-OS P1K4 nx=80 CG stall): a context enqueued
@@ -1967,6 +1992,22 @@ idle_park_again:
    * observing runnable work (the old path logged IDLE_WITH_RUNNABLE and
    * yielded anyway). */
   __atomic_fetch_add(&sched->leaving_harts, 1, __ATOMIC_SEQ_CST);
+  /* SELF-HEAL at last exit: before this hart leaves, rescue any child whose
+   * ledger drifted to needed <= granted while RUNNABLE/warm work is queued
+   * (fjs_heal_starved_children lifts needed; the restart pass grants). Off
+   * the hot path by construction — only harts about to yield pay it. */
+  if (fjs_any_child_ledger_starved(sched)) {
+    fjs_heal_starved_children(sched);
+    long lvh = __atomic_load_n(&sched->leaving_harts, __ATOMIC_SEQ_CST);
+    while (lvh > 0 &&
+           !__atomic_compare_exchange_n(&sched->leaving_harts, &lvh, lvh - 1,
+                                        false, __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST))
+      ;
+    if (lithe_sched_trace_enabled())
+      lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0, LITHE_ST_DEC_OK, 4);
+    goto restart;
+  }
   if (__atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 0 ||
       __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) > 0 ||
       tqsize_s(sched, vcore_id()) > 0 ||
@@ -1977,13 +2018,16 @@ idle_park_again:
                                         false, __ATOMIC_SEQ_CST,
                                         __ATOMIC_SEQ_CST))
       ;
-    /* Staying after all: undo the surplus demand release above so the
-     * needed ledger is not drained by a restart (HART-LEDGER SYMMETRY). */
-    if (idle_yield_released_demand)
-      lithe_hart_request(1);
     if (lithe_sched_trace_enabled())
       lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0, LITHE_ST_DEC_OK, 3);
     goto restart;
+  }
+  /* Truly leaving: only now release surplus demand (see deferred note
+   * above) so restarts never drain or churn the needed ledger. */
+  if (idle_yield_released_demand) {
+    lithe_hart_request(-1);
+    if (fjs_interfere_on())
+      __sync_fetch_and_add(&fjs_cnt_hart_request_release, 1);
   }
   vconline(vcore_id()) = false;
   lithe_hart_yield();
@@ -1999,13 +2043,17 @@ void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
 	if (lithe_sched_trace_enabled())
 		lithe_sched_trace_emit(LITHE_ST_CTX_BLOCK, __this,
 		                       (uint32_t)c->id, LITHE_ST_DEC_OK, 0);
-	/* HART-LEDGER SYMMETRY: if this context's wake-side +1 was suppressed by
-	 * the soft-cap clamp, consume that credit instead of issuing a -1 the
-	 * ledger never saw the +1 for. Unconditional -1 here drained the
-	 * parent's harts_needed below true demand over clamped park/wake
-	 * cycles until grants stopped with RUNNABLE work queued. */
-	if (fjs_consume_suppressed_request((lithe_fork_join_sched_t *)__this))
-		return;
+	/* NOTE (needed-ledger drift, deliberate): wake-side +1s can be clamped
+	 * at soft_cap while this -1 is unconditional, so the parent's
+	 * harts_needed drifts below true demand over clamped park/wake cycles
+	 * and grants stop. Symmetric "credit" accounting was tried and kept
+	 * needed at true demand — but that parks spare harts in the child for
+	 * the whole run (every SC enqueue's reactor poke resets their idle-park
+	 * streak) and cost ~2x P2K2 nx=80 CG. The drift is instead rescued by
+	 * the last-exit starved-child heal in hart_enter
+	 * (fjs_heal_starved_children), which re-opens the grant window whenever
+	 * a departing hart sees queued RUNNABLE/warm work under a satisfied
+	 * ledger (hosted miniFE P1K4 nx=80 stall). */
 	lithe_hart_request(-1);
 }
 
@@ -2052,10 +2100,7 @@ void lithe_fork_join_sched_context_exit(lithe_sched_t *__this,
   assert(ctx->state == FJS_CTX_RUNNING);
   fjs_stats_run_leave();
   if (c != sched->sched.main_context) {
-    /* HART-LEDGER SYMMETRY: the creation/wake +1 for this context may have
-     * been clamped; consume the credit instead of over-releasing. */
-    if (!fjs_consume_suppressed_request(sched))
-      lithe_hart_request(-1);
+    lithe_hart_request(-1);
     lithe_fork_join_context_destroy(ctx);
     lithe_fork_join_sched_join_one(sched);
   }
