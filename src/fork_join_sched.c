@@ -619,6 +619,7 @@ static __thread int fjs_wake_batch_harts;
 static __thread int fjs_wake_batch_wake;
 
 static int fjs_clamp_hart_request(lithe_fork_join_sched_t *s, int h);
+static void fjs_heal_own_ledger_if_starved(lithe_fork_join_sched_t *sched);
 
 void lithe_fork_join_wake_batch_begin(void)
 {
@@ -710,8 +711,12 @@ static void fjs_request_harts(int h)
 			if (h <= 0) {
 				/* At soft cap: wake parked siblings so they notice
 				 * the new RUNNABLE and multiplex; do not inflate
-				 * root_sched_harts_needed past the rank budget. */
+				 * root_sched_harts_needed past the rank budget.
+				 * Also reopen parent demand if ledger drifted
+				 * (see fjs_heal_own_ledger_if_starved). */
 				fjs_maybe_reactor_wake();
+				fjs_heal_own_ledger_if_starved(
+					(lithe_fork_join_sched_t *)cur);
 				return;
 			}
 		}
@@ -750,6 +755,9 @@ static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)owner, 1);
 		if (h > 0)
 			lithe_hart_request_for(owner, h);
+		else if (owner->funcs == &lithe_fork_join_sched_funcs)
+			fjs_heal_own_ledger_if_starved(
+				(lithe_fork_join_sched_t *)owner);
 		fjs_maybe_reactor_wake();
 	} else {
 		fjs_request_harts(1);
@@ -1614,6 +1622,36 @@ static void fjs_heal_starved_children(lithe_fork_join_sched_t *sched)
 	spin_pdr_unlock(&sched->child_sched_list_lock);
 }
 
+
+/* ENQUEUE-CLAMP SELF-HEAL: when soft_cap clamps a wake but RUNNABLE/warm
+ * work is queued on this sched, reopen parent demand if the ledger already
+ * looks satisfied (needed <= granted). Closes the race where context_block
+ * released -1 just before this enqueue became visible — previously only
+ * park/last-exit heals recovered (P1K4 nx=80 slow-tail 2/30). Cheap: two
+ * atomics + parent_data touch, only on the clamped path. */
+static void fjs_heal_own_ledger_if_starved(lithe_fork_join_sched_t *sched)
+{
+	uint16_t *harts_granted;
+	uint16_t *harts_needed;
+	int16_t delta;
+
+	if (sched == NULL)
+		return;
+	if (__atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) <= 0 &&
+	    __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) <= 0)
+		return;
+	/* Root has no parent grant ledger; parent_data is unused there. */
+	if (sched->sched.parent == NULL)
+		return;
+	harts_granted = (uint16_t *)&sched->sched.parent_data;
+	harts_needed = (uint16_t *)&sched->sched.parent_data + 1;
+	if (*harts_granted < *harts_needed)
+		return;
+	delta = (int16_t)(*harts_granted - *harts_needed) + 1;
+	if (delta > 0)
+		__sync_fetch_and_add(harts_needed, (uint16_t)delta);
+}
+
 /* Peek whether any registered child still wants a hart. Used to avoid
  * idle-spin → hart_enter restart thrash when the child list is non-empty
  * but nobody needs a grant (profile: fjs_try_hart_grant_child / spinlock). */
@@ -1670,9 +1708,16 @@ static void fjs_hart_grant_children(lithe_fork_join_sched_t *sched)
 {
   if (TAILQ_EMPTY(&sched->child_sched_list))
     return;
-  /* No child with harts_needed > harts_granted: skip list rotate + atomics. */
-  if (!fjs_any_child_needs_hart(sched))
-    return;
+  /* No child with harts_needed > harts_granted: skip list rotate + atomics.
+   * Ledger-starved children (needed <= granted but RUNNABLE queued) still need
+   * a heal+grant pass — otherwise grant_children never runs when the drifted
+   * ledger hides demand (P1K4 nx=80 slow-tail: heals only when a hart parks). */
+  if (!fjs_any_child_needs_hart(sched)) {
+    if (fjs_any_child_ledger_starved(sched))
+      fjs_heal_starved_children(sched);
+    if (!fjs_any_child_needs_hart(sched))
+      return;
+  }
 
   fjs_tradespace_init_once();
   __sync_fetch_and_add(&sched->granting_harts, 1);
