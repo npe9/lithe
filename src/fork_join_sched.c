@@ -2043,17 +2043,28 @@ void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
 	if (lithe_sched_trace_enabled())
 		lithe_sched_trace_emit(LITHE_ST_CTX_BLOCK, __this,
 		                       (uint32_t)c->id, LITHE_ST_DEC_OK, 0);
-	/* NOTE (needed-ledger drift, deliberate): wake-side +1s can be clamped
-	 * at soft_cap while this -1 is unconditional, so the parent's
-	 * harts_needed drifts below true demand over clamped park/wake cycles
-	 * and grants stop. Symmetric "credit" accounting was tried and kept
-	 * needed at true demand — but that parks spare harts in the child for
-	 * the whole run (every SC enqueue's reactor poke resets their idle-park
-	 * streak) and cost ~2x P2K2 nx=80 CG. The drift is instead rescued by
-	 * the last-exit starved-child heal in hart_enter
-	 * (fjs_heal_starved_children), which re-opens the grant window whenever
-	 * a departing hart sees queued RUNNABLE/warm work under a satisfied
-	 * ledger (hosted miniFE P1K4 nx=80 stall). */
+	/* NEEDED-LEDGER DRIFT FIX: wake-side +1s can be clamped at soft_cap
+	 * while this -1 was unconditional, so the parent's harts_needed
+	 * drifted below true demand over clamped park/wake cycles and grants
+	 * stopped with RUNNABLE work queued (hosted miniFE P1K4 nx=80: live
+	 * gdb showed needed==granted with contexts queued state=RUNNABLE
+	 * while busy harts spun in wait). Symmetric "credit" accounting kept
+	 * needed pinned at cap for the whole run and cost ~2x P2K2 nx=80 CG;
+	 * hart_enter heals (park-loop / last-exit) need an idle parent hart
+	 * to visit hart_enter, which the stall states do not guarantee.
+	 *
+	 * Instead, release demand only when this sched has no queued
+	 * RUNNABLE/warm work: if the queue is non-empty the demand this
+	 * context represented is immediately re-owed to the queued work (the
+	 * hart freed by this block, or a pending grant, must run it). Once
+	 * queues drain, later blocks decrement normally, and any residual
+	 * inflation is released by the idle-yield surplus path. */
+	{
+		lithe_fork_join_sched_t *sched = (lithe_fork_join_sched_t *)__this;
+		if (__atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 0 ||
+		    __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) > 0)
+			return;
+	}
 	lithe_hart_request(-1);
 }
 
@@ -2100,7 +2111,11 @@ void lithe_fork_join_sched_context_exit(lithe_sched_t *__this,
   assert(ctx->state == FJS_CTX_RUNNING);
   fjs_stats_run_leave();
   if (c != sched->sched.main_context) {
-    lithe_hart_request(-1);
+    /* NEEDED-LEDGER DRIFT FIX: same rule as context_block — keep the
+     * demand while RUNNABLE/warm work is queued (see comment there). */
+    if (__atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) <= 0 &&
+        __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) <= 0)
+      lithe_hart_request(-1);
     lithe_fork_join_context_destroy(ctx);
     lithe_fork_join_sched_join_one(sched);
   }
