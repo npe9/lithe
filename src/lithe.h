@@ -64,6 +64,12 @@ void lithe_sched_exit();
  */
 lithe_sched_t *lithe_sched_current();
 
+/* 1 when the current context may cooperatively block (see lithe.c). False
+ * during library constructors and _dl_fini destructors, and on the base
+ * scheduler. Test this before any lithe blocking primitive on a path that can
+ * run at process teardown. */
+int lithe_can_block(void);
+
 /**
  * Request up to a specified number of harts from the parent. Note that the
  * parent is free to make a request using the calling hart to their own parent

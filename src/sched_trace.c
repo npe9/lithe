@@ -9,6 +9,9 @@
  */
 
 #include "sched_trace.h"
+#include <parlib/reactor.h>
+#include "lithe.h"
+#include "context.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -72,7 +75,14 @@ static void st_resolve_path(void)
 {
 	const char *e = getenv("LITHE_SCHED_TRACE_PATH");
 	if (e && *e) {
-		snprintf(st_path, sizeof(st_path), "%s", e);
+		/* "%p" in the path expands to the PID so every process of a job
+		 * writes its own file (the driver concatenates the protobufs). */
+		const char *pp = strstr(e, "%p");
+		if (pp)
+			snprintf(st_path, sizeof(st_path), "%.*s%d%s", (int)(pp - e), e,
+			         (int)getpid(), pp + 2);
+		else
+			snprintf(st_path, sizeof(st_path), "%s", e);
 		return;
 	}
 	snprintf(st_path, sizeof(st_path), "lithe_sched_trace.%d.bin", (int)getpid());
@@ -115,6 +125,30 @@ static void st_ctor_early_arm(void)
 	sa.sa_flags = SA_RESTART;
 	if (sigaction(SIGUSR2, &sa, &st_old_sigusr2) == 0)
 		st_sigusr2_installed = 1;
+}
+
+/* parlib reactor -> trace ring bridge (installed in st_init_once). */
+static void st_reactor_trace(int ev, int fd, int aux)
+{
+	static const uint8_t map[3] = { LITHE_ST_REACTOR_PARK, LITHE_ST_REACTOR_WAKE,
+	                                LITHE_ST_REACTOR_EXPIRE };
+	if (ev < 0 || ev > 2)
+		return;
+	lithe_sched_trace_emit(map[ev], NULL, (uint32_t)fd, 0, aux);
+}
+
+static int st_format(void) /* 0 bin, 1 perfetto, 2 both */
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("LITHE_SCHED_TRACE_FORMAT");
+		cached = 0;
+		if (e && (!strcmp(e, "perfetto") || !strcmp(e, "proto")))
+			cached = 1;
+		else if (e && !strcmp(e, "both"))
+			cached = 2;
+	}
+	return cached;
 }
 
 static void st_init_once(void)
@@ -167,6 +201,7 @@ static void st_init_once(void)
 			st_sigusr2_installed = 1;
 	}
 	atexit(st_atexit_dump);
+	parlib_reactor_set_trace_fn(st_reactor_trace);
 
 	st_inited = 1;
 	fprintf(stderr,
@@ -207,7 +242,23 @@ const char *lithe_sched_trace_ev_name(uint8_t ev)
 	case LITHE_ST_CHILD_ENTER: return "child_enter";
 	case LITHE_ST_CHILD_EXIT: return "child_exit";
 	case LITHE_ST_WARM_CLAIM: return "warm_claim";
+	case LITHE_ST_OMP_FORK_BEGIN: return "omp_fork_begin";
+	case LITHE_ST_OMP_FORK_END: return "omp_fork_end";
+	case LITHE_ST_OMP_RUN_BEGIN: return "omp_run_begin";
+	case LITHE_ST_OMP_RUN_END: return "omp_run_end";
+	case LITHE_ST_OMP_BARRIER_BEGIN: return "omp_barrier_begin";
+	case LITHE_ST_OMP_BARRIER_END: return "omp_barrier_end";
+	case LITHE_ST_REACTOR_PARK: return "reactor_park";
+	case LITHE_ST_REACTOR_WAKE: return "reactor_wake";
+	case LITHE_ST_REACTOR_EXPIRE: return "reactor_expire";
+	case LITHE_ST_WAIT_SYNC_BLOCK: return "wait_sync_block";
+	case LITHE_ST_WAIT_SYNC_WAKE: return "wait_sync_wake";
+	case LITHE_ST_USER_BEGIN: return "user_begin";
+	case LITHE_ST_USER_END: return "user_end";
 	case LITHE_ST_WARM_PARK: return "warm_park";
+	case LITHE_ST_HART_REQUEST: return "hart_request";
+	case LITHE_ST_BASE_REQUEST: return "base_hart_request";
+	case LITHE_ST_BASE_GRANT: return "base_grant";
 	case LITHE_ST_DUMP_MARKER: return "dump_marker";
 	default: return "unknown";
 	}
@@ -228,7 +279,7 @@ void lithe_sched_trace_emit(uint8_t ev, void *sched, uint32_t ctx_id,
 
 	vc = vcore_id();
 	if (vc < 0 || (unsigned)vc >= st_n_vcores)
-		vc = 0;
+		return; /* off-vcore callers must not race vcore 0 ring */
 	if (!st_rings[vc])
 		return;
 
@@ -300,7 +351,7 @@ void lithe_sched_trace_get_counters(lithe_sched_trace_counters_t *out)
 	}
 }
 
-int lithe_sched_trace_dump(void)
+static int st_dump_bin(const char *path)
 {
 	int fd;
 	unsigned int i;
@@ -311,12 +362,10 @@ int lithe_sched_trace_dump(void)
 	/* Finalize-wrap / SIGUSR2 may run before any emit; arm from env. */
 	if (!lithe_sched_trace_enabled() || !st_inited)
 		return -1;
-
-	st_resolve_path();
-	fd = open(st_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd < 0) {
 		fprintf(stderr, "[LITHE_SCHED_TRACE] open(%s) failed: %s\n",
-		        st_path, strerror(errno));
+		        path, strerror(errno));
 		return -1;
 	}
 
@@ -359,13 +408,32 @@ int lithe_sched_trace_dump(void)
 			goto fail;
 
 		if (nrec && st_rings[i]) {
-			uint32_t k;
-			for (k = 0; k < nrec; k++) {
-				uint64_t idx = (start + k) & st_ring_mask;
-				n = write(fd, &st_rings[i][idx],
-				          sizeof(lithe_sched_trace_rec_t));
-				if (n != (ssize_t)sizeof(lithe_sched_trace_rec_t))
+			/* The ring is contiguous in at most two pieces: [first .. cap)
+			 * and [0 .. first). Write each piece in large chunks. The old
+			 * one-record-per-write() loop issued ~10 M syscalls for a full
+			 * 9-vcore ring and sat 15+ minutes in exit on Lustre
+			 * (2026-10-16, BabelStream C10 test). */
+			uint64_t first = start & st_ring_mask;
+			uint64_t piece1 = (first + nrec <= st_ring_cap) ? nrec
+			                                                : (st_ring_cap - first);
+			uint64_t piece2 = nrec - piece1;
+			const char *p1 = (const char *)&st_rings[i][first];
+			const char *p2 = (const char *)&st_rings[i][0];
+			size_t left1 = piece1 * sizeof(lithe_sched_trace_rec_t);
+			size_t left2 = piece2 * sizeof(lithe_sched_trace_rec_t);
+			while (left1 > 0) {
+				size_t chunk = left1 > (1u << 22) ? (1u << 22) : left1;
+				n = write(fd, p1, chunk);
+				if (n <= 0)
 					goto fail;
+				p1 += n; left1 -= (size_t)n;
+			}
+			while (left2 > 0) {
+				size_t chunk = left2 > (1u << 22) ? (1u << 22) : left2;
+				n = write(fd, p2, chunk);
+				if (n <= 0)
+					goto fail;
+				p2 += n; left2 -= (size_t)n;
 			}
 		}
 	}
@@ -380,7 +448,7 @@ int lithe_sched_trace_dump(void)
 	        "[LITHE_SCHED_TRACE] dumped %s events=%llu dropped=%llu "
 	        "idle_with_runnable=%llu steal_local_nonempty=%llu "
 	        "grant_empty_child=%llu yield_with_peers=%llu\n",
-	        st_path,
+	        path,
 	        (unsigned long long)ctrs.events_emitted,
 	        (unsigned long long)ctrs.events_dropped,
 	        (unsigned long long)ctrs.idle_with_runnable,
@@ -393,4 +461,492 @@ fail:
 	fprintf(stderr, "[LITHE_SCHED_TRACE] write failed: %s\n", strerror(errno));
 	close(fd);
 	return -1;
+}
+
+/* ======================================================================
+ * Native Perfetto protobuf writer (LITHE_SCHED_TRACE_FORMAT=perfetto|both)
+ * Hand-rolled wire encoding of the few TracePacket / TrackDescriptor /
+ * TrackEvent fields we need; no protobuf library. Field numbers are from
+ * perfetto/protos/perfetto/trace/{trace_packet,track_event}/… .proto files.
+ * Model: process = PID; thread track per hart (slices "ctx N" / "-- idle --",
+ * instants for scheduler events and flagged decisions); async counter track
+ * per hart (runnable_count); async track per OpenMP thread ("parallel
+ * region" / "run" / "barrier" slices from libomp); async track per context
+ * ("MPI wait (wait_sync)" from OMPI, "user N" from the app); flows from
+ * context_unblock to that context's next dispatch; a ClockSnapshot so the
+ * trace merges with other MONOTONIC_RAW/BOOTTIME sources.
+ * ====================================================================== */
+#define PB_VARINT 0
+#define PB_FIXED64 1
+#define PB_LEN 2
+
+typedef struct { uint8_t *b; size_t n, cap; int fd; int err; } pb_out_t;
+typedef struct { uint8_t b[1024]; size_t n; int ovf; } pb_msg_t;
+
+static size_t pb_enc_varint(uint8_t *d, uint64_t v)
+{
+	size_t i = 0;
+	while (v >= 0x80) { d[i++] = (uint8_t)(v | 0x80); v >>= 7; }
+	d[i++] = (uint8_t)v;
+	return i;
+}
+static void pbo_flush(pb_out_t *o)
+{
+	size_t off = 0;
+	while (off < o->n && !o->err) {
+		ssize_t w = write(o->fd, o->b + off, o->n - off);
+		if (w <= 0) { o->err = errno ? errno : EIO; break; }
+		off += (size_t)w;
+	}
+	o->n = 0;
+}
+static void pbo_put(pb_out_t *o, const void *p, size_t n)
+{
+	if (o->n + n > o->cap) pbo_flush(o);
+	if (n > o->cap) { o->err = EFBIG; return; }
+	memcpy(o->b + o->n, p, n); o->n += n;
+}
+static void pbm_init(pb_msg_t *m) { m->n = 0; m->ovf = 0; }
+static void pbm_varint(pb_msg_t *m, uint64_t v)
+{
+	if (m->n + 10 > sizeof(m->b)) { m->ovf = 1; return; }
+	m->n += pb_enc_varint(m->b + m->n, v);
+}
+static void pbm_tag(pb_msg_t *m, uint32_t f, int wt) { pbm_varint(m, ((uint64_t)f << 3) | (uint64_t)wt); }
+static void pbm_u64(pb_msg_t *m, uint32_t f, uint64_t v) { pbm_tag(m, f, PB_VARINT); pbm_varint(m, v); }
+static void pbm_i64(pb_msg_t *m, uint32_t f, int64_t v) { pbm_u64(m, f, (uint64_t)v); }
+static void pbm_fixed64(pb_msg_t *m, uint32_t f, uint64_t v)
+{
+	pbm_tag(m, f, PB_FIXED64);
+	if (m->n + 8 > sizeof(m->b)) { m->ovf = 1; return; }
+	memcpy(m->b + m->n, &v, 8); m->n += 8;
+}
+static void pbm_bytes(pb_msg_t *m, uint32_t f, const void *p, size_t n)
+{
+	pbm_tag(m, f, PB_LEN); pbm_varint(m, n);
+	if (m->n + n > sizeof(m->b)) { m->ovf = 1; return; }
+	memcpy(m->b + m->n, p, n); m->n += n;
+}
+static void pbm_str(pb_msg_t *m, uint32_t f, const char *s) { pbm_bytes(m, f, s, strlen(s)); }
+static void pbm_msg(pb_msg_t *m, uint32_t f, const pb_msg_t *sub) { pbm_bytes(m, f, sub->b, sub->n); }
+static void pbo_packet(pb_out_t *o, pb_msg_t *pkt)
+{
+	uint8_t hdr[16]; size_t h = 0;
+	if (pkt->ovf) { o->err = EMSGSIZE; return; }
+	h += pb_enc_varint(hdr, (1u << 3) | PB_LEN);   /* Trace.packet = 1 */
+	h += pb_enc_varint(hdr + h, pkt->n);
+	pbo_put(o, hdr, h); pbo_put(o, pkt->b, pkt->n);
+}
+
+#define TP_TIMESTAMP 8
+#define TP_TRUSTED_SEQ 10
+#define TP_TRACK_EVENT 11
+#define TP_SEQ_FLAGS 13
+#define TP_TRACK_DESCRIPTOR 60
+#define TP_CLOCK_ID 58
+#define TP_CLOCK_SNAPSHOT 6
+#define TD_UUID 1
+#define TD_NAME 2
+#define TD_PROCESS 3
+#define TD_THREAD 4
+#define TD_PARENT 5
+#define TD_COUNTER 8
+#define TE_DEBUG_ANN 4
+#define TE_TYPE 9
+#define TE_TRACK_UUID 11
+#define TE_CATEGORIES 22
+#define TE_NAME 23
+#define TE_COUNTER_VALUE 30
+#define TE_FLOW_IDS 47
+#define TE_TERM_FLOW_IDS 48
+#define TE_SLICE_BEGIN 1
+#define TE_SLICE_END 2
+#define TE_INSTANT 3
+#define TE_COUNTER 4
+#define DA_INT 4
+#define DA_NAME 10
+
+typedef struct { const char *name; int64_t val; } pf_ann_t;
+
+static int pf_first_packet = 1;
+static int pf_clock_id = 6;
+
+static uint64_t pf_seq_id = 1;      /* per process: concatenated files must not share a sequence */
+static int64_t pf_boot_off = 0;     /* BOOTTIME - record clock, so timestamps need no cross-file clock sync */
+static void pf_seq(pb_msg_t *p)
+{
+	pbm_u64(p, TP_TRUSTED_SEQ, pf_seq_id);
+	if (pf_first_packet) { pbm_u64(p, TP_SEQ_FLAGS, 1 /* SEQ_INCREMENTAL_STATE_CLEARED */); pf_first_packet = 0; }
+}
+
+static void pf_event(pb_out_t *o, uint64_t ts, uint64_t track, int type,
+                     const char *name, const char *cat,
+                     const int64_t *counter, uint64_t flow, uint64_t term_flow,
+                     const pf_ann_t *ann, int n_ann)
+{
+	pb_msg_t pkt, te; int i;
+	pbm_init(&pkt); pbm_init(&te);
+	pbm_u64(&pkt, TP_TIMESTAMP, ts);
+	pbm_u64(&pkt, TP_CLOCK_ID, (uint64_t)pf_clock_id);
+	pf_seq(&pkt);
+	pbm_u64(&te, TE_TYPE, (uint64_t)type);
+	pbm_u64(&te, TE_TRACK_UUID, track);
+	if (name) pbm_str(&te, TE_NAME, name);
+	if (cat) pbm_str(&te, TE_CATEGORIES, cat);
+	if (counter) pbm_i64(&te, TE_COUNTER_VALUE, *counter);
+	if (flow) pbm_fixed64(&te, TE_FLOW_IDS, flow);
+	if (term_flow) pbm_fixed64(&te, TE_TERM_FLOW_IDS, term_flow);
+	for (i = 0; i < n_ann; i++) {
+		pb_msg_t da; pbm_init(&da);
+		pbm_str(&da, DA_NAME, ann[i].name);
+		pbm_i64(&da, DA_INT, ann[i].val);
+		pbm_msg(&te, TE_DEBUG_ANN, &da);
+	}
+	pbm_msg(&pkt, TP_TRACK_EVENT, &te);
+	pbo_packet(o, &pkt);
+}
+static void pf_track_thread(pb_out_t *o, uint64_t uuid, int pid, int tid, const char *name)
+{
+	pb_msg_t pkt, td, th; pbm_init(&pkt); pbm_init(&td); pbm_init(&th);
+	pf_seq(&pkt);
+	pbm_u64(&td, TD_UUID, uuid);
+	pbm_i64(&th, 1, pid); pbm_i64(&th, 2, tid); pbm_str(&th, 5, name);
+	pbm_msg(&td, TD_THREAD, &th);
+	pbm_msg(&pkt, TP_TRACK_DESCRIPTOR, &td);
+	pbo_packet(o, &pkt);
+}
+static void pf_track_process(pb_out_t *o, uint64_t uuid, int pid, const char *name)
+{
+	pb_msg_t pkt, td, pr; pbm_init(&pkt); pbm_init(&td); pbm_init(&pr);
+	pf_seq(&pkt);
+	pbm_u64(&td, TD_UUID, uuid);
+	pbm_i64(&pr, 1, pid); pbm_str(&pr, 6, name);
+	pbm_msg(&td, TD_PROCESS, &pr);
+	pbm_msg(&pkt, TP_TRACK_DESCRIPTOR, &td);
+	pbo_packet(o, &pkt);
+}
+static void pf_track_async(pb_out_t *o, uint64_t uuid, uint64_t parent, const char *name, int counter)
+{
+	pb_msg_t pkt, td; pbm_init(&pkt); pbm_init(&td);
+	pf_seq(&pkt);
+	pbm_u64(&td, TD_UUID, uuid);
+	pbm_u64(&td, TD_PARENT, parent);
+	pbm_str(&td, TD_NAME, name);
+	if (counter) { pb_msg_t cd; pbm_init(&cd); pbm_msg(&td, TD_COUNTER, &cd); }
+	pbm_msg(&pkt, TP_TRACK_DESCRIPTOR, &td);
+	pbo_packet(o, &pkt);
+}
+static void pf_clock_snapshot(pb_out_t *o)
+{
+	struct timespec raw, mono, boot, real;
+	pb_msg_t pkt, cs, c; int have_raw = 0;
+	pbm_init(&pkt); pbm_init(&cs);
+	pf_seq(&pkt);
+#if defined(CLOCK_MONOTONIC_RAW)
+	have_raw = (clock_gettime(CLOCK_MONOTONIC_RAW, &raw) == 0);
+#endif
+	clock_gettime(CLOCK_MONOTONIC, &mono);
+	clock_gettime(CLOCK_BOOTTIME, &boot);
+	clock_gettime(CLOCK_REALTIME, &real);
+#define PF_CLK(id, ts) do { pbm_init(&c); pbm_u64(&c, 1, (id)); \
+	pbm_u64(&c, 2, (uint64_t)(ts).tv_sec * 1000000000ull + (uint64_t)(ts).tv_nsec); \
+	pbm_msg(&cs, 1, &c); } while (0)
+	if (have_raw) PF_CLK(5, raw);
+	PF_CLK(3, mono); PF_CLK(6, boot); PF_CLK(1, real);
+#undef PF_CLK
+	/* Records are stamped with the st_now_ns() clock (MONOTONIC_RAW when
+	 * available, else MONOTONIC). Emit every event in BOOTTIME instead:
+	 * the trace processor rejects a ClockSnapshot that is older than the
+	 * previous one, so two concatenated per-rank files whose ranks dumped
+	 * in the "wrong" order lost every event of the second rank
+	 * (clock_sync_failure, 2026-10-17). With BOOTTIME timestamps the
+	 * snapshot is informational only (merging with other traces). */
+	{
+		struct timespec *base = have_raw ? &raw : &mono;
+		int64_t b = (int64_t)boot.tv_sec * 1000000000ll + boot.tv_nsec;
+		int64_t r = (int64_t)base->tv_sec * 1000000000ll + base->tv_nsec;
+		pf_boot_off = b - r;
+	}
+	pbm_u64(&cs, 2, 6); /* primary_trace_clock = BOOTTIME */
+	pbm_msg(&pkt, TP_CLOCK_SNAPSHOT, &cs);
+	pbo_packet(o, &pkt);
+}
+
+#define PF_SET_SZ 8192
+typedef struct { uint64_t key[PF_SET_SZ]; uint64_t val[PF_SET_SZ]; uint8_t used[PF_SET_SZ]; } pf_map_t;
+static uint64_t *pf_map_get(pf_map_t *m, uint64_t k, int *is_new)
+{
+	unsigned h = (unsigned)((k * 0x9E3779B97F4A7C15ull) >> 51) & (PF_SET_SZ - 1);
+	unsigned i;
+	*is_new = 0;
+	for (i = 0; i < PF_SET_SZ; i++) {
+		unsigned j = (h + i) & (PF_SET_SZ - 1);
+		if (!m->used[j]) { m->used[j] = 1; m->key[j] = k; m->val[j] = 0; *is_new = 1; return &m->val[j]; }
+		if (m->key[j] == k) return &m->val[j];
+	}
+	return NULL;
+}
+
+int lithe_sched_trace_dump_perfetto(const char *path)
+{
+	int fd, pid = (int)getpid();
+	unsigned int i;
+	pb_out_t o;
+	uint64_t P;
+	pf_map_t *omp_tracks, *ctx_tracks, *flows;
+	uint64_t flow_seq = 1, total = 0;
+	char name[96];
+
+	if (!lithe_sched_trace_enabled() || !st_inited)
+		return -1;
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		fprintf(stderr, "[LITHE_SCHED_TRACE] open(%s) failed: %s\n", path, strerror(errno));
+		return -1;
+	}
+	o.cap = 4u << 20; o.b = malloc(o.cap); o.n = 0; o.fd = fd; o.err = 0;
+	omp_tracks = calloc(1, sizeof(*omp_tracks));
+	ctx_tracks = calloc(1, sizeof(*ctx_tracks));
+	flows = calloc(1, sizeof(*flows));
+	if (!o.b || !omp_tracks || !ctx_tracks || !flows) {
+		close(fd); free(o.b); free(omp_tracks); free(ctx_tracks); free(flows);
+		return -1;
+	}
+	pf_clock_id = 6; /* BOOTTIME, see pf_clock_snapshot */
+	pf_seq_id = 2 + ((uint64_t)pid & 0xffffff);
+	pf_first_packet = 1;
+	P = (uint64_t)pid * 1000003ull + 1;
+	pf_clock_snapshot(&o);
+	{
+		/* Label the process with its launcher rank when one is set, so a
+		 * concatenated multi-rank trace reads "rank 1" rather than a PID. */
+		const char *rk = getenv("OMPI_COMM_WORLD_RANK");
+		if (!rk || !*rk) rk = getenv("PMI_RANK");
+		if (!rk || !*rk) rk = getenv("FLUX_TASK_RANK");
+		if (!rk || !*rk) rk = getenv("SLURM_PROCID");
+		if (rk && *rk)
+			snprintf(name, sizeof(name), "rank %s pid %d", rk, pid);
+		else
+			snprintf(name, sizeof(name), "lithe pid %d", pid);
+	}
+	pf_track_process(&o, P, pid, name);
+	for (i = 0; i < st_n_vcores; i++) {
+		int cpu;
+		if (st_write_seq[i] == 0) continue;
+		/* The CPU parlib pinned this vcore to (-1 when unpinned / kernel-balanced),
+		 * so a placement artifact is visible in the trace itself (PLAN-affinity A7). */
+		cpu = parlib_vcore_cpu((int)i);
+		if (cpu >= 0 && parlib_vcore_pinned((int)i))
+			snprintf(name, sizeof(name), "hart %u (cpu %d)%s", i, cpu, st_dropped[i] ? " [dropped]" : "");
+		else if (cpu >= 0)
+			snprintf(name, sizeof(name), "hart %u (unpinned, started cpu %d)%s", i, cpu, st_dropped[i] ? " [dropped]" : "");
+		else
+			snprintf(name, sizeof(name), "hart %u%s", i, st_dropped[i] ? " [dropped]" : "");
+		pf_track_thread(&o, P + 100 + i, pid, (int)i + 1, name);
+		snprintf(name, sizeof(name), "runnable hart %u", i);
+		pf_track_async(&o, P + 300 + i, P, name, 1);
+	}
+
+	for (i = 0; i < st_n_vcores && !o.err; i++) {
+		uint64_t seq = st_write_seq[i], nrec, start, k;
+		uint64_t hart = P + 100 + i, ctr = P + 300 + i;
+		int cur = 0; /* 0 none, -1 idle, >0 ctx */
+		uint64_t last_ts = 0; /* last slice begin/end on this hart track */
+		if (seq == 0 || !st_rings[i]) continue;
+		if (seq <= st_ring_cap) { nrec = seq; start = 0; } else { nrec = st_ring_cap; start = seq - st_ring_cap; }
+		total += nrec;
+		for (k = 0; k < nrec && !o.err; k++) {
+			const lithe_sched_trace_rec_t *r = &st_rings[i][(start + k) & st_ring_mask];
+			uint64_t ts = (uint64_t)((int64_t)r->ns + pf_boot_off);
+			/* Equal timestamps on one thread track (yield -> idle begin, or an
+			 * instant on the ts of a slice end) are order-ambiguous for the trace
+			 * processor and showed up as misplaced_end_event; keep every slice
+			 * begin/end on a hart track strictly after the previous one. */
+#define HART_SLICE(type, name, cat, term, ann, na) do { \
+				if (ts <= last_ts) ts = last_ts + 1; \
+				pf_event(&o, ts, hart, (type), (name), (cat), NULL, 0, (term), (ann), (na)); \
+				last_ts = ts; } while (0)
+			const char *evn = lithe_sched_trace_ev_name(r->ev);
+			pf_ann_t ann[3];
+			/* Hart life-cycle instants (2026-10-17): a hart that leaves the
+			 * scheduler used to vanish from the trace with no event, and a
+			 * request the base scheduler refused was invisible (XSBench OMP=4:
+			 * two woken workers waited 136 ms for harts that never came). */
+			switch (r->ev) {
+			case LITHE_ST_HART_RETURN: case LITHE_ST_IDLE_YIELD: case LITHE_ST_HART_ENTER:
+			case LITHE_ST_HART_REQUEST: case LITHE_ST_BASE_REQUEST: case LITHE_ST_BASE_GRANT:
+			case LITHE_ST_CHILD_EXIT: case LITHE_ST_WARM_PARK: {
+				pf_ann_t a2[4];
+				a2[0].name = "ctx"; a2[0].val = r->ctx_id; a2[1].name = "aux"; a2[1].val = r->aux;
+				a2[2].name = "dec"; a2[2].val = r->decision; a2[3].name = "sched"; a2[3].val = r->sched_id;
+				pf_event(&o, ts, hart, TE_INSTANT, evn, "hart", NULL, 0, 0, a2, 4);
+				break; }
+			default: break;
+			}
+			if ((r->ev == LITHE_ST_DEQUEUE_LOCAL || r->ev == LITHE_ST_HART_ENTER ||
+			     r->ev == LITHE_ST_IDLE_YIELD || r->ev == LITHE_ST_CTX_YIELD) && r->aux >= 0) {
+				int64_t v = r->aux;
+				pf_event(&o, ts, ctr, TE_COUNTER, NULL, NULL, &v, 0, 0, NULL, 0);
+			}
+			switch (r->ev) {
+			case LITHE_ST_DEQUEUE_LOCAL: case LITHE_ST_STEAL_SUCCESS: case LITHE_ST_WARM_CLAIM: {
+				/* A dispatch always carries a context. Context ids start at 0
+				 * (lithe.c next_context_id), so "ctx 0" is the first context of
+				 * the process: the MPI rank / OpenMP primary. Until 2026-10-17 it
+				 * was skipped and the primary's time showed as "-- idle --". */
+				uint64_t term = 0; int is_new; uint64_t *pf;
+				if (cur) HART_SLICE(TE_SLICE_END, NULL, NULL, 0, NULL, 0);
+				pf = pf_map_get(flows, r->ctx_id, &is_new);
+				if (pf && *pf) { term = *pf; *pf = 0; }
+				snprintf(name, sizeof(name), "ctx %u", r->ctx_id);
+				ann[0].name = "ctx"; ann[0].val = r->ctx_id;
+				ann[1].name = "sched"; ann[1].val = r->sched_id; /* which FJS dispatched it (nested scheds share a hart track) */
+				HART_SLICE(TE_SLICE_BEGIN, name, "ctx", term, ann, 2);
+				cur = (int)r->ctx_id + 1; /* 0 none, -1 idle, >0 ctx id + 1 */
+				break; }
+			case LITHE_ST_CTX_YIELD: case LITHE_ST_CTX_BLOCK: case LITHE_ST_HART_RETURN:
+			case LITHE_ST_WARM_PARK: case LITHE_ST_CHILD_EXIT:
+				if (cur) HART_SLICE(TE_SLICE_END, NULL, NULL, 0, NULL, 0);
+				cur = 0;
+				if (r->ev != LITHE_ST_HART_RETURN) {
+					HART_SLICE(TE_SLICE_BEGIN, "-- idle --", "idle", 0, NULL, 0);
+					cur = -1;
+				}
+				break;
+			case LITHE_ST_IDLE_SPIN: case LITHE_ST_IDLE_YIELD: case LITHE_ST_REACTOR_BLOCK:
+				if (cur != -1) {
+					if (cur) HART_SLICE(TE_SLICE_END, NULL, NULL, 0, NULL, 0);
+					HART_SLICE(TE_SLICE_BEGIN, "-- idle --", "idle", 0, NULL, 0);
+					cur = -1;
+				}
+				break;
+			case LITHE_ST_CTX_UNBLOCK: {
+				int is_new; uint64_t *pf = pf_map_get(flows, r->ctx_id, &is_new);
+				uint64_t fid = ((uint64_t)pid << 32) | (flow_seq++ & 0xffffffffu);
+				if (pf) *pf = fid;
+				ann[0].name = "ctx"; ann[0].val = r->ctx_id; ann[1].name = "aux"; ann[1].val = r->aux;
+				pf_event(&o, ts, hart, TE_INSTANT, "context_unblock", "sched", NULL, fid, 0, ann, 2);
+				break; }
+			case LITHE_ST_STEAL_ATTEMPT: case LITHE_ST_STEAL_FAIL: case LITHE_ST_PROGRESS_WAKE:
+			case LITHE_ST_HART_GRANT: case LITHE_ST_CHILD_ENTER:
+				ann[0].name = "ctx"; ann[0].val = r->ctx_id; ann[1].name = "aux"; ann[1].val = r->aux;
+				ann[2].name = "sched"; ann[2].val = r->sched_id;
+				pf_event(&o, ts, hart, TE_INSTANT, evn, "sched", NULL, 0, 0, ann, 3);
+				break;
+			case LITHE_ST_REACTOR_PARK: case LITHE_ST_REACTOR_WAKE: case LITHE_ST_REACTOR_EXPIRE:
+				ann[0].name = "fd"; ann[0].val = r->ctx_id;
+				ann[1].name = (r->ev == LITHE_ST_REACTOR_PARK) ? "timeout_ms" : "events"; ann[1].val = r->aux;
+				pf_event(&o, ts, hart, TE_INSTANT, evn, "reactor", NULL, 0, 0, ann, 2);
+				break;
+			case LITHE_ST_OMP_FORK_BEGIN: case LITHE_ST_OMP_FORK_END:
+			case LITHE_ST_OMP_RUN_BEGIN: case LITHE_ST_OMP_RUN_END:
+			case LITHE_ST_OMP_BARRIER_BEGIN: case LITHE_ST_OMP_BARRIER_END: {
+				int is_new; uint64_t *t = pf_map_get(omp_tracks, r->ctx_id, &is_new);
+				uint64_t track = P + 1000 + r->ctx_id;
+				if (!t) break;
+				if (is_new) { snprintf(name, sizeof(name), "omp thread %u", r->ctx_id); pf_track_async(&o, track, P, name, 0); }
+				if (r->ev == LITHE_ST_OMP_FORK_BEGIN) {
+					ann[0].name = "hart"; ann[0].val = r->vcore_id;
+					pf_event(&o, ts, track, TE_SLICE_BEGIN, "parallel region", "omp", NULL, 0, 0, ann, 1);
+				} else if (r->ev == LITHE_ST_OMP_RUN_BEGIN) {
+					ann[0].name = "hart"; ann[0].val = r->vcore_id; ann[1].name = "tid"; ann[1].val = r->aux;
+					pf_event(&o, ts, track, TE_SLICE_BEGIN, "run", "omp", NULL, 0, 0, ann, 2);
+				} else if (r->ev == LITHE_ST_OMP_BARRIER_BEGIN) {
+					ann[0].name = "hart"; ann[0].val = r->vcore_id; ann[1].name = "type"; ann[1].val = r->aux;
+					pf_event(&o, ts, track, TE_SLICE_BEGIN,
+					         r->aux == 1 ? "fork/join barrier" : (r->aux == 2 ? "reduction barrier" : "barrier"),
+					         "omp", NULL, 0, 0, ann, 2);
+				} else {
+					pf_event(&o, ts, track, TE_SLICE_END, NULL, NULL, NULL, 0, 0, NULL, 0);
+				}
+				break; }
+			case LITHE_ST_WAIT_SYNC_BLOCK: case LITHE_ST_WAIT_SYNC_WAKE:
+			case LITHE_ST_USER_BEGIN: case LITHE_ST_USER_END: {
+				int is_new; uint64_t *t = pf_map_get(ctx_tracks, r->ctx_id, &is_new);
+				uint64_t track = P + 3000000ull + r->ctx_id;
+				if (!t) break;
+				if (is_new) {
+					if (r->ctx_id & 0x80000000u) snprintf(name, sizeof(name), "context %#x", r->ctx_id);
+					else snprintf(name, sizeof(name), "context %u", r->ctx_id);
+					pf_track_async(&o, track, P, name, 0);
+				}
+				if (r->ev == LITHE_ST_WAIT_SYNC_BLOCK) {
+					ann[0].name = "hart"; ann[0].val = r->vcore_id; ann[1].name = "sync"; ann[1].val = r->aux;
+					pf_event(&o, ts, track, TE_SLICE_BEGIN, "MPI wait (wait_sync)", "mpi", NULL, 0, 0, ann, 2);
+				} else if (r->ev == LITHE_ST_USER_BEGIN) {
+					snprintf(name, sizeof(name), "user %d", r->aux);
+					ann[0].name = "hart"; ann[0].val = r->vcore_id;
+					pf_event(&o, ts, track, TE_SLICE_BEGIN, name, "user", NULL, 0, 0, ann, 1);
+				} else {
+					pf_event(&o, ts, track, TE_SLICE_END, NULL, NULL, NULL, 0, 0, NULL, 0);
+				}
+				break; }
+			default:
+				break;
+			}
+			if (r->decision) {
+				char fl[200]; fl[0] = 0;
+				if (r->decision & LITHE_ST_DEC_STEAL_LOCAL_NONEMPTY) strcat(fl, "steal_with_local_nonempty+");
+				if (r->decision & LITHE_ST_DEC_IDLE_WITH_RUNNABLE) strcat(fl, "IDLE_WITH_RUNNABLE+");
+				if (r->decision & LITHE_ST_DEC_GRANT_EMPTY_CHILD) strcat(fl, "grant_to_empty_child+");
+				if (r->decision & LITHE_ST_DEC_GRANT_PARENT_RUNNABLE) strcat(fl, "grant_while_parent_runnable+");
+				if (r->decision & LITHE_ST_DEC_YIELD_WITH_PEERS) strcat(fl, "yield_with_peers+");
+				if (r->decision & LITHE_ST_DEC_SELF_RESCHED_HOT) strcat(fl, "self_resched_hot+");
+				if (fl[0]) fl[strlen(fl) - 1] = 0;
+				ann[0].name = "event"; ann[0].val = r->ev;
+				ann[1].name = "ctx"; ann[1].val = r->ctx_id;
+				ann[2].name = "aux"; ann[2].val = r->aux;
+				pf_event(&o, (ts <= last_ts) ? last_ts : ts, hart, TE_INSTANT, fl, "flag", NULL, 0, 0, ann, 3);
+			}
+		}
+		if (cur && nrec) {
+			/* close a slice still open at dump time (hot-team workers that never
+			 * yield); the timestamp must be in the same BOOTTIME domain as the
+			 * begin, or the trace processor drops the whole slice (BabelStream
+			 * showed 0 % occupancy, 2026-10-17). */
+			uint64_t ts = (uint64_t)((int64_t)st_rings[i][(start + nrec - 1) & st_ring_mask].ns + pf_boot_off);
+			if (ts <= last_ts) ts = last_ts + 1;
+			pf_event(&o, ts, hart, TE_SLICE_END, NULL, NULL, NULL, 0, 0, NULL, 0);
+		}
+#undef HART_SLICE
+	}
+	pbo_flush(&o);
+	close(fd);
+	free(o.b); free(omp_tracks); free(ctx_tracks); free(flows);
+	if (o.err) {
+		fprintf(stderr, "[LITHE_SCHED_TRACE] perfetto write failed: %s\n", strerror(o.err));
+		return -1;
+	}
+	fprintf(stderr, "[LITHE_SCHED_TRACE] dumped perfetto %s records=%llu "
+	        "(ui.perfetto.dev / trace_processor)\n", path, (unsigned long long)total);
+	return 0;
+}
+
+uint32_t lithe_sched_trace_ctx_key(void)
+{
+	lithe_context_t *c = lithe_context_self();
+	if (!c)
+		return 0;
+	return (uint32_t)c->id;
+}
+
+int lithe_sched_trace_dump(void)
+{
+	int fmt, rc;
+	if (!lithe_sched_trace_enabled() || !st_inited)
+		return -1;
+	st_resolve_path();
+	fmt = st_format();
+	if (fmt == 0)
+		return st_dump_bin(st_path);
+	if (fmt == 1)
+		return lithe_sched_trace_dump_perfetto(st_path);
+	rc = st_dump_bin(st_path);
+	{
+		char p2[4200];
+		snprintf(p2, sizeof(p2), "%s.perfetto-trace", st_path);
+		if (lithe_sched_trace_dump_perfetto(p2) != 0)
+			rc = -1;
+	}
+	return rc;
 }

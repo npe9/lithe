@@ -64,10 +64,10 @@ liblithe_la_SOURCES = $(LIB_CFILES) $(LIB_HFILES)
 # Exclude C++ files to make it a pure C library
 # liblithe_la_SOURCES += $(LIB_CXXFILES) $(LIB_HHFILES)
 if STATIC_ONLY 
-liblithe_la_LIBADD = $(LPARLIB) -lpthread
+liblithe_la_LIBADD = $(LPARLIB) -lpthread -ldl
 liblithe_la_LDFLAGS = -all-static 
 else
-liblithe_la_LIBADD = $(LPARLIB)
+liblithe_la_LIBADD = $(LPARLIB) -ldl
 endif 
 
 # Setup a directory where all of the include files will be installed

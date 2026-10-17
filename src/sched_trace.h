@@ -2,7 +2,8 @@
  * Lithe scheduling decision + latency tracing (env-gated, default OFF).
  *
  * Enable:  LITHE_SCHED_TRACE=1
- * Dump:    LITHE_SCHED_TRACE_PATH=/path/to/file.bin  (default: lithe_sched_trace.<pid>.bin)
+ * Dump:    LITHE_SCHED_TRACE_PATH=/path/to/file.bin  (default: lithe_sched_trace.<pid>.bin; "%p" -> pid)
+ * Format:  LITHE_SCHED_TRACE_FORMAT=bin|perfetto|both (default bin; perfetto = native protobuf)
  * Ring:    LITHE_SCHED_TRACE_RING=<power-of-2 records per vcore>  (default 4096)
  * Signal:  SIGUSR2 dumps rings (after init)
  *
@@ -40,6 +41,25 @@ typedef enum {
 	LITHE_ST_CHILD_EXIT = 16,
 	LITHE_ST_WARM_CLAIM = 17,
 	LITHE_ST_WARM_PARK = 18,
+	/* Runtime-level events above the FJS (2026-10-16, Perfetto plan 2.4).
+	 * All are emitted through lithe_sched_trace_emit() from the runtime that
+	 * owns the event; sched is NULL. */
+	LITHE_ST_OMP_FORK_BEGIN = 20,    /* master enters __kmp_fork_call; ctx=gtid */
+	LITHE_ST_OMP_FORK_END = 21,      /* master leaves __kmp_join_call;  ctx=gtid */
+	LITHE_ST_OMP_RUN_BEGIN = 22,     /* thread starts its microtask; ctx=gtid aux=tid */
+	LITHE_ST_OMP_RUN_END = 23,
+	LITHE_ST_OMP_BARRIER_BEGIN = 24, /* thread enters a barrier; ctx=gtid aux=bt (0 plain,1 forkjoin,2 reduction) */
+	LITHE_ST_OMP_BARRIER_END = 25,
+	LITHE_ST_REACTOR_PARK = 26,      /* uthread parks on an fd; ctx=fd aux=timeout_ms */
+	LITHE_ST_REACTOR_WAKE = 27,      /* drive woke a waiter;    ctx=fd aux=events */
+	LITHE_ST_REACTOR_EXPIRE = 28,    /* timed waiter expired;   ctx=fd */
+	LITHE_ST_WAIT_SYNC_BLOCK = 29,   /* OMPI wait_sync: this context blocks; ctx=ctx key */
+	LITHE_ST_WAIT_SYNC_WAKE = 30,    /* ... and resumes */
+	LITHE_ST_USER_BEGIN = 31,        /* application slice on the ctx track; ctx=ctx key aux=user id */
+	LITHE_ST_USER_END = 32,
+	LITHE_ST_HART_REQUEST = 33,      /* FJS fjs_request_harts: ctx=h requested, aux=h after clamp (0 = clamped away) */
+	LITHE_ST_BASE_REQUEST = 34,      /* base_hart_request: ctx=(needed<<16)|have after the add, aux=vcores woken (-1: no deficit) */
+	LITHE_ST_BASE_GRANT = 35,        /* base_hart_enter decision: ctx=(needed<<16)|harts_before, aux=1 granted / 0 denied -> vcore parks */
 	LITHE_ST_DUMP_MARKER = 255
 } lithe_sched_trace_ev_t;
 
@@ -117,6 +137,17 @@ void lithe_sched_trace_get_counters(lithe_sched_trace_counters_t *out);
 
 /* Event name for analyzers / debug. */
 const char *lithe_sched_trace_ev_name(uint8_t ev);
+/* Write the rings as a native Perfetto protobuf trace (TrackEvent packets:
+ * hart threads with context/idle slices and instants, per-hart runnable
+ * counters, async tracks per OpenMP thread and per MPI context, flows from
+ * context_unblock to the next dispatch, a ClockSnapshot so the trace merges
+ * with other MONOTONIC_RAW/BOOTTIME traces). Selected for the normal dump by
+ * LITHE_SCHED_TRACE_FORMAT=perfetto (or =both: .bin plus <path>.perfetto-trace). */
+int lithe_sched_trace_dump_perfetto(const char *path);
+/* Stable small key for "the current context": the FJS context id when the
+ * current scheduler is a fork-join scheduler, otherwise a pointer-derived key
+ * with the top bit set. 0 when there is no current context. */
+uint32_t lithe_sched_trace_ctx_key(void);
 
 #ifdef __cplusplus
 }

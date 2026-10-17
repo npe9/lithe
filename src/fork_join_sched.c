@@ -4,12 +4,15 @@
  * See COPYING for details.
  */
 
+#include <time.h>
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <parlib/waitfreelist.h>
 #include <parlib/reactor.h>
+/* lithe.c: LITHE_FJS_EXIT_QUIESCE gate (2026-10-15). */
+extern int lithe_exit_quiesce_on(void);
 #include <parlib/arch.h>
 #include "fork_join_sched.h"
 #include "lithe.h"
@@ -88,6 +91,20 @@ static unsigned long fjs_cnt_hart_cap_clamp;
 static long fjs_sample_owned;
 static long fjs_sample_demand;
 static long fjs_sample_runnable;
+
+/* B20: when this sched is exiting (teardown_quiesce), leave even if the
+ * process-global reactor has pending waiters (they belong to some sched; the
+ * parent's harts drive the reactor). LITHE_FJS_QUIESCE_IGNORE_PENDING=0
+ * restores the old gate for A/B. Default on. */
+static inline int fjs_quiesce_ignore_pending_on(void)
+{
+  static int cached = -1;
+  if (__builtin_expect(cached < 0, 0)) {
+    const char *e = getenv("LITHE_FJS_QUIESCE_IGNORE_PENDING");
+    cached = (e && e[0] == '0') ? 0 : 1;
+  }
+  return cached;
+}
 
 static inline int fjs_interfere_on(void)
 {
@@ -228,6 +245,49 @@ void lithe_fork_join_set_idle_nanosleep_usec(long us)
     (void)us;
 }
 
+/* LITHE_FJS_REACTOR_POLL_US (2026-10-17): minimum interval between two
+ * zero-timeout reactor polls on one hart. pending is never 0 in a lithified
+ * MPI process (the PMIx progress context is parked on its fd for the life of
+ * the process), so the gate below polled on EVERY hart re-enter: epoll_wait(0)
+ * + two clock_gettime in parlib_reactor_drive. perf (audit 2026-10-17):
+ * 8 % of GROMACS NP=1 OMP=4 samples, 81 % of a hosted RPH=8 run's. The reactor
+ * serves PMIx/libevent sockets and timers, which tolerate tens of us; MPI
+ * progress does not go through it. 0 = poll every time (old). Default 50 after
+ * the A/B (3 reps): hosted RPH=4 x OMP=2 CG 0.0236 -> 0.0187 s, RPH=8 0.0174 ->
+ * 0.0164, serial 0.0087 -> 0.0084, stress 46.6 -> 45.9 us/op, LULESH +2 %,
+ * GROMACS / LAMMPS within noise. */
+static long fjs_reactor_poll_us = 50;
+static uint64_t fjs_tsc_per_us = 0;
+static __thread uint64_t fjs_last_poll_tsc;
+static inline uint64_t fjs_rdtsc(void)
+{
+	unsigned int lo, hi;
+	__asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+	return ((uint64_t)hi << 32) | lo;
+}
+static void fjs_reactor_poll_init(void)
+{
+	const char *e = getenv("LITHE_FJS_REACTOR_POLL_US");
+	if (e && *e) {
+		char *end = NULL;
+		unsigned long v = strtoul(e, &end, 10);
+		if (end != e && v <= 100000ul)
+			fjs_reactor_poll_us = (long)v;
+	}
+	if (fjs_reactor_poll_us > 0) {
+		/* calibrate the TSC once: 2 ms against CLOCK_MONOTONIC */
+		struct timespec a, b;
+		uint64_t t0 = fjs_rdtsc(), t1;
+		clock_gettime(CLOCK_MONOTONIC, &a);
+		do {
+			clock_gettime(CLOCK_MONOTONIC, &b);
+		} while ((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec) < 2000000L);
+		t1 = fjs_rdtsc();
+		fjs_tsc_per_us = (t1 - t0) / 2000;
+		if (fjs_tsc_per_us == 0)
+			fjs_tsc_per_us = 1;
+	}
+}
 static inline void fjs_reactor_poll(void)
 {
 	/* parlib_reactor_drive(0) is epoll_wait(..., 0). When no uthreads are
@@ -236,12 +296,107 @@ static inline void fjs_reactor_poll(void)
 	 * profiles at full-node rank count. hart_request still pokes wake_efd
 	 * for vcores blocked in drive(-1); runqueue work is found via dequeue
 	 * and the adaptive spin without needing a zero-timeout poll here. */
-	if (parlib_reactor_initialized() && parlib_reactor_pending() > 0)
-		(void)parlib_reactor_drive(0);
+	if (!parlib_reactor_initialized() || parlib_reactor_pending() <= 0)
+		return;
+	if (fjs_reactor_poll_us > 0) {
+		uint64_t t = fjs_rdtsc();
+		if (t - fjs_last_poll_tsc < (uint64_t)fjs_reactor_poll_us * fjs_tsc_per_us)
+			return;
+		fjs_last_poll_tsc = t;
+	}
+	(void)parlib_reactor_drive(0);
 }
 
 static struct wfl sched_zombie_list = WFL_INITIALIZER(sched_zombie_list);
+
+/* ---- context free list, BUCKETED BY STACK SIZE CLASS --------------------
+ *
+ * CORRECTNESS FIX (2026-10-13). This used to be a single process-global list
+ * carrying the comment "wfl currently assumes stacksize the same for all
+ * contexts". That assumption is FALSE in this stack:
+ *
+ *   OPAL progress contexts   256 KB  (opal/mca/threads/lithe/threads_lithe_module.c)
+ *   PMIx progress contexts     1 MB  (openpmix/src/threads/thread.c)
+ *   miniFE rank contexts      16 MB  (4 * FJS_STACK_SIZE)
+ *   OFI helpers              varies  (ofi_thread_create)
+ *
+ * __ctx_alloc() popped the list with no size check, so a recycled 256 KB
+ * progress context could be handed to a rank asking for 16 MB -- a 64x
+ * undersized stack, i.e. silent memory corruption with an arbitrary blast
+ * radius. Any context destroy (lithe_fork_join_context_destroy -> __ctx_free)
+ * feeds the same list, so mixing is reachable as soon as one progress helper
+ * exits before the ranks are created.
+ *
+ * Fix: bucket by ceil(log2(pages)) and only reuse within a class, plus a
+ * belt-and-braces size check on reuse (the per-context offset randomisation
+ * means usable size varies slightly within a class).
+ *
+ * LITHE_FJS_CTX_POOL=0 reverts to a single unbucketed list for A/B only --
+ * it reinstates the bug, so use it to demonstrate, never to run.
+ * -------------------------------------------------------------------------- */
+#define FJS_CTX_SIZE_CLASSES 28
+static struct wfl context_zombie_class[FJS_CTX_SIZE_CLASSES];
 static struct wfl context_zombie_list = WFL_INITIALIZER(context_zombie_list);
+
+static void fjs_ctx_pool_ctor(void) __attribute__((constructor(102)));
+static void fjs_ctx_pool_ctor(void)
+{
+	for (int i = 0; i < FJS_CTX_SIZE_CLASSES; i++)
+		wfl_init(&context_zombie_class[i]);
+}
+
+static int fjs_ctx_pool_bucketed(void)
+{
+	static int cached = -1;
+	if (__builtin_expect(cached < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_CTX_POOL");
+		int v = 1;
+		if (e && e[0] == '0' && e[1] == '\0')
+			v = 0;
+		__atomic_store_n(&cached, v, __ATOMIC_RELAXED);
+	}
+	return __atomic_load_n(&cached, __ATOMIC_RELAXED) != 0;
+}
+
+static int fjs_ctx_size_class(size_t stacksize)
+{
+	size_t pages = (stacksize + PGSIZE - 1) / PGSIZE;
+	int c = 0;
+	while (((size_t)1 << c) < pages && c < FJS_CTX_SIZE_CLASSES - 1)
+		c++;
+	return c;
+}
+
+/* Executable context stacks are not needed by anything here; PROT_EXEC also
+ * makes the mapping ineligible for THP on some kernels. LITHE_FJS_STACK_EXEC=1
+ * restores the old PROT_READ|PROT_WRITE|PROT_EXEC if something turns out to
+ * need it. */
+static int fjs_stack_exec(void)
+{
+	static int cached = -1;
+	if (__builtin_expect(cached < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_STACK_EXEC");
+		__atomic_store_n(&cached, (e && e[0] == '1') ? 1 : 0, __ATOMIC_RELAXED);
+	}
+	return __atomic_load_n(&cached, __ATOMIC_RELAXED) != 0;
+}
+
+/* madvise(MADV_HUGEPAGE) on stacks >= 2 MB. Advisory: a no-op when THP is
+ * "never", a 512x reduction in fault COUNT when it is "madvise" or "always".
+ * Context stacks are the largest single mapping this runtime makes (16 MB per
+ * miniFE rank), so they are where fault count concentrates. 0 to disable. */
+static int fjs_stack_hugepage(void)
+{
+	static int cached = -1;
+	if (__builtin_expect(cached < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_STACK_HUGE");
+		int v = 1;
+		if (e && e[0] == '0' && e[1] == '\0')
+			v = 0;
+		__atomic_store_n(&cached, v, __ATOMIC_RELAXED);
+	}
+	return __atomic_load_n(&cached, __ATOMIC_RELAXED) != 0;
+}
 
 /* Env-gated concurrency instrumentation (LITHE_FJS_STATS=1). Tracks the number
  * of contexts currently RUNNING (dispatched via hart_enter and not yet
@@ -291,6 +446,32 @@ static inline void fjs_stats_run_leave(void)
  * LITHE_PROGRESS_SPIN_MAX=N  (bounded spin before reactor block; see header)
  * ------------------------------------------------------------------------- */
 static lithe_fjs_steal_mode_t fjs_steal_mode = LITHE_FJS_STEAL_DEFAULT;
+static int fjs_steal_topo; /* LITHE_FJS_STEAL_TOPO, A6 */
+/* Per-thief victim order: vcores sorted by (same L3, same NUMA, other), built
+ * lazily once per vcore from parlib's topology accessors. */
+#define FJS_TOPO_MAX_VC 256
+static int16_t fjs_topo_order[FJS_TOPO_MAX_VC][FJS_TOPO_MAX_VC];
+static int fjs_topo_n[FJS_TOPO_MAX_VC];
+static int fjs_topo_ready[FJS_TOPO_MAX_VC];
+static void fjs_topo_build(int vc, int mv)
+{
+	int l3 = parlib_vcore_l3_group(vc), nd = parlib_vcore_numa_node(vc);
+	int n = 0;
+	if (mv > FJS_TOPO_MAX_VC)
+		mv = FJS_TOPO_MAX_VC;
+	for (int pass = 0; pass < 3; pass++) {
+		for (int i = 0; i < mv; i++) {
+			if (i == vc)
+				continue;
+			int il3 = parlib_vcore_l3_group(i), ind = parlib_vcore_numa_node(i);
+			int cls = (il3 >= 0 && il3 == l3) ? 0 : ((ind >= 0 && ind == nd) ? 1 : 2);
+			if (cls == pass)
+				fjs_topo_order[vc][n++] = (int16_t)i;
+		}
+	}
+	fjs_topo_n[vc] = n;
+	__atomic_store_n(&fjs_topo_ready[vc], 1, __ATOMIC_RELEASE);
+}
 static lithe_fjs_hart_order_t fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
 static int fjs_progress_sched_child = 0;
 static int fjs_tradespace_init = 0;
@@ -310,6 +491,12 @@ static int fjs_tradespace_init = 0;
  * park+pump (P2K2 ~2ms). Opt in via LITHE_FJS_HELPER_HARTS=1.
  * LITHE_FJS_MAX_ONLINE_HARTS still wins when set. */
 static int fjs_soft_hart_cap = 0;
+/* Idle harts allowed in the infinite reactor drive (LITHE_FJS_REACTOR_DRIVERS; 0 = all = the
+ * pre-2026-10-17 behaviour, see hart_enter). Default 1 after the A/B: XSBench NP=2 OMP=4
+ * 13.2-13.5M -> 25.3-26.1M lookups/s (vanilla 26.2-27.1M), LULESH OMP=4 lost its half-speed
+ * mode (1454 vs 2710-2787 z/s), GROMACS and LAMMPS unchanged. */
+static long fjs_reactor_drivers_max = 1;
+static long fjs_reactor_drivers = 0;
 /* Extra harts above RPH reserved for progress/helpers (default 0). */
 static int fjs_helper_harts = 0;
 /* Default: spin before CQ park. 0 meant every empty progress tick paid
@@ -343,6 +530,19 @@ static void fjs_tradespace_init_once(void)
 	e = getenv("LITHE_PROGRESS_SCHED");
 	fjs_progress_sched_child = (e && strcmp(e, "child") == 0) ? 1 : 0;
 
+	/* A6 (docs/PLAN-affinity.md): LITHE_FJS_STEAL_TOPO=1 orders steal victims
+	 * by distance from the thief's CPU -- same L3 group, then same NUMA
+	 * node, then the rest -- instead of two random picks + a round-robin
+	 * walk from vcoreid+1. A stolen context drags its cache footprint and,
+	 * on first touch, its pages across the boundary it crosses. Measured
+	 * 2026-10-16 (login node, hosted_allreduce_stress, 16 contexts on 12
+	 * harts = CPUs 0-11 across the L3 boundary at 8, 3 reps): allreduce 64 KiB
+	 * random 306/300/291 us/op -> topo 267/290/268; halo 4 KiB noise either
+	 * way; control (8 ctx on 6 harts inside one L3) 91 both. DEFAULT ON;
+	 * LITHE_FJS_STEAL_TOPO=0 restores the random pair + round-robin walk. */
+	e = getenv("LITHE_FJS_STEAL_TOPO");
+	fjs_steal_topo = (e && *e) ? (atoi(e) != 0) : 1;
+
 	e = getenv("LITHE_FJS_HART_ORDER");
 	if (!e || !*e || strcmp(e, "child_first") == 0)
 		fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
@@ -361,6 +561,14 @@ static void fjs_tradespace_init_once(void)
 			fjs_progress_spin_max = (unsigned int)v;
 	}
 
+	fjs_reactor_poll_init();
+	e = getenv("LITHE_FJS_REACTOR_DRIVERS");
+	if (e && *e) {
+		char *end = NULL;
+		unsigned long v = strtoul(e, &end, 10);
+		if (end != e && v <= 1024ul)
+			fjs_reactor_drivers_max = (long)v;
+	}
 	e = getenv("LITHE_FJS_HELPER_HARTS");
 	if (e && *e) {
 		char *end = NULL;
@@ -478,8 +686,23 @@ const lithe_sched_funcs_t lithe_fork_join_sched_funcs = {
 static lithe_fork_join_context_t *__ctx_alloc(lithe_fork_join_sched_t *sched,
                                               size_t stacksize)
 {
-    // TODO wfl currently assumes stacksize the same for all contexts
-    lithe_fork_join_context_t *ctx = wfl_remove(&context_zombie_list);
+    /* Reuse only from the matching size class (see the comment on
+     * context_zombie_class). The size check is belt-and-braces: within a class
+     * the usable size varies slightly because of the offset randomisation
+     * below, so never trust the class alone. A misfit is dropped rather than
+     * re-inserted, which cannot loop. */
+    lithe_fork_join_context_t *ctx;
+    if (fjs_ctx_pool_bucketed()) {
+        int cls = fjs_ctx_size_class(stacksize);
+        ctx = wfl_remove(&context_zombie_class[cls]);
+        if (ctx && ctx->context.stack.size < stacksize) {
+            int ss = ctx->context.stack.size + ctx->stack_offset;
+            munmap(ctx->context.stack.bottom, ss);
+            ctx = NULL;
+        }
+    } else {
+        ctx = wfl_remove(&context_zombie_list);
+    }
     if (!ctx) {
 		int offset = ROUNDUP(sizeof(lithe_fork_join_context_t), ARCH_CL_SIZE);
 		/* Use the target sched's rseed instead of lithe_sched_current()'s
@@ -497,12 +720,19 @@ static lithe_fork_join_context_t *__ctx_alloc(lithe_fork_join_sched_t *sched,
 		if (mv < 1) mv = 1;
 		offset += rand_r(&rseed_s(sched, 0)) % mv * ARCH_CL_SIZE;
 		stacksize = ROUNDUP(stacksize + offset, PGSIZE);
+		int prot = PROT_READ|PROT_WRITE;
+		if (fjs_stack_exec())
+			prot |= PROT_EXEC;
 		void *stackbot = mmap(
-			0, stacksize, PROT_READ|PROT_WRITE|PROT_EXEC,
+			0, stacksize, prot,
 			MAP_PRIVATE|MAP_ANONYMOUS, -1, 0
 		);
 		if (stackbot == MAP_FAILED)
 			abort();
+#ifdef MADV_HUGEPAGE
+		if (fjs_stack_hugepage() && stacksize >= (2u << 20))
+			(void)madvise(stackbot, stacksize, MADV_HUGEPAGE);
+#endif
 		ctx = stackbot + stacksize - offset;
 		ctx->stack_offset = offset;
 		ctx->context.stack.bottom = stackbot;
@@ -528,9 +758,17 @@ static void __ctx_free(lithe_fork_join_context_t *ctx)
         abort();
     }
     ctx->start_routine = FJS_CTX_FREED_POISON;
-    if (wfl_size(&context_zombie_list) < 1000) {
+    if (fjs_ctx_pool_bucketed()) {
+        int cls = fjs_ctx_size_class(ctx->context.stack.size);
+        if (wfl_size(&context_zombie_class[cls]) < 1000) {
+            wfl_insert(&context_zombie_class[cls], ctx);
+            return;
+        }
+    } else if (wfl_size(&context_zombie_list) < 1000) {
         wfl_insert(&context_zombie_list, ctx);
-    } else {
+        return;
+    }
+    {
 		int stacksize = ctx->context.stack.size + ctx->stack_offset;
 		int ret = munmap(ctx->context.stack.bottom, stacksize);
 		assert(!ret);
@@ -644,9 +882,13 @@ void lithe_fork_join_wake_batch_end(void)
 	/* One hart request for the whole team release (parent grants N harts), then
 	 * one reactor poke for any vcores parked in parlib_reactor_drive(-1). */
 	if (h > 0) {
+		int h_req = h;
 		cur = lithe_sched_current();
 		if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs)
 			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)cur, h);
+		if (lithe_sched_trace_enabled())
+			lithe_sched_trace_emit(LITHE_ST_HART_REQUEST, cur,
+			                       (uint32_t)h_req, LITHE_ST_DEC_OK, (int32_t)h);
 		if (h > 0)
 			lithe_hart_request(h);
 	}
@@ -702,11 +944,15 @@ static int fjs_clamp_hart_request(lithe_fork_join_sched_t *s, int h)
 static void fjs_request_harts(int h)
 {
 	lithe_sched_t *cur;
+	int h_req = h;
 
 	if (h > 0) {
 		cur = lithe_sched_current();
 		if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs) {
 			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)cur, h);
+			if (lithe_sched_trace_enabled())
+				lithe_sched_trace_emit(LITHE_ST_HART_REQUEST, cur,
+				                       (uint32_t)h_req, LITHE_ST_DEC_OK, (int32_t)h);
 			if (h <= 0) {
 				/* At soft cap: wake parked siblings so they notice
 				 * the new RUNNABLE and multiplex; do not inflate
@@ -1056,14 +1302,24 @@ static lithe_fork_join_context_t *__thread_dequeue()
 		int span = (int)max_vcores();
 		if (span < 1)
 			span = 1;
+		if (fjs_steal_topo && vcoreid >= 0 && vcoreid < FJS_TOPO_MAX_VC) {
+			/* A6: nearest-first walk; only lock nonempty queues. */
+			if (!__atomic_load_n(&fjs_topo_ready[vcoreid], __ATOMIC_ACQUIRE))
+				fjs_topo_build(vcoreid, span);
+			for (int k = 0; k < fjs_topo_n[vcoreid] && !ctx; k++) {
+				int v = fjs_topo_order[vcoreid][k];
+				if (tqsize_s(cur, v) > 0)
+					ctx = steal_threads(v);
+			}
+		}
 		int choice[2] = { rand_r(&rseed(vcoreid)) % span,
 		                  rand_r(&rseed(vcoreid)) % span};
-		int size[2] = { tqsize_s(cur, choice[0]),
-		                tqsize_s(cur, choice[1])};
+		int size[2] = { ctx ? 0 : tqsize_s(cur, choice[0]),
+		                ctx ? 0 : tqsize_s(cur, choice[1])};
 		int id = (size[0] > size[1]) ? 0 : 1;
-		if (size[id] > 0 && vcoreid != choice[id])
+		if (!ctx && size[id] > 0 && vcoreid != choice[id])
 			ctx = steal_threads(choice[id]);
-		else if (size[!id] > 0 && vcoreid != choice[!id])
+		else if (!ctx && size[!id] > 0 && vcoreid != choice[!id])
 			ctx = steal_threads(choice[!id]);
 
 		/* Fall back: walk all vcores but only lock/dequeue nonempty
@@ -1152,12 +1408,60 @@ lithe_fork_join_sched_t *lithe_fork_join_sched_create()
  * ------------------------------------------------------------------------- */
 static lithe_fork_join_sched_t *lithe_root_fj_sched;
 static int lithe_root_fj_entered;
+/* 1 when the root was ADOPTED from the caller's current scheduler rather than
+ * created here. An adopted root must never be exited or destroyed by lithe --
+ * it belongs to the application. */
+static int lithe_root_fj_adopted;
 
 lithe_fork_join_sched_t *lithe_ensure_root_fork_join_sched(void)
 {
   /* Base bootstrap (owned by lithe/parlib, idempotent): main -> vcore 0 +
    * parlib vcore pool + base scheduler. Safe to call repeatedly. */
   lithe_ensure_main_on_vcore0();
+
+  /* ADOPT, DO NOT NEST (2026-10-14).
+   *
+   * If the caller is already inside a fork-join scheduler, THAT scheduler is
+   * the root for composition purposes -- adopt it and return. The old code
+   * unconditionally created a second FJS and entered it from whatever context
+   * called first, which produced two distinct failures:
+   *
+   *   1. A permanent spurious scheduler layer on every composed run: a
+   *      standalone-libomp region inside an app that already had its own FJS
+   *      built base -> app FJS -> "root" FJS -> sticky OMP FJS, where the
+   *      middle layer exists only because this function insisted on owning a
+   *      root it had not been asked for.
+   *   2. A guaranteed hang. `lithe_root_fj_entered` is a process-global latch,
+   *      so the enter was charged to whichever CONTEXT happened to call first.
+   *      When that context is transient (one Lithe context per rank, which is
+   *      the whole hosted model) it exits while still inside this scheduler,
+   *      leaving a child registered on its parent with granted=1 and harts=0.
+   *      base_child_exited() then spins forever waiting for a hart that no one
+   *      owns, so the application's own lithe_sched_exit() never returns.
+   *
+   * Reproduced with ONE OpenMP region of ONE thread inside ONE Lithe context;
+   * the region itself computes correctly and teardown hangs. The reproducer and
+   * the ablation (no-OMP control exits cleanly) are in
+   * .build_logs/ompctx/repro.c.
+   *
+   * Adopting is also the honest semantic: callers use the result as "the
+   * fork-join scheduler to create worker contexts on" (see libomp's
+   * __kmp_lithe_worker_sched_for_create), and when you are already inside one,
+   * that is the correct answer. */
+  if (lithe_root_fj_sched == NULL) {
+    lithe_sched_t *cur = lithe_sched_current();
+    if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs) {
+      lithe_fork_join_sched_t *adopted = (lithe_fork_join_sched_t *)cur;
+      if (__sync_bool_compare_and_swap(&lithe_root_fj_sched, NULL, adopted)) {
+        /* Entered by construction: the caller is running inside it. Nothing to
+         * exit later, which is precisely the point. */
+        lithe_root_fj_adopted = 1;
+        lithe_root_fj_entered = 1;
+      }
+      if (lithe_root_fj_sched != NULL)
+        return lithe_root_fj_sched;
+    }
+  }
 
   /* Create the single root FJ scheduler once. */
   if (lithe_root_fj_sched == NULL) {
@@ -1188,6 +1492,14 @@ int lithe_root_fork_join_sched_entered(void)
   return lithe_root_fj_entered;
 }
 
+/* 1 when the root fork-join scheduler is the application's own, adopted rather
+ * than created by lithe. Callers that would otherwise tear the root down at
+ * process exit must not do so in that case. */
+int lithe_root_fork_join_sched_adopted(void)
+{
+  return lithe_root_fj_adopted;
+}
+
 /* Number of RUNNABLE-but-unscheduled contexts on the CURRENT fork-join sched,
  * i.e. contexts sitting on this sched's per-vcore runqueues waiting for a hart.
  *
@@ -1213,6 +1525,26 @@ long lithe_fork_join_current_runnable_count(void)
     return 0;
   return __atomic_load_n(&((lithe_fork_join_sched_t *)cur)->runnable_count,
                          __ATOMIC_ACQUIRE);
+}
+
+long lithe_fork_join_current_hartless_runnable(void)
+{
+  lithe_sched_t *cur = lithe_sched_current();
+  lithe_fork_join_sched_t *s;
+  long r, owned, running, idle;
+  if (cur == NULL || cur->funcs != &lithe_fork_join_sched_funcs)
+    return 0;
+  s = (lithe_fork_join_sched_t *)cur;
+  r = __atomic_load_n(&s->runnable_count, __ATOMIC_ACQUIRE);
+  if (r <= 0)
+    return 0;
+  owned = (long)parlib_atomic_read(&s->sched.harts);
+  running = __atomic_load_n(&s->running_count, __ATOMIC_ACQUIRE);
+  idle = owned - running;
+  if (idle < 0)
+    idle = 0;
+  r -= idle;
+  return r > 0 ? r : 0;
 }
 
 int lithe_fork_join_should_yield_to_runnable(void)
@@ -1314,6 +1646,7 @@ void lithe_fork_join_sched_init(lithe_fork_join_sched_t *sched,
   sched->runnable_count = 0;  /* CHANGE 1: O(1) any-runnable indicator */
   sched->warm_ready_count = 0;  /* WARM VCORES: GO-and-unclaimed warm workers */
   sched->leaving_harts = 0;  /* LOST-WAKEUP GUARD: committed-to-yield harts */
+  sched->running_count = 1;  /* IDLE-AWARE PEER CHECK: the main context is running */
   TAILQ_INIT(&sched->child_sched_list);
   spin_pdr_init(&sched->child_sched_list_lock);
   /* sched->next_queue_id initialized in sched_enter() */
@@ -1452,6 +1785,8 @@ void lithe_fork_join_sched_sched_enter(lithe_sched_t *__this)
 	lithe_fork_join_sched_t *sched = (void *)__this;
 	vconline(vcore_id()) = true;
 	sched->next_queue_id = vcore_id();
+	/* Re-entry after an exit (libomp's sticky FJ is re-entered at teardown). */
+	sched->teardown_quiesce = 0;
 }
 
 void lithe_fork_join_sched_sched_exit(lithe_sched_t *__this)
@@ -1467,6 +1802,13 @@ void lithe_fork_join_sched_sched_exit(lithe_sched_t *__this)
 	 */
 	harts_needed = (uint16_t *)&sched->sched.parent_data + 1;
 	*harts_needed = 0;
+	/* EXIT QUIESCE: tell this sched's other harts to leave now instead of
+	 * idle-parking in hart_enter (see lithe.c base_child_exited). The field
+	 * existed but nothing ever set or read it. Poke parked harts. */
+	if (lithe_exit_quiesce_on()) {
+		__atomic_store_n(&sched->teardown_quiesce, 1, __ATOMIC_SEQ_CST);
+		parlib_reactor_wake();
+	}
 }
 
 void lithe_fork_join_sched_child_enter(lithe_sched_t *__this,
@@ -1720,6 +2062,7 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
         lithe_sched_trace_emit(LITHE_ST_WARM_CLAIM, sched,
                                (uint32_t)w->context.id, LITHE_ST_DEC_OK, 0);
       fjs_stats_run_enter();
+      __atomic_fetch_add(&sched->running_count, 1, __ATOMIC_SEQ_CST);
       lithe_context_run(&w->context);
     }
   }
@@ -1743,8 +2086,90 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
     assert(ctx->state == FJS_CTX_RUNNABLE);
     ctx->state = FJS_CTX_RUNNING;
     fjs_stats_run_enter();
+    __atomic_fetch_add(&sched->running_count, 1, __ATOMIC_SEQ_CST);
     lithe_context_run(&ctx->context);
   }
+}
+
+/* PARENT-STARVATION YIELD (2026-10-15, env LITHE_FJS_PARENT_STARVE_YIELD=1,
+ * default off for A/B).
+ *
+ * A Lithe child never returns a hart to its parent while it has runnable work,
+ * and a context that spin-waits with lithe_context_yield() is ALWAYS runnable
+ * (context_yield re-enqueues it and the same hart re-enters). So when every
+ * hart is inside children whose contexts are spin-waiting on something only a
+ * context of the PARENT can release, nothing ever runs the parent.
+ *
+ * Measured on the login node with .build_logs/ompctx/repro: 3 Lithe contexts
+ * each opening a team of 2 on VCORE_LIMIT=3 hangs 3/3. gdb: app sched harts=0
+ * runnable=1; its two OMP child scheds hold all 3 harts; libomp's
+ * __kmp_forkjoin_lock (a TICKET lock) has now_serving=5 next_ticket=8 and was
+ * last RELEASED -- the context holding ticket 5 is the parent's runnable one,
+ * and tickets 6,7 spin-yield inside the children. Same hang stops hosted
+ * miniFE OMP_NUM_THREADS=2 at its first `omp parallel for`.
+ *
+ * Rule: a child hart that finds its FJS parent with runnable work and NO harts
+ * gives the hart back; the parent then runs its own work before re-granting
+ * (fjs_self_first_now) or the hart would ping-pong straight back. */
+
+/* Per-vcore count of consecutive context_yield re-entries (spin-wait streak).
+ * The starvation hand-off fires only after a full slice: handing off on the
+ * FIRST re-entry made every freshly granted hart bounce straight back to the
+ * parent when all siblings were starved (gdb: 4 OMP children runnable=1-2,
+ * harts=0, both rank-sched harts looping grant->yield->grant; miniFE never
+ * printed). LITHE_FJS_STARVE_YIELD_SLICE (default 32). */
+#define FJS_MAX_SLICE_VC 1024
+static int fjs_yield_streak[FJS_MAX_SLICE_VC];
+static int fjs_starve_slice = 32;
+static int fjs_parent_starve_yield = -1;
+static int fjs_parent_starve_yield_on(void)
+{
+  if (fjs_parent_starve_yield < 0) {
+    const char *e = getenv("LITHE_FJS_PARENT_STARVE_YIELD");
+    fjs_parent_starve_yield = (e && e[0] == '1') ? 1 : 0;
+    const char *sl = getenv("LITHE_FJS_STARVE_YIELD_SLICE");
+    if (sl && atoi(sl) > 0)
+      fjs_starve_slice = atoi(sl);
+  }
+  return fjs_parent_starve_yield;
+}
+static int fjs_parent_starved(lithe_fork_join_sched_t *sched)
+{
+  lithe_sched_t *p = sched->sched.parent;
+  if (p == NULL || p->funcs != &lithe_fork_join_sched_funcs)
+    return 0;
+  lithe_fork_join_sched_t *pf = (lithe_fork_join_sched_t *)p;
+  if ((long)parlib_atomic_read(&p->harts) == 0 &&
+      __atomic_load_n(&pf->runnable_count, __ATOMIC_ACQUIRE) > 0)
+    return 1;
+  /* SIBLING starvation (hosted miniFE RPH=4 x OMP=2, VCORE_LIMIT=3): the
+   * parent is the rank FJS with nothing runnable itself, but two of its four
+   * per-rank OMP children hold every hart (masters spinning in MPI waits /
+   * hosted sync) while the other two have RUNNABLE work and zero harts. Hand
+   * the hart to the parent; its grant rotation passes it to the starved one. */
+  int starved = 0;
+  lithe_sched_t *sib;
+  spin_pdr_lock(&pf->child_sched_list_lock);
+  TAILQ_FOREACH(sib, &pf->child_sched_list, link) {
+    if (sib == &sched->sched)
+      continue;
+    if ((long)parlib_atomic_read(&sib->harts) == 0 &&
+        (fjs_child_needs_hart(sib) || fjs_child_work_hint(sib) > 0)) {
+      starved = 1;
+      break;
+    }
+  }
+  spin_pdr_unlock(&pf->child_sched_list_lock);
+  return starved;
+}
+/* Own work first when this hart is the only one this sched owns and its own
+ * contexts are waiting: otherwise a hart handed back by a child is granted
+ * straight back to that child before the parent's context ever runs. */
+static int fjs_self_first_now(lithe_fork_join_sched_t *sched)
+{
+  return fjs_parent_starve_yield_on() &&
+         (long)parlib_atomic_read(&sched->sched.harts) <= 1 &&
+         __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0;
 }
 
 void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
@@ -1781,20 +2206,86 @@ restart:
 
   fjs_tradespace_init_once();
 
-  /* Default and progress_first: children before own work; self_first inverts. */
-  if (fjs_hart_order != LITHE_FJS_HART_ORDER_SELF_FIRST)
-    fjs_hart_grant_children(sched);
+  if (__atomic_load_n(&sched->teardown_quiesce, __ATOMIC_ACQUIRE) &&
+      __atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) <= 0 &&
+      __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) <= 0 &&
+      (fjs_quiesce_ignore_pending_on() || parlib_reactor_pending() <= 0)) {
+    /* Exiting sched with nothing left to run: leave immediately.
+     * B20 (2026-10-16): parlib_reactor_pending() is PROCESS-global, not
+     * per-sched. The hosted RPH>1 harness calls lithe_sched_exit() on its
+     * rank sched before MPI_Finalize(), so the PMIx progress context (which
+     * lives in OPAL's sched, not ours) is still parked on its event-base fd
+     * and pending stays 1 for the rest of the process. With the pending
+     * condition in this gate, every hart of the exiting sched stayed in the
+     * `while (pending > 0) drive(-1)` loop below forever, child->harts never
+     * reached 0, and lithe_sched_exit() burned its 2,000,000-yield drain
+     * bound (each yield = reactor poll + wake_efd write = 30-50 us of
+     * kernel time): 60-100 s exits, >90 s timeouts in the stress harness,
+     * and the 6-15 s "teardown is not reliably fast" of GAPS B14 at smaller
+     * spin cost. Reactor waiters are never stranded by our leaving: the
+     * parent's harts drive the reactor, and a woken context re-requests a
+     * hart through schedule_context -> lithe_hart_request. */
+    vconline(vcore_id()) = false;
+    lithe_hart_yield();
+  }
 
-  fjs_hart_run_warm_or_dequeue(sched);
+  if (fjs_parent_starve_yield_on()) {
+    int vc = vcore_id();
+    if (vc < FJS_MAX_SLICE_VC && fjs_yield_streak[vc] >= fjs_starve_slice &&
+        fjs_parent_starved(sched)) {
+      fjs_yield_streak[vc] = 0;
+      /* Keep our needed ledger: our runnable work still wants this hart back. */
+      vconline(vc) = false;
+      lithe_hart_yield();
+    }
+  }
 
-  if (fjs_hart_order == LITHE_FJS_HART_ORDER_SELF_FIRST)
-    fjs_hart_grant_children(sched);
+  {
+    /* Default and progress_first: children before own work; self_first inverts. */
+    int self_first = fjs_hart_order == LITHE_FJS_HART_ORDER_SELF_FIRST ||
+                     fjs_self_first_now(sched);
+    if (!self_first)
+      fjs_hart_grant_children(sched);
+
+    fjs_hart_run_warm_or_dequeue(sched);
+
+    if (self_first)
+      fjs_hart_grant_children(sched);
+  }
 
   /* No runnable contexts. If any continuations are parked on fd readiness,
    * this scheduler handoff blocks the vcore in epoll_wait until an fd fires
    * or the reactor wake fd is poked by a newly-runnable context, then loops
    * back through the full scheduler decision path. */
+  /* LITHE_FJS_REACTOR_DRIVERS (2026-10-17, GAPS C12): how many idle harts may
+   * sit in the infinite reactor drive at once. Default 1; 0 = unlimited (old).
+   * With the PMIx progress context parked on its event fd for the whole
+   * process, pending stays > 0 and EVERY idle hart used to block here in
+   * epoll_wait on the one shared epoll fd. A wake poke (one eventfd write)
+   * wakes at most one such sleeper, and the busy harts' zero-timeout polls on
+   * hart re-enter drain the eventfd first, so the sleeper goes back to sleep
+   * inside epoll_wait. XSBench NP=2 OMP=4: two workers released at +0.4 ms
+   * into a 250 ms region were run only when the region ended, because the
+   * two idle harts never woke (traced, .build_logs/perfetto/gaps_20261017).
+   * Harts beyond the driver budget fall through to the adaptive spin, the
+   * timed park and the surplus yield to parlib, where vcore_request() wakes
+   * exactly the vcores asked for through their own futex. */
+  fjs_tradespace_init_once();
   while (parlib_reactor_pending() > 0) {
+    if (fjs_reactor_drivers_max > 0) {
+      long d = __atomic_load_n(&fjs_reactor_drivers, __ATOMIC_ACQUIRE);
+      if (d >= fjs_reactor_drivers_max)
+        break;
+      if (!__atomic_compare_exchange_n(&fjs_reactor_drivers, &d, d + 1, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        continue;
+      if (lithe_sched_trace_enabled())
+        lithe_sched_trace_emit(LITHE_ST_REACTOR_BLOCK, sched, 0, LITHE_ST_DEC_OK,
+                               (int32_t)parlib_reactor_pending());
+      (void)fjs_reactor_drive_parked(sched, vcore_id(), -1);
+      __atomic_fetch_sub(&fjs_reactor_drivers, 1, __ATOMIC_ACQ_REL);
+      goto restart;
+    }
     if (lithe_sched_trace_enabled())
       lithe_sched_trace_emit(LITHE_ST_REACTOR_BLOCK, sched, 0, LITHE_ST_DEC_OK,
                              (int32_t)parlib_reactor_pending());
@@ -1875,6 +2366,15 @@ restart:
      * demand+1 would tolerate owned==4 at VCORE=4 (the VCORE=4 churn case). */
     is_surplus = (owned > demand + 1) ||
                  (soft_cap > 0 && owned > (long)soft_cap);
+    /* PARENT/SIBLING STARVATION at the idle path (same gate as the slice
+     * hand-off above): an EMPTY child must not park on a hart that a starved
+     * sibling or parent needs. Hosted miniFE RPH=4 x OMP=2 only worked once
+     * VCORE_LIMIT >= ~RPH+2 (login-node sweep 2026-10-15): a rank blocked in
+     * MPI inside its OMP child leaves that child empty, and its hart parked
+     * here through the 1->64 ms escalation (~1 s) before returning, while the
+     * ranks that could satisfy the wait sat RUNNABLE with zero harts. */
+    if (!is_surplus && fjs_parent_starve_yield_on() && fjs_parent_starved(sched))
+      is_surplus = 1;
     if (fjs_interfere_on()) {
       static int once;
       if (!once && __sync_bool_compare_and_swap(&once, 0, 1))
@@ -1912,6 +2412,7 @@ idle_park_again:
             tqsize_s(sched, my_vc) > 0 ||
             __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
             __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0 ||
+            __atomic_load_n(&sched->teardown_quiesce, __ATOMIC_ACQUIRE) ||
             ((idle_park_streak & 3u) == 0 &&
              fjs_any_child_needs_hart(sched))) {
           idle_park_streak = 0;
@@ -2036,10 +2537,14 @@ idle_park_again:
 void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
                                          lithe_context_t *c)
 {
+	if (vcore_id() < FJS_MAX_SLICE_VC)
+		fjs_yield_streak[vcore_id()] = 0; /* streak = consecutive yields */
 	lithe_fork_join_context_t *ctx = (void*)c;
 	assert(ctx->state == FJS_CTX_RUNNING);
 	ctx->state = FJS_CTX_BLOCKED;
 	fjs_stats_run_leave();
+	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
+	                   __ATOMIC_SEQ_CST);
 	if (lithe_sched_trace_enabled())
 		lithe_sched_trace_emit(LITHE_ST_CTX_BLOCK, __this,
 		                       (uint32_t)c->id, LITHE_ST_DEC_OK, 0);
@@ -2085,6 +2590,8 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 	lithe_fork_join_context_t *ctx = (void*)c;
 	assert(ctx->state == FJS_CTX_RUNNING);
 	fjs_stats_run_leave();
+	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
+	                   __ATOMIC_SEQ_CST);
 	if (lithe_sched_trace_enabled()) {
 		lithe_fork_join_sched_t *s = (lithe_fork_join_sched_t *)__this;
 		long rc = __atomic_load_n(&s->runnable_count, __ATOMIC_RELAXED);
@@ -2101,6 +2608,11 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 	 * the timeout (HOSTED_FULLCORE soft_cap idle → ms-scale floors). */
 	__thread_enqueue(ctx, false);
 	fjs_maybe_reactor_wake();
+	if (fjs_parent_starve_yield_on()) {
+		int vc = vcore_id();
+		if (vc < FJS_MAX_SLICE_VC)
+			fjs_yield_streak[vc]++;
+	}
 }
 
 void lithe_fork_join_sched_context_exit(lithe_sched_t *__this,
@@ -2110,6 +2622,7 @@ void lithe_fork_join_sched_context_exit(lithe_sched_t *__this,
   lithe_fork_join_context_t *ctx = (void*)c;
   assert(ctx->state == FJS_CTX_RUNNING);
   fjs_stats_run_leave();
+  __atomic_fetch_sub(&sched->running_count, 1, __ATOMIC_SEQ_CST);
   if (c != sched->sched.main_context) {
     /* NEEDED-LEDGER DRIFT FIX: same rule as context_block — keep the
      * demand while RUNNABLE/warm work is queued (see comment there). */

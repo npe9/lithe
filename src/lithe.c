@@ -12,11 +12,17 @@
 #error "expecting __GNUC__ to be defined (are you using gcc?)"
 #endif
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <dlfcn.h>
+#include <unistd.h>
 
 #include <parlib/parlib.h>
 #include <parlib/reactor.h>
@@ -24,6 +30,7 @@
 #include "fatal.h"
 #include "internal/assert.h"
 #include "internal/vcore.h"
+#include "sched_trace.h"
 
 #ifndef __linux__
 #ifndef __ros__
@@ -397,6 +404,14 @@ static void base_hart_enter(lithe_sched_t *__this)
 
       assert(root_sched);
       size_t old_harts_granted = atomic_add(&root_sched->harts, 1);
+      {
+        long needed_now = parlib_atomic_read(&root_sched_harts_needed);
+        int granted = (old_harts_granted + 1 <= (size_t)needed_now);
+        if (lithe_sched_trace_enabled())
+          lithe_sched_trace_emit(LITHE_ST_BASE_GRANT, root_sched,
+                                 (uint32_t)(((needed_now & 0xffff) << 16) | (old_harts_granted & 0xffff)),
+                                 0, granted);
+      }
       if (old_harts_granted + 1 <= parlib_atomic_read(&root_sched_harts_needed)) {
         // Finish up our accounting
         atomic_add(&__this->harts, -1);
@@ -445,9 +460,44 @@ static void base_child_entered(lithe_sched_t *__this, lithe_sched_t *child)
   root_sched_harts_needed = PARLIB_ATOMIC_INITIALIZER(1);
 }
 
+/* EXIT QUIESCE (2026-10-15, LITHE_FJS_EXIT_QUIESCE=1, default off for A/B):
+ * the drain below waits for every hart to leave the exiting root, but
+ * base_hart_enter keeps GRANTING harts to it -- add_not_zero(ref_count)
+ * succeeds while any hart is still inside, and root_sched_harts_needed is
+ * never cleared on exit. A hart that idle-yields out of the root is re-granted
+ * straight back in, so the drain can spin indefinitely (docs/GAPS.md B14:
+ * bare FJS + sched_exit, no OpenMP, hung ~15% of runs on the login node;
+ * gdb: base_child_exited spinning, 2 harts parked in the root's hart_enter).
+ * An exiting root needs no harts: zero its demand first. */
+int lithe_sched_exit_wait_on(void)
+{
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("LITHE_SCHED_EXIT_WAIT");
+    on = (e && *e) ? (atoi(e) != 0) : 0;
+  }
+  return on;
+}
+
+int lithe_sched_exit_wait_on(void);
+int lithe_exit_quiesce_on(void)
+{
+  static int on = -1;
+  if (on < 0) {
+    /* Default ON since 2026-10-16: login A/B on the E5 remap proxy's clean-exit
+     * path, 10 exits per arm, gate off 8/10 hung >20 s in base_child_exited,
+     * gate on 0/10 (.build_logs/TESTBED_20261016.md). =0 restores the drain. */
+    const char *e = getenv("LITHE_FJS_EXIT_QUIESCE");
+    on = (e && e[0] == '0') ? 0 : 1;
+  }
+  return on;
+}
+
 static void base_child_exited(lithe_sched_t *__this, lithe_sched_t *child)
 {
   assert(root_sched == child);
+  if (lithe_exit_quiesce_on())
+    __atomic_store_n((long *)&root_sched_harts_needed, 0, __ATOMIC_SEQ_CST);
   atomic_add(&root_sched_ref_count, -2);
   while (root_sched_ref_count)
     cpu_relax();
@@ -481,9 +531,13 @@ static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h
     long have = root_sched ? parlib_atomic_read(&root_sched->harts) : 0;
     long need = parlib_atomic_read(&root_sched_harts_needed);
     long deficit = need - have;
+    int wake_n = (deficit < (long)h) ? (int)deficit : h;
+    if (lithe_sched_trace_enabled())
+      lithe_sched_trace_emit(LITHE_ST_BASE_REQUEST, root_sched,
+                             (uint32_t)(((need & 0xffff) << 16) | (have & 0xffff)),
+                             0, (int32_t)(deficit < 1 ? -1 : wake_n));
     if (deficit < 1)
       return;
-    int wake_n = (deficit < (long)h) ? (int)deficit : h;
     /* Wake any vcore parked in parlib_reactor_drive(-1). The maybe_vcore_request
      * path below only notices spinning vcores (via the wake_me_up flag set
      * inside maybe_vcore_yield) and otherwise asks the kernel for a brand-new
@@ -500,6 +554,34 @@ static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h
     parlib_reactor_wake();
     maybe_vcore_request(wake_n);
   }
+}
+
+/* 1 when the CURRENT context may cooperatively BLOCK.
+ *
+ * False on the base scheduler -- whose context_block is a fatal() by design,
+ * because a base context has nowhere to be parked -- and false when there is no
+ * current scheduler at all. Those are exactly the states a process is in during
+ * library CONSTRUCTORS and during _dl_fini DESTRUCTORS, after the application
+ * has already exited its own scheduler.
+ *
+ * Added 2026-10-14 for a measured, deterministic failure: libomp's library
+ * destructor reaps its workers with a lithe condvar
+ * (__kmp_reap_worker -> lithe_condvar_wait), running on main's context, which
+ * _dl_fini time has returned to the base scheduler. Result:
+ * "Contexts created by the base scheduler should never need to block!" and
+ * exit status 1, 20/20 runs. Composed runtimes must test this before using any
+ * lithe blocking primitive from a path that can run at process teardown.
+ *
+ * Companion to parlib_can_cooperatively_yield(), which answers the same
+ * question for YIELDING. Blocking is strictly stronger: it also needs a
+ * scheduler willing to take the context. */
+int lithe_can_block(void)
+{
+  lithe_sched_t *s = lithe_sched_current();
+
+  if (s == NULL || s == &base_sched)
+    return 0;
+  return parlib_can_cooperatively_yield();
 }
 
 long lithe_root_harts_needed(void)
@@ -731,9 +813,32 @@ void lithe_sched_exit()
    * count that never reaches 0; continuing is preferable to wedging Finalize. */
   long n;
   int drain_spins = 0;
-  while ((n = parlib_atomic_read(&child->harts)) != 0 && drain_spins++ < 2000000) {
+  int wait = lithe_sched_exit_wait_on();
+  struct timespec t_start;
+  clock_gettime(CLOCK_MONOTONIC, &t_start);
+  while ((n = parlib_atomic_read(&child->harts)) != 0) {
     assert(n >= 0);
-    lithe_context_yield();
+    if (wait) {
+      /* EXIT WAIT (2026-10-17, LITHE_SCHED_EXIT_WAIT): the old drain
+       * yield-spun ~4 us per iteration until the child's other harts left,
+       * and they leave only when their timed idle park (1->64 ms) expires or
+       * a reactor poke reaches them; sched_exit sends one poke, which wakes
+       * one sleeper. Perfetto audit: 50-470 ms of teardown per run with tens
+       * of thousands of 0.35 us dispatches and steal attempts
+       * (docs/AUDIT-perfetto-performance-20261017.md section 5). Poke on
+       * every pass (each poke wakes one parked hart, which sees
+       * teardown_quiesce and leaves) and sleep instead of spinning. */
+      struct timespec nap = { 0, 20000 }, now;
+      parlib_reactor_wake();
+      nanosleep(&nap, NULL);
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if ((now.tv_sec - t_start.tv_sec) * 1000000000L + (now.tv_nsec - t_start.tv_nsec) > 10000000000L)
+        break; /* stray hart count (hosted RPH>1, B14): continue rather than wedge */
+    } else {
+      if (drain_spins++ >= 2000000)
+        break;
+      lithe_context_yield();
+    }
   }
 }
 
@@ -946,12 +1051,58 @@ void lithe_context_unblock(lithe_context_t *context)
   current_sched = sched;
 }
 
+/* LITHE_YIELD_CALLERS=1 (2026-10-17, audit tool): histogram of the return
+ * addresses of lithe_context_yield, symbolised with dladdr and printed to
+ * stderr at exit. Answers "who is yielding in this storm" without a debugger
+ * (the Perfetto trace records the yield, not its caller). */
+static int yc_on = -1;
+#define YC_SLOTS 64
+static struct { void *addr; unsigned long n; } yc_tab[YC_SLOTS];
+static void yc_dump(void)
+{
+  int i, j;
+  /* sort by count, descending (tiny table) */
+  for (i = 0; i < YC_SLOTS; i++)
+    for (j = i + 1; j < YC_SLOTS; j++)
+      if (yc_tab[j].n > yc_tab[i].n) { __typeof__(yc_tab[0]) t = yc_tab[i]; yc_tab[i] = yc_tab[j]; yc_tab[j] = t; }
+  fprintf(stderr, "[LITHE_YIELD_CALLERS] pid %d: lithe_context_yield callers\n", (int)getpid());
+  for (i = 0; i < YC_SLOTS && yc_tab[i].n; i++) {
+    Dl_info di; const char *sym = "?", *obj = "?"; unsigned long off = 0;
+    if (dladdr(yc_tab[i].addr, &di)) {
+      if (di.dli_sname) { sym = di.dli_sname; off = (unsigned long)yc_tab[i].addr - (unsigned long)di.dli_saddr; }
+      if (di.dli_fname) { obj = strrchr(di.dli_fname, '/'); obj = obj ? obj + 1 : di.dli_fname; }
+    }
+    fprintf(stderr, "  %10lu  %s+0x%lx (%s+0x%lx) %p\n", yc_tab[i].n, sym, off, obj,
+            (unsigned long)yc_tab[i].addr - (unsigned long)(dladdr(yc_tab[i].addr, &di) ? di.dli_fbase : 0), yc_tab[i].addr);
+  }
+}
+static inline void yc_record(void *ra)
+{
+  int i;
+  if (yc_on < 0) {
+    const char *e = getenv("LITHE_YIELD_CALLERS");
+    yc_on = (e && *e && atoi(e) != 0) ? 1 : 0;
+    if (yc_on) atexit(yc_dump);
+  }
+  if (!yc_on) return;
+  for (i = 0; i < YC_SLOTS; i++) {
+    void *a = __atomic_load_n(&yc_tab[i].addr, __ATOMIC_ACQUIRE);
+    if (a == ra) { __atomic_fetch_add(&yc_tab[i].n, 1, __ATOMIC_RELAXED); return; }
+    if (a == NULL) {
+      void *expect = NULL;
+      if (__atomic_compare_exchange_n(&yc_tab[i].addr, &expect, ra, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || expect == ra) {
+        __atomic_fetch_add(&yc_tab[i].n, 1, __ATOMIC_RELAXED); return;
+      }
+    }
+  }
+}
+
 void lithe_context_yield()
 {
   assert(!in_vcore_context());
   assert(current_sched);
   assert(current_context);
-  /* debug print removed */
+  yc_record(__builtin_return_address(0));
 
   uthread_yield(true, __lithe_context_yield, NULL);
 }

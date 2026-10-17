@@ -128,6 +128,13 @@ typedef struct {
    * miniFE P1K4 nx=80 CG stall). Plain C11 atomics; appended field is
    * ABI-safe (FJS-internal, callers hold opaque pointers). */
   long leaving_harts;
+  /* IDLE-AWARE PEER CHECK (2026-10-16, GAPS C11 part 2): contexts of this
+   * sched currently RUNNING on a hart (the main context counts from sched
+   * creation). owned - running_count = harts of this sched that are inside
+   * hart_enter with nothing to run; such a hart dequeues a RUNNABLE peer
+   * itself, so a hart-holding spinner need not yield for that peer. Plain
+   * C11 atomics, appended field, ABI-safe like the ones above. */
+  long running_count;
 } lithe_fork_join_sched_t;
 
 typedef struct {
@@ -204,6 +211,12 @@ lithe_fork_join_sched_t *lithe_ensure_root_fork_join_sched(void);
 /* Whether the root FJ sched has been entered (non-zero) yet. */
 int lithe_root_fork_join_sched_entered(void);
 
+/* 1 when the root fork-join scheduler was ADOPTED from the caller's own
+ * scheduler instead of being created by lithe (see
+ * lithe_ensure_root_fork_join_sched). An adopted root belongs to the
+ * application: lithe must never exit or destroy it. */
+int lithe_root_fork_join_sched_adopted(void);
+
 /* Progress-thread scheduler selection (LITHE_PROGRESS_SCHED=root|child).
  * Returns root FJS by default; when child, lazily creates a dedicated progress
  * child FJS registered on root via child_enter (lithe-multi-runtime-schedulers). */
@@ -223,6 +236,13 @@ unsigned int lithe_progress_spin_max(void);
  * current sched is not a fork-join sched. See fork_join_sched.c for the full
  * livelock rationale. */
 long lithe_fork_join_current_runnable_count(void);
+/* RUNNABLE peers that no idle hart of the current FJ sched will serve:
+ * max(0, runnable_count - max(0, owned_harts - running_count)). 0 when the
+ * current sched is not a fork-join sched. See fork_join_sched.h running_count
+ * and docs/GAPS.md C11 (GROMACS PME: MPI_Alltoall inside a parallel region,
+ * primary yields in opal_progress, every worker at the omp barrier saw
+ * runnable_count==1 and yielded although a 5th hart sat idle). */
+long lithe_fork_join_current_hartless_runnable(void);
 
 /*
  * True when a waiting context should lithe_context_yield() to drain RUNNABLE
