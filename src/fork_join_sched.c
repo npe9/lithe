@@ -668,6 +668,18 @@ static void fjs_tradespace_init_once(void)
 			unsigned long v = strtoul(e, &end, 10);
 			if (end != e && v >= 1 && v <= (unsigned long)max_vcores()) {
 				unsigned long cap = v + (unsigned long)fjs_helper_harts;
+				/* Hosted MPI+OpenMP (2026-10-18): with OMP_NUM_THREADS=T each rank's
+				 * team wants T harts, but the RPH cap held ALL ranks' teams to RPH
+				 * harts (2 ranks x 8 threads on 8 harts ran on 2: 41 ms/iter vs 10.4
+				 * with the cap at 8; bench/alt/ranks_omp.c). Cap at RPH*T instead,
+				 * still clamped to the vcore pool. LITHE_FJS_CAP_OMP=0 restores RPH. */
+				const char *ce = getenv("LITHE_FJS_CAP_OMP");
+				const char *te = getenv("OMP_NUM_THREADS");
+				if (!(ce && ce[0] == '0' && ce[1] == '\0') && te && *te) {
+					unsigned long t = strtoul(te, NULL, 10);
+					if (t > 1)
+						cap = v * t + (unsigned long)fjs_helper_harts;
+				}
 				if (cap > (unsigned long)max_vcores())
 					cap = (unsigned long)max_vcores();
 				/* soft_cap = RPH + helper budget (MAX_ONLINE_HARTS wins above). */
