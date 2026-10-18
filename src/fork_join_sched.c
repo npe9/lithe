@@ -367,6 +367,32 @@ static int fjs_ctx_size_class(size_t stacksize)
 	return c;
 }
 
+/* Class a FREED context is pooled under (2026-10-18). __ctx_alloc looks up
+ * ceil(log2(requested pages)); a freed context's usable size is the request
+ * plus page rounding minus the cache-line offset, i.e. one page MORE than a
+ * power-of-two request, so the ceiling put it one class too high and no
+ * power-of-two request (64 KB .. 16 MB, i.e. all of them) ever hit the pool:
+ * every create mmap'd, every free munmap'd once the class held 1000
+ * (bench/alt/ulth_bench.c create: 20% mmap + 20% munmap). Pool by the floor
+ * instead: a context in class c has >= 2^c pages, which satisfies any request
+ * that maps to class c; the size check in __ctx_alloc still guards reuse.
+ * LITHE_FJS_CTX_POOL_FLOOR=0 restores the ceiling, for A/B only. */
+static int fjs_ctx_free_class(size_t usable)
+{
+	static int floor_on = -1;
+	if (__builtin_expect(floor_on < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_CTX_POOL_FLOOR");
+		floor_on = !(e && e[0] == '0' && e[1] == '\0');
+	}
+	if (!floor_on)
+		return fjs_ctx_size_class(usable);
+	size_t pages = usable / PGSIZE;
+	int c = 0;
+	while (((size_t)2 << c) <= pages && c < FJS_CTX_SIZE_CLASSES - 1)
+		c++;
+	return c;
+}
+
 /* Executable context stacks are not needed by anything here; PROT_EXEC also
  * makes the mapping ineligible for THP on some kernels. LITHE_FJS_STACK_EXEC=1
  * restores the old PROT_READ|PROT_WRITE|PROT_EXEC if something turns out to
@@ -809,7 +835,7 @@ static void __ctx_free(lithe_fork_join_context_t *ctx)
     }
     ctx->start_routine = FJS_CTX_FREED_POISON;
     if (fjs_ctx_pool_bucketed()) {
-        int cls = fjs_ctx_size_class(ctx->context.stack.size);
+        int cls = fjs_ctx_free_class(ctx->context.stack.size);
         if (wfl_size(&context_zombie_class[cls]) < 1000) {
             wfl_insert(&context_zombie_class[cls], ctx);
             return;
