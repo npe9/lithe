@@ -453,6 +453,40 @@ static int fjs_steal_topo; /* LITHE_FJS_STEAL_TOPO, A6 */
 static int16_t fjs_topo_order[FJS_TOPO_MAX_VC][FJS_TOPO_MAX_VC];
 static int fjs_topo_n[FJS_TOPO_MAX_VC];
 static int fjs_topo_ready[FJS_TOPO_MAX_VC];
+/* A11 (docs/PLAN-affinity.md, GAPS C15): L3 confinement. LITHE_FJS_L3_CONFINE=1: a hart outside the
+ * L3 group of vcore 0 (the "home" group, where the rank contexts' data lives) runs no context while
+ * any home hart of this sched is online and idle; it pokes the reactor so the idle home hart wakes.
+ * Hosted RPH=8: the same 8 harts give CG 4.9 ms in one group and 9.8 ms split across two. */
+static int fjs_l3_confine = -1;
+static unsigned char fjs_vc_busy[FJS_TOPO_MAX_VC];
+static signed char fjs_vc_home[FJS_TOPO_MAX_VC]; /* -1 unknown, 0 no, 1 yes */
+static inline void fjs_vc_set_busy(int on)
+{
+	int v = vcore_id();
+	if (v >= 0 && v < FJS_TOPO_MAX_VC)
+		__atomic_store_n(&fjs_vc_busy[v], (unsigned char)on, __ATOMIC_RELEASE);
+}
+static void fjs_l3_confine_init(void)
+{
+	/* Default: on for hosted multi-rank processes (LITHE_CONTEXT_RANKS_PER_HOST > 1), whose rank
+	 * contexts migrate between harts: RPH=8 CG 8.2-8.8 -> 5.9-7.0 ms at 12 harts, 8.5-8.7 -> 5.4-6.4 at
+	 * 16, neutral within one group. Off for flat OpenMP teams, which want every hart and lost up to 6 %
+	 * (XSBench OMP=16 spanning two groups). LITHE_FJS_L3_CONFINE=0/1 overrides. */
+	const char *e = getenv("LITHE_FJS_L3_CONFINE");
+	if (e && *e) {
+		fjs_l3_confine = (atoi(e) != 0);
+	} else {
+		const char *r = getenv("LITHE_CONTEXT_RANKS_PER_HOST");
+		fjs_l3_confine = (r && atoi(r) > 1) ? 1 : 0;
+	}
+	if (!fjs_l3_confine) return;
+	int mv = (int)max_vcores(), g0 = parlib_vcore_l3_group(0);
+	for (int v = 0; v < mv && v < FJS_TOPO_MAX_VC; v++) {
+		int g = parlib_vcore_l3_group(v);
+		/* unknown placement (unpinned): treat as home, i.e. no confinement */
+		fjs_vc_home[v] = (g0 < 0 || g < 0 || g == g0) ? 1 : 0;
+	}
+}
 static void fjs_topo_build(int vc, int mv)
 {
 	int l3 = parlib_vcore_l3_group(vc), nd = parlib_vcore_numa_node(vc);
@@ -2069,6 +2103,25 @@ static void fjs_hart_grant_children(lithe_fork_join_sched_t *sched)
 
 static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
 {
+  if (__builtin_expect(fjs_l3_confine < 0, 0))
+    fjs_l3_confine_init();
+  if (fjs_l3_confine) {
+    int me = vcore_id();
+    if (me >= 0 && me < FJS_TOPO_MAX_VC && fjs_vc_home[me] == 0) {
+      int mv = (int)max_vcores(), idle_home = 0;
+      for (int v = 0; v < mv && v < FJS_TOPO_MAX_VC; v++)
+        if (fjs_vc_home[v] > 0 && vconline_s(sched, v) &&
+            !__atomic_load_n(&fjs_vc_busy[v], __ATOMIC_ACQUIRE)) {
+          idle_home = 1;
+          break;
+        }
+      if (idle_home) {
+        if (__atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0)
+          parlib_reactor_wake();
+        return;
+      }
+    }
+  }
   if (__atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0) {
     lithe_fork_join_context_t *w = fjs_warm_claim(sched, vcore_id());
     if (w != NULL) {
@@ -2079,6 +2132,7 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
                                (uint32_t)w->context.id, LITHE_ST_DEC_OK, 0);
       fjs_stats_run_enter();
       __atomic_fetch_add(&sched->running_count, 1, __ATOMIC_SEQ_CST);
+      fjs_vc_set_busy(1);
       lithe_context_run(&w->context);
     }
   }
@@ -2103,6 +2157,7 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
     ctx->state = FJS_CTX_RUNNING;
     fjs_stats_run_enter();
     __atomic_fetch_add(&sched->running_count, 1, __ATOMIC_SEQ_CST);
+      fjs_vc_set_busy(1);
     lithe_context_run(&ctx->context);
   }
 }
@@ -2563,6 +2618,7 @@ void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
 	fjs_stats_run_leave();
 	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
 	                   __ATOMIC_SEQ_CST);
+	fjs_vc_set_busy(0);
 	if (lithe_sched_trace_enabled())
 		lithe_sched_trace_emit(LITHE_ST_CTX_BLOCK, __this,
 		                       (uint32_t)c->id, LITHE_ST_DEC_OK, 0);
@@ -2610,6 +2666,7 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 	fjs_stats_run_leave();
 	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
 	                   __ATOMIC_SEQ_CST);
+	fjs_vc_set_busy(0);
 	if (lithe_sched_trace_enabled()) {
 		lithe_fork_join_sched_t *s = (lithe_fork_join_sched_t *)__this;
 		long rc = __atomic_load_n(&s->runnable_count, __ATOMIC_RELAXED);
@@ -2641,6 +2698,7 @@ void lithe_fork_join_sched_context_exit(lithe_sched_t *__this,
   assert(ctx->state == FJS_CTX_RUNNING);
   fjs_stats_run_leave();
   __atomic_fetch_sub(&sched->running_count, 1, __ATOMIC_SEQ_CST);
+  fjs_vc_set_busy(0);
   if (c != sched->sched.main_context) {
     /* NEEDED-LEDGER DRIFT FIX: same rule as context_block — keep the
      * demand while RUNNABLE/warm work is queued (see comment there). */
