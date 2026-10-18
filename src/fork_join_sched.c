@@ -497,6 +497,16 @@ static int fjs_soft_hart_cap = 0;
  * mode (1454 vs 2710-2787 z/s), GROMACS and LAMMPS unchanged. */
 static long fjs_reactor_drivers_max = 1;
 static long fjs_reactor_drivers = 0;
+/* Park-budget knobs (2026-10-17, audit section 3.5 / 8): how long an idle hart stays
+ * resident before it is returned to parlib, and how much surplus is tolerated.
+ *   LITHE_FJS_IDLE_PARK_ROUNDS  (default 24): timed-park rounds (1,1,4,4,...,MAX ms) before idle_yield
+ *   LITHE_FJS_IDLE_PARK_MAX_MS  (default 64): ceiling of the park escalation
+ *   LITHE_FJS_SURPLUS_SLACK     (default 1): a hart is surplus when owned > runnable + warm + 1 + slack
+ * A resident hart dispatches a wake in ~1 us; a returned one needs vcore_request + futex, 88 us p50 /
+ * 270 us p90 at RPH=8 (docs/AUDIT-perfetto-performance-20261017.md). */
+static unsigned fjs_idle_park_rounds = 24u;
+static int fjs_idle_park_max_ms = 64;
+static long fjs_surplus_slack = 1;
 /* Extra harts above RPH reserved for progress/helpers (default 0). */
 static int fjs_helper_harts = 0;
 /* Default: spin before CQ park. 0 meant every empty progress tick paid
@@ -562,6 +572,12 @@ static void fjs_tradespace_init_once(void)
 	}
 
 	fjs_reactor_poll_init();
+	e = getenv("LITHE_FJS_IDLE_PARK_ROUNDS");
+	if (e && *e) { char *end = NULL; unsigned long v = strtoul(e, &end, 10); if (end != e && v <= 100000ul) fjs_idle_park_rounds = (unsigned)v; }
+	e = getenv("LITHE_FJS_IDLE_PARK_MAX_MS");
+	if (e && *e) { char *end = NULL; unsigned long v = strtoul(e, &end, 10); if (end != e && v >= 1 && v <= 10000ul) fjs_idle_park_max_ms = (int)v; }
+	e = getenv("LITHE_FJS_SURPLUS_SLACK");
+	if (e && *e) { char *end = NULL; unsigned long v = strtoul(e, &end, 10); if (end != e && v <= 1024ul) fjs_surplus_slack = (long)v; }
 	e = getenv("LITHE_FJS_REACTOR_DRIVERS");
 	if (e && *e) {
 		char *end = NULL;
@@ -1602,7 +1618,7 @@ int lithe_fork_join_should_yield_to_runnable(void)
         return 1;
     }
     demand = r + wc + 1;
-    if (owned > demand + 1)
+    if (owned > demand + fjs_surplus_slack)
       return 1;
     return 0;
   }
@@ -2364,7 +2380,7 @@ restart:
       demand += 1;
     /* Soft-cap surplus: any hart above the rank budget is excess even when
      * demand+1 would tolerate owned==4 at VCORE=4 (the VCORE=4 churn case). */
-    is_surplus = (owned > demand + 1) ||
+    is_surplus = (owned > demand + fjs_surplus_slack) ||
                  (soft_cap > 0 && owned > (long)soft_cap);
     /* PARENT/SIBLING STARVATION at the idle path (same gate as the slice
      * hand-off above): an EMPTY child must not park on a hart that a starved
@@ -2399,6 +2415,8 @@ idle_park_again:
           ms = 16;
         if (idle_park_streak >= 16u)
           ms = 64;
+        if (ms > fjs_idle_park_max_ms)
+          ms = fjs_idle_park_max_ms;
         if (fjs_interfere_on())
           __sync_fetch_and_add(&fjs_cnt_idle_park, 1);
         if (lithe_sched_trace_enabled())
@@ -2433,7 +2451,7 @@ idle_park_again:
           idle_park_streak = 0;
           goto restart;
         }
-        if (idle_park_streak < 24u) {
+        if (idle_park_streak < fjs_idle_park_rounds) {
           idle_park_streak++;
           goto idle_park_again;
         }
