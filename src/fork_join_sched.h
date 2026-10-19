@@ -135,6 +135,10 @@ typedef struct {
    * itself, so a hart-holding spinner need not yield for that peer. Plain
    * C11 atomics, appended field, ABI-safe like the ones above. */
   long running_count;
+  /* LPT (LITHE_FJS_LPT): queued contexts that carry a long-burst prediction.
+   * While 0 a hart takes the plain local-queue fast path; only when some
+   * queued context could be ranked does it scan all queues. Appended field. */
+  long lpt_ranked_queued;
 } lithe_fork_join_sched_t;
 
 typedef struct {
@@ -169,6 +173,8 @@ typedef struct {
   int lpt_polling;
   /* Not counted by join_all (lithe_fork_join_context_set_daemon). */
   int daemon;
+  /* counted in its scheduler's lpt_ranked_queued while queued */
+  int lpt_counted;
 } lithe_fork_join_context_t;
 
 

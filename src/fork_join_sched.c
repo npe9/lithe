@@ -885,6 +885,24 @@ static int get_next_queue_id()
 	return get_next_queue_id_for(sched);
 }
 
+static inline int fjs_lpt_on(void);
+static inline uint64_t fjs_lpt_key(lithe_fork_join_context_t *f);
+/* Under the queue lock: keep lpt_ranked_queued = queued contexts with a key. */
+static inline void fjs_lpt_count_in(lithe_fork_join_sched_t *sched, lithe_fork_join_context_t *ctx)
+{
+	if (fjs_lpt_on() && fjs_lpt_key(ctx) > 0) {
+		ctx->lpt_counted = 1;
+		__atomic_fetch_add(&sched->lpt_ranked_queued, 1, __ATOMIC_RELAXED);
+	}
+}
+static inline void fjs_lpt_count_out(lithe_fork_join_sched_t *sched, lithe_fork_join_context_t *ctx)
+{
+	if (ctx->lpt_counted) {
+		ctx->lpt_counted = 0;
+		__atomic_fetch_sub(&sched->lpt_ranked_queued, 1, __ATOMIC_RELAXED);
+	}
+}
+
 static int __thread_enqueue_on(lithe_fork_join_sched_t *sched,
                                lithe_fork_join_context_t *ctx, bool athead)
 {
@@ -901,6 +919,7 @@ static int __thread_enqueue_on(lithe_fork_join_sched_t *sched,
 	else
 		TAILQ_INSERT_TAIL(&tqueue_s(sched, vcoreid), &ctx->context, link);
 	tqsize_s(sched, vcoreid)++;
+	fjs_lpt_count_in(sched, ctx);
 	/* CHANGE 1: bump the O(1) any-runnable indicator under tqlock, so any
 	 * vcore that could find this context in the queue also observes count>0. */
 	__atomic_fetch_add(&sched->runnable_count, 1, __ATOMIC_SEQ_CST);
@@ -1360,7 +1379,8 @@ static lithe_fork_join_context_t *__thread_dequeue()
 		if (tqsize(vcoreid)) {
 			spin_pdr_lock(&tqlock(vcoreid));
 			ctx = (lithe_fork_join_context_t*) TAILQ_FIRST(&tqueue(vcoreid));
-			if (ctx && fjs_lpt_on()) {
+			if (ctx && fjs_lpt_on() &&
+			    __atomic_load_n(&cur->lpt_ranked_queued, __ATOMIC_RELAXED) > 0) {
 				lithe_context_t *c = TAILQ_NEXT(&ctx->context, link);
 				for (int k = 1; c && k < FJS_LPT_SCAN; k++, c = TAILQ_NEXT(c, link)) {
 					lithe_fork_join_context_t *f = (lithe_fork_join_context_t *)c;
@@ -1370,6 +1390,7 @@ static lithe_fork_join_context_t *__thread_dequeue()
 			}
 			if (ctx) {
 				TAILQ_REMOVE(&tqueue(vcoreid), &ctx->context, link);
+				fjs_lpt_count_out(cur, ctx);
 				tqsize(vcoreid)--;
 				/* CHANGE 1: drop the O(1) any-runnable indicator under tqlock. */
 				__atomic_fetch_sub(&cur->runnable_count, 1, __ATOMIC_SEQ_CST);
@@ -1414,6 +1435,7 @@ static lithe_fork_join_context_t *__thread_dequeue()
 		for (int k = 0; c && k < FJS_LPT_SCAN; k++, c = TAILQ_NEXT(c, link)) {
 			if ((lithe_fork_join_context_t *)c == best) {
 				TAILQ_REMOVE(&tqueue(bv), c, link);
+				fjs_lpt_count_out(cur, best);
 				tqsize(bv)--;
 				__atomic_fetch_sub(&cur->runnable_count, 1, __ATOMIC_SEQ_CST);
 				got = best;
@@ -1432,7 +1454,7 @@ static lithe_fork_join_context_t *__thread_dequeue()
 
 	/* Try and grab a thread from our queue */
 	local_tq = tqsize(vcoreid);
-	if (fjs_lpt_on())
+	if (fjs_lpt_on() && __atomic_load_n(&cur->lpt_ranked_queued, __ATOMIC_RELAXED) > 0)
 		ctx = lpt_pick_global();
 	if (!ctx)
 		ctx = tdequeue(vcoreid);
@@ -1844,6 +1866,7 @@ void lithe_fork_join_sched_init(lithe_fork_join_sched_t *sched,
   sched->warm_ready_count = 0;  /* WARM VCORES: GO-and-unclaimed warm workers */
   sched->leaving_harts = 0;  /* LOST-WAKEUP GUARD: committed-to-yield harts */
   sched->running_count = 1;  /* IDLE-AWARE PEER CHECK: the main context is running */
+  sched->lpt_ranked_queued = 0;
   TAILQ_INIT(&sched->child_sched_list);
   spin_pdr_init(&sched->child_sched_list_lock);
   /* sched->next_queue_id initialized in sched_enter() */
@@ -1881,6 +1904,7 @@ void lithe_fork_join_context_init(lithe_fork_join_sched_t *sched,
   ctx->lpt_pred_ns = 0;
   ctx->lpt_polling = 0;
   ctx->daemon = 0;
+  ctx->lpt_counted = 0;
 
   void start_routine_wrapper(void *arg)
   {
@@ -1951,6 +1975,7 @@ void lithe_fork_join_context_migrate(lithe_fork_join_sched_t *from,
 			TAILQ_FOREACH(c, &tqueue_s(from, i), link) {
 				if (c == &ctx->context) {
 					TAILQ_REMOVE(&tqueue_s(from, i), c, link);
+					fjs_lpt_count_out(from, (lithe_fork_join_context_t *)c);
 					tqsize_s(from, i)--;
 					/* CHANGE 1: keep the any-runnable indicator in sync when a
 					 * RUNNABLE context is pulled off `from`'s queues; the paired
