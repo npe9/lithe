@@ -167,6 +167,8 @@ typedef struct {
   /* set when it yielded after a short slice (polling in a wait loop): ranks
    * last until it runs a long slice or blocks */
   int lpt_polling;
+  /* Not counted by join_all (lithe_fork_join_context_set_daemon). */
+  int daemon;
 } lithe_fork_join_context_t;
 
 
@@ -291,6 +293,12 @@ void lithe_fork_join_context_init(lithe_fork_join_sched_t *sched,
 void lithe_fork_join_context_cleanup(lithe_fork_join_context_t *context);
 void lithe_fork_join_context_destroy(lithe_fork_join_context_t *context);
 void lithe_fork_join_sched_join_one(lithe_fork_join_sched_t *sched);
+/* Exclude a context from its scheduler's join_all (GAPS B26). For runtime pool
+ * workers that park between uses and live as long as the runtime -- the Lithe
+ * libgomp's and oneTBB's -- so a scheduler that hosts them can still be joined.
+ * Idempotent; call right after creating the context. A daemon context that
+ * exits does not count again. */
+void lithe_fork_join_context_set_daemon(lithe_fork_join_context_t *ctx);
 void lithe_fork_join_sched_join_all(lithe_fork_join_sched_t *sched);
 
 /* Move a fork-join context between schedulers, updating runnable queues and

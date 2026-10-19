@@ -1880,6 +1880,7 @@ void lithe_fork_join_context_init(lithe_fork_join_sched_t *sched,
   ctx->lpt_start_ns = 0;
   ctx->lpt_pred_ns = 0;
   ctx->lpt_polling = 0;
+  ctx->daemon = 0;
 
   void start_routine_wrapper(void *arg)
   {
@@ -1910,6 +1911,13 @@ void lithe_fork_join_sched_join_one(lithe_fork_join_sched_t *sched)
 {
   if(__sync_add_and_fetch(&sched->num_contexts, -1) == 0)
     lithe_context_unblock(sched->sched.main_context);
+}
+
+void lithe_fork_join_context_set_daemon(lithe_fork_join_context_t *ctx)
+{
+  if (!ctx || __atomic_exchange_n(&ctx->daemon, 1, __ATOMIC_ACQ_REL))
+    return;
+  lithe_fork_join_sched_join_one((lithe_fork_join_sched_t *)ctx->context.sched);
 }
 
 static void block_main_context(lithe_context_t *c, void *arg)
@@ -1959,9 +1967,11 @@ void lithe_fork_join_context_migrate(lithe_fork_join_sched_t *from,
 		assert(found && "migrate: RUNNABLE context not on from's queues");
 	}
 
-	__sync_fetch_and_add(&from->num_contexts, -1);
+	if (!__atomic_load_n(&ctx->daemon, __ATOMIC_ACQUIRE))
+		__sync_fetch_and_add(&from->num_contexts, -1);
 	lithe_context_reassociate(&ctx->context, &to->sched);
-	__sync_fetch_and_add(&to->num_contexts, 1);
+	if (!__atomic_load_n(&ctx->daemon, __ATOMIC_ACQUIRE))
+		__sync_fetch_and_add(&to->num_contexts, 1);
 
 	if (ctx->state == FJS_CTX_RUNNABLE) {
 		__thread_enqueue_on(to, ctx, false);
@@ -2859,7 +2869,9 @@ void lithe_fork_join_sched_context_exit(lithe_sched_t *__this,
     if (__atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) <= 0 &&
         __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) <= 0)
       lithe_hart_request(-1);
+    int daemon = __atomic_load_n(&ctx->daemon, __ATOMIC_ACQUIRE);
     lithe_fork_join_context_destroy(ctx);
-    lithe_fork_join_sched_join_one(sched);
+    if (!daemon)
+      lithe_fork_join_sched_join_one(sched);
   }
 }
