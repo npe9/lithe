@@ -130,7 +130,13 @@ int lithe_mutex_lock(lithe_mutex_t *mutex)
          * in lithe_context_block with no current context), the base scheduler,
          * a constructor or _dl_fini -- waits by yielding its kernel thread. */
         mcs_pdr_unlock(&mutex->lock, &qnode);
-        sched_yield();
+        /* Poll the flag WITHOUT the queue lock until it looks free: retaking the
+         * MCS lock on every retry convoyed -- 8 helpers on 4 CPUs, a queued one
+         * preempted, the holder stuck in lithe_mutex_unlock behind it: 1.8-3.3 s
+         * finalize in 5/10 runs (gdb, GAPS B29). */
+        do {
+          sched_yield();
+        } while (__atomic_load_n(&mutex->locked, __ATOMIC_ACQUIRE));
         memset(&qnode, 0, sizeof(mcs_lock_qnode_t));
         mcs_pdr_lock(&mutex->lock, &qnode);
         lithe_mutex_ensure_queue(mutex);
