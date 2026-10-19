@@ -31,6 +31,7 @@
 #include "internal/assert.h"
 #include "internal/vcore.h"
 #include "sched_trace.h"
+#include <sched.h>
 
 #ifndef __linux__
 #ifndef __ros__
@@ -1099,6 +1100,14 @@ static inline void yc_record(void *ra)
 
 void lithe_context_yield()
 {
+  /* Called from a thread that is not running a Lithe context (a parlib offload
+   * helper running a lithified library's wait loop, GAPS B29: cxip_pte_set_state_wait
+   * during a parallel endpoint close), there is no context to yield: yield the
+   * kernel thread instead of dereferencing a NULL current context. */
+  if (current_context == NULL || in_vcore_context()) {
+    sched_yield();
+    return;
+  }
   assert(!in_vcore_context());
   assert(current_sched);
   assert(current_context);

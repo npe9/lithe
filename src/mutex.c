@@ -17,6 +17,7 @@
 #include <parlib/parlib.h>
 #include <parlib/mcs.h>
 #include "mutex.h"
+#include <sched.h>
 
 int lithe_mutexattr_init(lithe_mutexattr_t *attr)
 {
@@ -122,6 +123,19 @@ int lithe_mutex_lock(lithe_mutex_t *mutex)
   }
   else {
     while(mutex->locked) {
+      if(!lithe_can_block()) {
+        /* A caller that cannot block as a Lithe context -- a plain kernel thread
+         * (parlib offload helpers running library calls, GAPS B29: a lithified
+         * libfabric AV lock contended by two helpers closing endpoints crashed
+         * in lithe_context_block with no current context), the base scheduler,
+         * a constructor or _dl_fini -- waits by yielding its kernel thread. */
+        mcs_pdr_unlock(&mutex->lock, &qnode);
+        sched_yield();
+        memset(&qnode, 0, sizeof(mcs_lock_qnode_t));
+        mcs_pdr_lock(&mutex->lock, &qnode);
+        lithe_mutex_ensure_queue(mutex);
+        continue;
+      }
       mutex->qnode = &qnode;
       lithe_context_block(block, mutex);
 
