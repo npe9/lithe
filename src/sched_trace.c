@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,12 +89,51 @@ static void st_resolve_path(void)
 	snprintf(st_path, sizeof(st_path), "lithe_sched_trace.%d.bin", (int)getpid());
 }
 
+/* SIGUSR2 lands on whatever thread the kernel picks, usually a vcore thread
+ * parked in its small bootstrap stack: dumping there (snprintf + protobuf
+ * encode) overflowed it and segfaulted (StarPU+OpenMP hang, 2026-10-19). The
+ * handler only pokes a pipe; a dumper pthread with a normal stack does the work. */
+static int st_dump_pipe[2] = { -1, -1 };
+static void *st_dumper(void *x)
+{
+	(void)x;
+	char b;
+	for (;;) {
+		ssize_t n = read(st_dump_pipe[0], &b, 1);
+		if (n == 1)
+			(void)lithe_sched_trace_dump();
+		else if (n < 0 && errno != EINTR)
+			return NULL;
+	}
+}
+static void st_start_dumper(void)
+{
+	pthread_t t;
+	pthread_attr_t a;
+	if (pipe2(st_dump_pipe, O_CLOEXEC) != 0)
+		return;
+	pthread_attr_init(&a);
+	pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+	if (pthread_create(&t, &a, st_dumper, NULL) != 0) {
+		close(st_dump_pipe[0]);
+		close(st_dump_pipe[1]);
+		st_dump_pipe[0] = st_dump_pipe[1] = -1;
+	}
+	pthread_attr_destroy(&a);
+}
+
 static void st_on_sigusr2(int sig)
 {
 	(void)sig;
 	/* Safe no-op if tracing never armed — must not terminate the process. */
-	if (st_enabled == 1 && st_inited)
-		(void)lithe_sched_trace_dump();
+	if (st_enabled == 1 && st_inited) {
+		int saved = errno;
+		if (st_dump_pipe[1] >= 0)
+			(void)!write(st_dump_pipe[1], "d", 1);
+		else
+			(void)lithe_sched_trace_dump();
+		errno = saved;
+	}
 }
 
 static void st_atexit_dump(void)
@@ -209,6 +249,7 @@ static void st_init_once(void)
 	}
 	atexit(st_atexit_dump);
 	parlib_reactor_set_trace_fn(st_reactor_trace);
+	st_start_dumper();
 
 	st_inited = 1;
 	fprintf(stderr,
