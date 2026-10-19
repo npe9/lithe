@@ -139,6 +139,11 @@ typedef struct {
    * While 0 a hart takes the plain local-queue fast path; only when some
    * queued context could be ranked does it scan all queues. Appended field. */
   long lpt_ranked_queued;
+  /* LPT gap gate (LITHE_FJS_LPT_GAP_US): decaying max/min of recent long-burst
+   * lengths. When they are close, reordering cannot shorten the makespan and the
+   * scan is skipped. Racy relaxed updates; appended fields. */
+  uint64_t lpt_hi_ns;
+  uint64_t lpt_lo_ns;
 } lithe_fork_join_sched_t;
 
 typedef struct {

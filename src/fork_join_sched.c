@@ -1344,10 +1344,11 @@ static int fjs_lpt = -1;
 static inline int fjs_lpt_on(void)
 {
 	if (__builtin_expect(fjs_lpt < 0, 0)) {
-		/* Default ON since 2026-10-19: with lpt_ranked_queued gating the scan it
-		 * costs nothing on fine-grained work (nested OpenMP, region cost, hosted
-		 * MPI+OpenMP unchanged) and the HPDC login suite (7 apps, NP=2 OMP=4, 3
-		 * reps) is neutral; hosted ranks gain 7-12 %. LITHE_FJS_LPT=0 disables. */
+		/* Default ON since 2026-10-19: lpt_ranked_queued and the gap gate
+		 * (fjs_lpt_scan_ok) keep the scan off fine-grained work (nested OpenMP,
+		 * region cost, hosted MPI+OpenMP unchanged) and the HPDC login suite (7
+		 * apps, NP=2 OMP=4, 3 reps) is neutral; hosted ranks gain 7-12 %.
+		 * LITHE_FJS_LPT=0 disables. */
 		const char *e = getenv("LITHE_FJS_LPT");
 		fjs_lpt = !(e && e[0] == '0');
 	}
@@ -1375,6 +1376,13 @@ static inline void fjs_lpt_stop(lithe_fork_join_context_t *ctx, int yielded)
 		if (d >= FJS_LPT_MIN_NS) {
 			ctx->lpt_pred_ns = d;
 			ctx->lpt_polling = 0;
+			lithe_fork_join_sched_t *s = (lithe_fork_join_sched_t *)ctx->context.sched;
+			uint64_t hi = __atomic_load_n(&s->lpt_hi_ns, __ATOMIC_RELAXED);
+			uint64_t lo = __atomic_load_n(&s->lpt_lo_ns, __ATOMIC_RELAXED);
+			hi -= hi >> 5;
+			lo = lo ? lo + (lo >> 5) : d;
+			__atomic_store_n(&s->lpt_hi_ns, d > hi ? d : hi, __ATOMIC_RELAXED);
+			__atomic_store_n(&s->lpt_lo_ns, d < lo ? d : lo, __ATOMIC_RELAXED);
 		} else {
 			ctx->lpt_polling = yielded;
 		}
@@ -1395,6 +1403,29 @@ static inline uint64_t fjs_lpt_key(lithe_fork_join_context_t *f)
 	return f->lpt_polling ? 0 : f->lpt_pred_ns;
 }
 
+/* GAP GATE (2026-10-19): LPT cost nested OpenMP 4-12 % (Lithe libgomp 4x4 128 ->
+ * 135 us, 8x4 257 -> 280): its 0.1-0.8 ms chunks earn predictions, so dispatches
+ * scanned and locked every queue, yet near-equal bursts gain nothing from reordering
+ * (a never-scan arm matched LPT off, so the cost is the scan, not the timestamps).
+ * The scan runs only while the decaying max and min of recent long bursts differ by
+ * >= LITHE_FJS_LPT_GAP_US (default 1000; 0 = always scan). Measured hi-lo: nested
+ * 0.2-0.35 ms, hosted ranks 3.7-6 ms. A ratio gate did not separate them (nested
+ * 1.7-3x, ranks 3.5-40x: one 120 us halo slice sets lo). Skipping the scan is plain
+ * FIFO, so aging is not needed then. */
+static long fjs_lpt_gap_ns = -1;
+static inline int fjs_lpt_scan_ok(lithe_fork_join_sched_t *s)
+{
+	if (__builtin_expect(fjs_lpt_gap_ns < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_LPT_GAP_US");
+		fjs_lpt_gap_ns = (e ? atol(e) : 1000) * 1000;
+	}
+	if (fjs_lpt_gap_ns == 0)
+		return 1;
+	uint64_t hi = __atomic_load_n(&s->lpt_hi_ns, __ATOMIC_RELAXED);
+	uint64_t lo = __atomic_load_n(&s->lpt_lo_ns, __ATOMIC_RELAXED);
+	return hi >= lo + (uint64_t)fjs_lpt_gap_ns;
+}
+
 static lithe_fork_join_context_t *__thread_dequeue()
 {
 	lithe_fork_join_sched_t *cur = (lithe_fork_join_sched_t *)lithe_sched_current();
@@ -1406,7 +1437,8 @@ static lithe_fork_join_context_t *__thread_dequeue()
 			spin_pdr_lock(&tqlock(vcoreid));
 			ctx = (lithe_fork_join_context_t*) TAILQ_FIRST(&tqueue(vcoreid));
 			if (ctx && fjs_lpt_on() &&
-			    __atomic_load_n(&cur->lpt_ranked_queued, __ATOMIC_RELAXED) > 0) {
+			    __atomic_load_n(&cur->lpt_ranked_queued, __ATOMIC_RELAXED) > 0 &&
+			    fjs_lpt_scan_ok(cur)) {
 				lithe_context_t *c = TAILQ_NEXT(&ctx->context, link);
 				for (int k = 1; c && k < FJS_LPT_SCAN; k++, c = TAILQ_NEXT(c, link)) {
 					lithe_fork_join_context_t *f = (lithe_fork_join_context_t *)c;
@@ -1480,7 +1512,8 @@ static lithe_fork_join_context_t *__thread_dequeue()
 
 	/* Try and grab a thread from our queue */
 	local_tq = tqsize(vcoreid);
-	if (fjs_lpt_on() && __atomic_load_n(&cur->lpt_ranked_queued, __ATOMIC_RELAXED) > 0)
+	if (fjs_lpt_on() && __atomic_load_n(&cur->lpt_ranked_queued, __ATOMIC_RELAXED) > 0 &&
+	    fjs_lpt_scan_ok(cur))
 		ctx = lpt_pick_global();
 	if (!ctx)
 		ctx = tdequeue(vcoreid);
@@ -1893,6 +1926,8 @@ void lithe_fork_join_sched_init(lithe_fork_join_sched_t *sched,
   sched->leaving_harts = 0;  /* LOST-WAKEUP GUARD: committed-to-yield harts */
   sched->running_count = 1;  /* IDLE-AWARE PEER CHECK: the main context is running */
   sched->lpt_ranked_queued = 0;
+  sched->lpt_hi_ns = 0;
+  sched->lpt_lo_ns = 0;
   TAILQ_INIT(&sched->child_sched_list);
   spin_pdr_init(&sched->child_sched_list_lock);
   /* sched->next_queue_id initialized in sched_enter() */
