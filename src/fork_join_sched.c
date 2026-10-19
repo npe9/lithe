@@ -275,15 +275,20 @@ static void fjs_reactor_poll_init(void)
 			fjs_reactor_poll_us = (long)v;
 	}
 	if (fjs_reactor_poll_us > 0) {
-		/* calibrate the TSC once: 2 ms against CLOCK_MONOTONIC */
+		/* calibrate the TSC once against CLOCK_MONOTONIC. 100 us (was 2 ms, a
+		 * busy wait every Lithe process paid before its first context ran:
+		 * 2.1 ms of a ~4 ms bootstrap) is well under 1 % error for the poll
+		 * interval it scales. */
 		struct timespec a, b;
 		uint64_t t0 = fjs_rdtsc(), t1;
+		long ns;
 		clock_gettime(CLOCK_MONOTONIC, &a);
 		do {
 			clock_gettime(CLOCK_MONOTONIC, &b);
-		} while ((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec) < 2000000L);
+			ns = (b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec);
+		} while (ns < 100000L);
 		t1 = fjs_rdtsc();
-		fjs_tsc_per_us = (t1 - t0) / 2000;
+		fjs_tsc_per_us = (t1 - t0) * 1000 / (uint64_t)ns;
 		if (fjs_tsc_per_us == 0)
 			fjs_tsc_per_us = 1;
 	}
