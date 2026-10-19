@@ -324,6 +324,18 @@ void lithe_sched_trace_emit(uint8_t ev, void *sched, uint32_t ctx_id,
 		return;
 	if (!st_inited || st_enabled != 1)
 		return;
+	/* LITHE_SCHED_TRACE_SKIP_IDLE=1 (2026-10-19): idle harts emit >1M idle_spin
+	 * records/s and wrap the ring, so a busy hart's history is lost ([dropped]
+	 * in the report). Skipping them keeps whole runs; idle ms then reads 0. */
+	if (ev == LITHE_ST_IDLE_SPIN) {
+		static int skip = -1;
+		if (skip < 0) {
+			const char *e = getenv("LITHE_SCHED_TRACE_SKIP_IDLE");
+			skip = e && e[0] == '1';
+		}
+		if (skip)
+			return;
+	}
 
 	vc = vcore_id();
 	if (vc < 0 || (unsigned)vc >= st_n_vcores)

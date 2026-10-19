@@ -1362,8 +1362,21 @@ static inline uint64_t fjs_lpt_now(void)
 }
 static inline void fjs_lpt_start(lithe_fork_join_context_t *ctx)
 {
-	if (fjs_lpt_on())
+	if (fjs_lpt_on()) {
 		ctx->lpt_start_ns = fjs_lpt_now();
+	}
+}
+static inline void fjs_lpt_record(lithe_fork_join_context_t *ctx, uint64_t d)
+{
+	ctx->lpt_pred_ns = d;
+	ctx->lpt_polling = 0;
+	lithe_fork_join_sched_t *s = (lithe_fork_join_sched_t *)ctx->context.sched;
+	uint64_t hi = __atomic_load_n(&s->lpt_hi_ns, __ATOMIC_RELAXED);
+	uint64_t lo = __atomic_load_n(&s->lpt_lo_ns, __ATOMIC_RELAXED);
+	hi -= hi >> 5;
+	lo = lo ? lo + (lo >> 5) : d;
+	__atomic_store_n(&s->lpt_hi_ns, d > hi ? d : hi, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->lpt_lo_ns, d < lo ? d : lo, __ATOMIC_RELAXED);
 }
 /* A context that YIELDS after a short slice is polling (an MPI wait loop): if it
  * kept its long-burst priority, LPT would hand the hart straight back to the poller
@@ -1374,15 +1387,7 @@ static inline void fjs_lpt_stop(lithe_fork_join_context_t *ctx, int yielded)
 	if (fjs_lpt_on() && ctx->lpt_start_ns) {
 		uint64_t d = fjs_lpt_now() - ctx->lpt_start_ns;
 		if (d >= FJS_LPT_MIN_NS) {
-			ctx->lpt_pred_ns = d;
-			ctx->lpt_polling = 0;
-			lithe_fork_join_sched_t *s = (lithe_fork_join_sched_t *)ctx->context.sched;
-			uint64_t hi = __atomic_load_n(&s->lpt_hi_ns, __ATOMIC_RELAXED);
-			uint64_t lo = __atomic_load_n(&s->lpt_lo_ns, __ATOMIC_RELAXED);
-			hi -= hi >> 5;
-			lo = lo ? lo + (lo >> 5) : d;
-			__atomic_store_n(&s->lpt_hi_ns, d > hi ? d : hi, __ATOMIC_RELAXED);
-			__atomic_store_n(&s->lpt_lo_ns, d < lo ? d : lo, __ATOMIC_RELAXED);
+			fjs_lpt_record(ctx, d);
 		} else {
 			ctx->lpt_polling = yielded;
 		}
@@ -1393,11 +1398,49 @@ static inline void fjs_lpt_stop(lithe_fork_join_context_t *ctx, int yielded)
  * process hung (LITHE_FJS_LPT=0 ran it in 0.05 s). A context queued longer than
  * FJS_LPT_AGE_NS outranks every prediction, oldest first. */
 #define FJS_LPT_AGE_NS 2000000ull
+/* AGE SCALING (2026-10-19): a fixed 2 ms age undid LPT whenever bursts are longer
+ * than that. Hosted ranks trace (K=8 alt, 4 harts): a 5.3 ms rank woken at 1.72 ms
+ * waited until 6.96 ms because at 4.3 ms it and two 2.6 ms ranks had all queued
+ * > 2 ms, and the oldest (by 20-30 us) won -- plain FIFO, ~2.6 ms lost per
+ * iteration. A context now ages after max(2 ms, M x the scheduler's recent
+ * longest burst), M = LITHE_FJS_LPT_AGE_MULT (default 1; 0 = fixed 2 ms).
+ * Only predicted contexts get the scaled age (see below). K=8 alt 10.3-10.5 ->
+ * 9.3 ms, block 9.3-9.7 -> 9.1-9.4, K=16 alt 17.8-18.0 -> 16.8-17.4; M=2/4 no
+ * better. NEGATIVE (same day): ending a burst prediction at the first wait-loop
+ * call (lithe_fork_join_should_yield_to_runnable), so spin-waits do not count as
+ * compute, measured no better than this alone; removed. */
+static int fjs_lpt_age_mult = -1;
+static int fjs_lpt_age_all = -1; /* LITHE_FJS_LPT_AGE_ALL=1: scale every context's age (A/B) */
+static inline int getenv_lpt_age_all(void)
+{
+	if (__builtin_expect(fjs_lpt_age_all < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_LPT_AGE_ALL");
+		fjs_lpt_age_all = e && e[0] == '1';
+	}
+	return fjs_lpt_age_all;
+}
+static inline uint64_t fjs_lpt_age_ns(lithe_fork_join_context_t *f)
+{
+	if (__builtin_expect(fjs_lpt_age_mult < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_LPT_AGE_MULT");
+		fjs_lpt_age_mult = e ? atoi(e) : 1;
+	}
+	if (fjs_lpt_age_mult == 0)
+		return FJS_LPT_AGE_NS;
+	/* only contexts with a long-burst prediction compete on burst length;
+	 * unpredicted and polling ones (progress engines) keep the 2 ms age:
+	 * scaling theirs cost hosted GPU ranks 2.5-4 % (ROCr progress contexts). */
+	if (getenv_lpt_age_all() == 0 && (f->lpt_polling || f->lpt_pred_ns == 0))
+		return FJS_LPT_AGE_NS;
+	lithe_fork_join_sched_t *s = (lithe_fork_join_sched_t *)f->context.sched;
+	uint64_t a = __atomic_load_n(&s->lpt_hi_ns, __ATOMIC_RELAXED) * (uint64_t)fjs_lpt_age_mult;
+	return a > FJS_LPT_AGE_NS ? a : FJS_LPT_AGE_NS;
+}
 static inline uint64_t fjs_lpt_key(lithe_fork_join_context_t *f)
 {
 	if (f->lpt_enq_ns) {
 		uint64_t now = fjs_lpt_now();
-		if (now > f->lpt_enq_ns && now - f->lpt_enq_ns > FJS_LPT_AGE_NS)
+		if (now > f->lpt_enq_ns && now - f->lpt_enq_ns > fjs_lpt_age_ns(f))
 			return (1ull << 62) + (now - f->lpt_enq_ns);
 	}
 	return f->lpt_polling ? 0 : f->lpt_pred_ns;
