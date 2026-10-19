@@ -167,6 +167,13 @@ static void st_init_once(void)
 		unsigned long v = strtoul(e, &end, 10);
 		if (end != e && v >= 64 && v <= (1ul << 20))
 			cap = (unsigned int)v;
+		else if (end != e && v > (1ul << 20)) {
+			/* Used to fall back to the 4096 default silently, so asking for a
+			 * bigger ring gave a 256x smaller one (2026-10-19). Clamp instead. */
+			cap = 1u << 20;
+			fprintf(stderr, "[LITHE_SCHED_TRACE] LITHE_SCHED_TRACE_RING=%lu above "
+			        "max %u; using %u\n", v, cap, cap);
+		}
 	}
 	st_ring_cap = st_next_pow2(cap);
 	st_ring_mask = st_ring_cap - 1;

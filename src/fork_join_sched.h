@@ -158,6 +158,15 @@ typedef struct {
   volatile int warm_go;
   int warm_vcq;
   void *warm_sched;
+  /* LPT dispatch (LITHE_FJS_LPT, fork_join_sched.c): when this context last
+   * started running (ns) and the length of its last run slice >= 100 us, its
+   * predicted compute burst. Appended last so existing field offsets (used by
+   * the lithified libomp) are unchanged. */
+  uint64_t lpt_start_ns;
+  uint64_t lpt_pred_ns;
+  /* set when it yielded after a short slice (polling in a wait loop): ranks
+   * last until it runs a long slice or blocks */
+  int lpt_polling;
 } lithe_fork_join_context_t;
 
 

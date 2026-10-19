@@ -1297,6 +1297,59 @@ void lithe_fork_join_resume_warm(lithe_context_t *c)
 	}
 }
 
+/* LPT dispatch (2026-10-19, GAPS B27). Bulk-synchronous rank contexts become
+ * runnable together (an allreduce releases them all) and the hart order they are
+ * picked in decides the makespan: 4 harts, 4 contexts of 5.2 ms and 4 of 2.7 ms
+ * finish in 7.9 ms if picked all-long-first (or all-short-first) and in ~10.4 ms
+ * when interleaved -- the measured hosted gap against AMPI, whose static block
+ * placement happens to pair one long and one short rank per core. With
+ * LITHE_FJS_LPT=1 a hart takes, among the first LPT_SCAN contexts of a queue,
+ * the one whose last long run slice was longest (longest processing time first,
+ * learned from the previous iteration, no hints). Slices under 100 us (MPI wait
+ * polls, yields) do not update the prediction. Default off for the A/B. */
+#define FJS_LPT_SCAN 16
+#define FJS_LPT_MIN_NS 100000ull
+static int fjs_lpt = -1;
+static inline int fjs_lpt_on(void)
+{
+	if (__builtin_expect(fjs_lpt < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_LPT");
+		fjs_lpt = (e && e[0] == '1');
+	}
+	return fjs_lpt;
+}
+static inline uint64_t fjs_lpt_now(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static inline void fjs_lpt_start(lithe_fork_join_context_t *ctx)
+{
+	if (fjs_lpt_on())
+		ctx->lpt_start_ns = fjs_lpt_now();
+}
+/* A context that YIELDS after a short slice is polling (an MPI wait loop): if it
+ * kept its long-burst priority, LPT would hand the hart straight back to the poller
+ * (trace: a heavy rank re-dequeued every 7 us for 2.5 ms while short ranks with real
+ * work queued). Polling contexts rank last until they run a long slice or block. */
+static inline void fjs_lpt_stop(lithe_fork_join_context_t *ctx, int yielded)
+{
+	if (fjs_lpt_on() && ctx->lpt_start_ns) {
+		uint64_t d = fjs_lpt_now() - ctx->lpt_start_ns;
+		if (d >= FJS_LPT_MIN_NS) {
+			ctx->lpt_pred_ns = d;
+			ctx->lpt_polling = 0;
+		} else {
+			ctx->lpt_polling = yielded;
+		}
+	}
+}
+static inline uint64_t fjs_lpt_key(lithe_fork_join_context_t *f)
+{
+	return f->lpt_polling ? 0 : f->lpt_pred_ns;
+}
+
 static lithe_fork_join_context_t *__thread_dequeue()
 {
 	lithe_fork_join_sched_t *cur = (lithe_fork_join_sched_t *)lithe_sched_current();
@@ -1307,6 +1360,14 @@ static lithe_fork_join_context_t *__thread_dequeue()
 		if (tqsize(vcoreid)) {
 			spin_pdr_lock(&tqlock(vcoreid));
 			ctx = (lithe_fork_join_context_t*) TAILQ_FIRST(&tqueue(vcoreid));
+			if (ctx && fjs_lpt_on()) {
+				lithe_context_t *c = TAILQ_NEXT(&ctx->context, link);
+				for (int k = 1; c && k < FJS_LPT_SCAN; k++, c = TAILQ_NEXT(c, link)) {
+					lithe_fork_join_context_t *f = (lithe_fork_join_context_t *)c;
+					if (fjs_lpt_key(f) > fjs_lpt_key(ctx))
+						ctx = f;
+				}
+			}
 			if (ctx) {
 				TAILQ_REMOVE(&tqueue(vcoreid), &ctx->context, link);
 				tqsize(vcoreid)--;
@@ -1320,13 +1381,61 @@ static lithe_fork_join_context_t *__thread_dequeue()
 		return ctx;
 	}
 
+	/* LPT across ALL queues (B27): picking the longest burst only within the local
+	 * queue left a long context queued behind another on one hart while a free
+	 * hart ran short ones from its own queue (trace: the heavy rank waited 5 ms
+	 * and set the iteration time). Peek every non-empty queue, then remove the
+	 * winner under its queue lock if it is still there; ties go to the local
+	 * queue. One lock per non-empty queue per dispatch: opt-in only. */
+	inline lithe_fork_join_context_t *lpt_pick_global(void)
+	{
+		int me = vcore_id(), mv = (int)max_vcores(), bv = -1;
+		lithe_fork_join_context_t *best = NULL;
+		for (int i = 0; i < mv; i++) {
+			int v = (me + i) % mv;
+			if (tqsize(v) == 0)
+				continue;
+			spin_pdr_lock(&tqlock(v));
+			lithe_context_t *c = TAILQ_FIRST(&tqueue(v));
+			for (int k = 0; c && k < FJS_LPT_SCAN; k++, c = TAILQ_NEXT(c, link)) {
+				lithe_fork_join_context_t *f = (lithe_fork_join_context_t *)c;
+				if (!best || fjs_lpt_key(f) > fjs_lpt_key(best)) {
+					best = f;
+					bv = v;
+				}
+			}
+			spin_pdr_unlock(&tqlock(v));
+		}
+		if (!best)
+			return NULL;
+		lithe_fork_join_context_t *got = NULL;
+		spin_pdr_lock(&tqlock(bv));
+		lithe_context_t *c = TAILQ_FIRST(&tqueue(bv));
+		for (int k = 0; c && k < FJS_LPT_SCAN; k++, c = TAILQ_NEXT(c, link)) {
+			if ((lithe_fork_join_context_t *)c == best) {
+				TAILQ_REMOVE(&tqueue(bv), c, link);
+				tqsize(bv)--;
+				__atomic_fetch_sub(&cur->runnable_count, 1, __ATOMIC_SEQ_CST);
+				got = best;
+				break;
+			}
+		}
+		spin_pdr_unlock(&tqlock(bv));
+		if (got)
+			got->preferred_vcq = me;
+		return got;
+	}
+
 	int vcoreid = vcore_id();
 	lithe_fork_join_context_t *ctx = NULL;
 	int local_tq;
 
 	/* Try and grab a thread from our queue */
 	local_tq = tqsize(vcoreid);
-	ctx = tdequeue(vcoreid);
+	if (fjs_lpt_on())
+		ctx = lpt_pick_global();
+	if (!ctx)
+		ctx = tdequeue(vcoreid);
 	if (ctx && lithe_sched_trace_enabled()) {
 		lithe_sched_trace_emit(LITHE_ST_DEQUEUE_LOCAL, cur,
 		                       (uint32_t)ctx->context.id, LITHE_ST_DEC_OK,
@@ -1768,6 +1877,9 @@ void lithe_fork_join_context_init(lithe_fork_join_sched_t *sched,
   ctx->warm_go = 0;
   ctx->warm_vcq = -1;
   ctx->warm_sched = NULL;
+  ctx->lpt_start_ns = 0;
+  ctx->lpt_pred_ns = 0;
+  ctx->lpt_polling = 0;
 
   void start_routine_wrapper(void *arg)
   {
@@ -2165,6 +2277,7 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
     if (w != NULL) {
       assert(w->context.uth.tls_desc != NULL);
       w->state = FJS_CTX_RUNNING;
+      fjs_lpt_start(w);
       if (lithe_sched_trace_enabled())
         lithe_sched_trace_emit(LITHE_ST_WARM_CLAIM, sched,
                                (uint32_t)w->context.id, LITHE_ST_DEC_OK, 0);
@@ -2193,6 +2306,7 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
     }
     assert(ctx->state == FJS_CTX_RUNNABLE);
     ctx->state = FJS_CTX_RUNNING;
+    fjs_lpt_start(ctx);
     fjs_stats_run_enter();
     __atomic_fetch_add(&sched->running_count, 1, __ATOMIC_SEQ_CST);
       fjs_vc_set_busy(1);
@@ -2652,6 +2766,7 @@ void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
 		fjs_yield_streak[vcore_id()] = 0; /* streak = consecutive yields */
 	lithe_fork_join_context_t *ctx = (void*)c;
 	assert(ctx->state == FJS_CTX_RUNNING);
+	fjs_lpt_stop(ctx, 0);
 	ctx->state = FJS_CTX_BLOCKED;
 	fjs_stats_run_leave();
 	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
@@ -2701,6 +2816,7 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 {
 	lithe_fork_join_context_t *ctx = (void*)c;
 	assert(ctx->state == FJS_CTX_RUNNING);
+	fjs_lpt_stop(ctx, 1);
 	fjs_stats_run_leave();
 	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
 	                   __ATOMIC_SEQ_CST);
