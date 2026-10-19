@@ -405,10 +405,10 @@ AUTOCONF = ${SHELL} /p/lustre5/evans117/lithe-docker/src/lithe/build-aux/missing
 AUTOHEADER = ${SHELL} /p/lustre5/evans117/lithe-docker/src/lithe/build-aux/missing autoheader
 AUTOMAKE = ${SHELL} /p/lustre5/evans117/lithe-docker/src/lithe/build-aux/missing automake-1.16
 AWK = gawk
-CC = /p/lustre5/evans117/lithe-docker/src/lithe/build-aux/compile gcc
+CC = gcc
 CCDEPMODE = depmode=gcc3
 CFLAGS = -O2 -g -fno-omit-frame-pointer -I/p/lustre5/evans117/lithe-docker/install-lithe/include
-CPP = /p/lustre5/evans117/lithe-docker/src/lithe/build-aux/compile gcc -E
+CPP = gcc -E
 CPPFLAGS = 
 CXX = g++
 CXXCPP = g++ -E
@@ -582,10 +582,10 @@ lib_LTLIBRARIES = liblithe.la
 liblithe_la_CFLAGS = $(AM_CFLAGS)
 liblithe_la_CXXFLAGS = $(AM_CXXFLAGS)
 liblithe_la_SOURCES = $(LIB_CFILES) $(LIB_HFILES)
-liblithe_la_LIBADD = $(LPARLIB)
+liblithe_la_LIBADD = $(LPARLIB) -ldl
 # Exclude C++ files to make it a pure C library
 # liblithe_la_SOURCES += $(LIB_CXXFILES) $(LIB_HHFILES)
-#liblithe_la_LIBADD = $(LPARLIB) -lpthread
+#liblithe_la_LIBADD = $(LPARLIB) -lpthread -ldl
 #liblithe_la_LDFLAGS = -all-static 
 
 # Setup a directory where all of the include files will be installed

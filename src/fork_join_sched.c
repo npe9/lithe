@@ -1325,15 +1325,19 @@ void lithe_fork_join_resume_warm(lithe_context_t *c)
  * LITHE_FJS_LPT=1 a hart takes, among the first LPT_SCAN contexts of a queue,
  * the one whose last long run slice was longest (longest processing time first,
  * learned from the previous iteration, no hints). Slices under 100 us (MPI wait
- * polls, yields) do not update the prediction. Default off for the A/B. */
+ * polls, yields) do not update the prediction. Default on (see fjs_lpt_on). */
 #define FJS_LPT_SCAN 16
 #define FJS_LPT_MIN_NS 100000ull
 static int fjs_lpt = -1;
 static inline int fjs_lpt_on(void)
 {
 	if (__builtin_expect(fjs_lpt < 0, 0)) {
+		/* Default ON since 2026-10-19: with lpt_ranked_queued gating the scan it
+		 * costs nothing on fine-grained work (nested OpenMP, region cost, hosted
+		 * MPI+OpenMP unchanged) and the HPDC login suite (7 apps, NP=2 OMP=4, 3
+		 * reps) is neutral; hosted ranks gain 7-12 %. LITHE_FJS_LPT=0 disables. */
 		const char *e = getenv("LITHE_FJS_LPT");
-		fjs_lpt = (e && e[0] == '1');
+		fjs_lpt = !(e && e[0] == '0');
 	}
 	return fjs_lpt;
 }
