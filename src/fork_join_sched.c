@@ -892,10 +892,17 @@ static int get_next_queue_id()
 
 static inline int fjs_lpt_on(void);
 static inline uint64_t fjs_lpt_key(lithe_fork_join_context_t *f);
+static inline uint64_t fjs_lpt_now(void);
 /* Under the queue lock: keep lpt_ranked_queued = queued contexts with a key. */
 static inline void fjs_lpt_count_in(lithe_fork_join_sched_t *sched, lithe_fork_join_context_t *ctx)
 {
-	if (fjs_lpt_on() && fjs_lpt_key(ctx) > 0) {
+	if (!fjs_lpt_on())
+		return;
+	ctx->lpt_enq_ns = fjs_lpt_now();
+	/* Count every queued context while any context in this scheduler has a prediction,
+	 * so the aging check also runs for unranked ones; a scheduler with no predictions
+	 * at all (fine-grained OpenMP) keeps the zero-cost fast path. */
+	if (fjs_lpt_key(ctx) > 0 || __atomic_load_n(&sched->lpt_ranked_queued, __ATOMIC_RELAXED) > 0) {
 		ctx->lpt_counted = 1;
 		__atomic_fetch_add(&sched->lpt_ranked_queued, 1, __ATOMIC_RELAXED);
 	}
@@ -1373,8 +1380,18 @@ static inline void fjs_lpt_stop(lithe_fork_join_context_t *ctx, int yielded)
 		}
 	}
 }
+/* AGING (2026-10-19): without it a context with no prediction could wait forever while
+ * others with predictions kept being runnable -- StarPU workers + an OpenMP team in one
+ * process hung (LITHE_FJS_LPT=0 ran it in 0.05 s). A context queued longer than
+ * FJS_LPT_AGE_NS outranks every prediction, oldest first. */
+#define FJS_LPT_AGE_NS 2000000ull
 static inline uint64_t fjs_lpt_key(lithe_fork_join_context_t *f)
 {
+	if (f->lpt_enq_ns) {
+		uint64_t now = fjs_lpt_now();
+		if (now > f->lpt_enq_ns && now - f->lpt_enq_ns > FJS_LPT_AGE_NS)
+			return (1ull << 62) + (now - f->lpt_enq_ns);
+	}
 	return f->lpt_polling ? 0 : f->lpt_pred_ns;
 }
 

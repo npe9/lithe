@@ -175,6 +175,8 @@ typedef struct {
   int daemon;
   /* counted in its scheduler's lpt_ranked_queued while queued */
   int lpt_counted;
+  /* when it was last enqueued (ns): LPT ages queued contexts so none starves */
+  uint64_t lpt_enq_ns;
 } lithe_fork_join_context_t;
 
 
