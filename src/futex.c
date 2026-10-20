@@ -6,6 +6,7 @@
 #include "lithe.h"
 #include "futex.h"
 #include <time.h>
+#include <limits.h>
 #include <parlib/reactor.h>
 
 struct futex_list;
@@ -86,15 +87,17 @@ static void __futex_timeout(void *arg)
   lithe_context_unblock(e->context);
 }
 
-/* A waker took e off the list: unblock it unless it already timed out. */
-static inline int __futex_claim(struct futex_element *e)
+/* Claim e for a waker: WAITING -> WOKEN. Called UNDER e->list->lock. A waiter whose
+ * timeout won (TIMEDOUT) is dropped: its timer callback takes this lock after us and
+ * unblocks it, and the waker never touches e again once the lock is released, because
+ * that waiter may resume and reuse its stack element (2026-10-20: claiming after the
+ * unlock read a reused element and double-unblocked, corrupting the list: tf.c (d)). */
+static inline int __futex_claim_locked(struct futex_element *e)
 {
   int exp = FX_WAITING;
-  if (!__atomic_compare_exchange_n(&e->state, &exp, FX_WOKEN, false,
-                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-    return 0;
-  lithe_context_unblock(e->context);
-  return 1;
+  e->on_list = 0;
+  return __atomic_compare_exchange_n(&e->state, &exp, FX_WOKEN, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
 /* lithe_context_block callback.  Atomically checks uaddr == val and blocks. */
@@ -112,6 +115,7 @@ static void __futex_block(lithe_context_t *context, void *arg) {
         e->deadline_ns = 0;   /* no reactor: untimed */
     } else {
       block = false;
+      e->deadline_ns = 0;   /* no timer was started: the caller must not cancel one */
     }
   spinlock_unlock(&e->list->lock);
 
@@ -165,29 +169,30 @@ int futex_wait_timeout(int *uaddr, int val, const struct timespec *rel)
 int futex_wake_one(int *uaddr)
 {
   struct futex_list *list = get_futex_list(uaddr);
-  for (;;) {
-    spinlock_lock(&list->lock);
-      struct futex_element *e = STAILQ_FIRST(&list->tailq);
-      if (e != NULL) {
-        STAILQ_REMOVE_HEAD(&list->tailq, next);
-        e->on_list = 0;
-      }
-    spinlock_unlock(&list->lock);
-    if (e == NULL)
-      return 0;
-    if (__futex_claim(e))
-      return 1;
-    /* it timed out under us: wake the next one instead */
-  }
+  struct futex_element *e;
+  spinlock_lock(&list->lock);
+    while ((e = STAILQ_FIRST(&list->tailq)) != NULL) {
+      STAILQ_REMOVE_HEAD(&list->tailq, next);
+      if (__futex_claim_locked(e))
+        break;
+      /* it timed out under us: wake the next one instead */
+    }
+  spinlock_unlock(&list->lock);
+  if (e == NULL)
+    return 0;
+  lithe_context_unblock(e->context);
+  return 1;
 }
 
+/* Unblock the claimed waiters on q (they cannot resume before this, so q is valid). */
 static inline int unblock_futex_queue(struct futex_tailq *q)
 {
   int num = 0;
   struct futex_element *e,*n;
   for (e = STAILQ_FIRST(q); e != NULL; e = n) {
     n = STAILQ_NEXT(e, next);
-    num += __futex_claim(e);
+    lithe_context_unblock(e->context);
+    num++;
   }
 
   return num;
@@ -195,17 +200,7 @@ static inline int unblock_futex_queue(struct futex_tailq *q)
 
 int futex_wake_all(int *uaddr)
 {
-  struct futex_list *list = get_futex_list(uaddr);
-  struct futex_element *e;
-
-  spinlock_lock(&list->lock);
-    STAILQ_FOREACH(e, &list->tailq, next)
-      e->on_list = 0;
-    struct futex_tailq q = list->tailq;
-    STAILQ_INIT(&list->tailq);
-  spinlock_unlock(&list->lock);
-
-  return unblock_futex_queue(&q);
+  return futex_wake_some(uaddr, INT_MAX);
 }
 
 int futex_wake_some(int *uaddr, int count)
@@ -215,11 +210,13 @@ int futex_wake_some(int *uaddr, int count)
   struct futex_element *e;
 
   spinlock_lock(&list->lock);
-    /* Remove up to count entries from the queue, and remeber them locally. */
-    while (count-- > 0 && (e = STAILQ_FIRST(&list->tailq)) != NULL) {
+    /* Remove up to count claimable entries from the queue, and remember them locally. */
+    while (count > 0 && (e = STAILQ_FIRST(&list->tailq)) != NULL) {
       STAILQ_REMOVE_HEAD(&list->tailq, next);
-      e->on_list = 0;
-      STAILQ_INSERT_TAIL(&q, e, next);
+      if (__futex_claim_locked(e)) {
+        STAILQ_INSERT_TAIL(&q, e, next);
+        count--;
+      }
     }
   spinlock_unlock(&list->lock);
 
