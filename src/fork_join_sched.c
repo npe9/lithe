@@ -133,8 +133,40 @@ static void fjs_interfere_atexit(void)
 	fflush(stderr);
 }
 
+/* LITHE_FJS_WAKE_PARKED_ONLY (2026-10-20, DEFAULT ON; =0 restores): poke the reactor
+ * only when a hart is parked in it. The `pending > 0` disjunct below makes EVERY context yield and
+ * enqueue write the wake eventfd while any reactor waiter exists -- always, in a
+ * hosted MPI process (the PMIx progress context sits on its fd), and whenever a
+ * timer is pending (perf: a PaRSEC park bounded by a never-firing 10 ms timed futex
+ * put 1136 samples of eventfd writes under fjs context_yield, OpenMP co-tenant
+ * window 0.146 -> 0.158-0.165). The disjunct closed one race: the infinite driver
+ * (drive_parked(-1)) registered and blocked without rechecking the run queue, so a
+ * yielder that read parked_harts == 0 just before the increment left its context
+ * queued behind a sleeping driver. Under the gate the driver rechecks like the timed
+ * parks, and the waker fences between its enqueue and the parked_harts load (Dekker:
+ * one side sees the other). Measured (5 interleaved reps, login node): hosted
+ * MPI+OpenMP CG 0.0176-0.0189 -> 0.0115-0.0120 s, serial hosted CG 0.0082-0.0085 ->
+ * 0.0079-0.0080, hosted allreduce 64 KiB 46.0-46.5 -> 39.1-39.6 us/op, halo 4 KiB
+ * 36.5-36.9 -> 27.5-27.9; GPU ranks, hosted ranks K=8, HPX/StarPU/nested OpenMP
+ * unchanged; PaRSEC timed park 0.158-0.168 -> 0.147-0.149 (= untimed). Integration,
+ * stress, connect/sleep/timed-futex reproducers clean with it on. */
+static int fjs_wake_parked_only = -1;
+static inline int fjs_wake_parked_only_on(void)
+{
+	if (fjs_wake_parked_only < 0) {
+		const char *e = getenv("LITHE_FJS_WAKE_PARKED_ONLY");
+		fjs_wake_parked_only = !(e && e[0] == '0');
+	}
+	return fjs_wake_parked_only;
+}
 static inline void fjs_maybe_reactor_wake(void)
 {
+	if (fjs_wake_parked_only_on()) {
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		if (__atomic_load_n(&fjs_reactor_parked_harts, __ATOMIC_SEQ_CST) > 0)
+			parlib_reactor_wake();
+		return;
+	}
 	if (__atomic_load_n(&fjs_reactor_parked_harts, __ATOMIC_ACQUIRE) > 0 ||
 	    parlib_reactor_pending() > 0)
 		parlib_reactor_wake();
@@ -144,7 +176,15 @@ static inline void fjs_maybe_reactor_wake(void)
 static inline int fjs_reactor_drive_parked(lithe_fork_join_sched_t *sched,
                                           int my_vc, int timeout_ms)
 {
-	__atomic_fetch_add(&fjs_reactor_parked_harts, 1, __ATOMIC_ACQ_REL);
+	__atomic_fetch_add(&fjs_reactor_parked_harts, 1, __ATOMIC_SEQ_CST);
+	if (timeout_ms < 0 && fjs_wake_parked_only_on() &&
+	    (tqsize_s(sched, my_vc) > 0 ||
+	     __atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 0 ||
+	     __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) > 0)) {
+		/* the infinite driver's recheck (see fjs_maybe_reactor_wake) */
+		__atomic_fetch_sub(&fjs_reactor_parked_harts, 1, __ATOMIC_ACQ_REL);
+		return 1;
+	}
 	if (timeout_ms >= 0 &&
 	    (parlib_reactor_pending() > 0 ||
 	     tqsize_s(sched, my_vc) > 0 ||
