@@ -18,6 +18,12 @@ int futex(int *uaddr, int op, int val, const struct timespec *timeout,
  * futex(uaddr, FUTEX_WAIT, val, NULL, NULL, 0) */
 int futex_wait(int *uaddr, int val);
 
+/* futex_wait with a relative timeout (NULL = forever): 0 when woken or *uaddr !=
+ * val, -1 with errno ETIMEDOUT when the timeout passed first. The timeout is a
+ * timer on parlib's reactor queue, not a kernel wait: the hart runs other
+ * contexts meanwhile. */
+int futex_wait_timeout(int *uaddr, int val, const struct timespec *rel);
+
 
 /* Variants on the wakeup call, optimized for the most common cases of wake
  * one or wake all.*/
