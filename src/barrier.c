@@ -87,7 +87,17 @@ void lithe_barrier_wait(lithe_barrier_t *barrier)
     /* Spin only when the barrier is not oversubscribed. With more contexts
      * than vcores, spinning burns the harts that should run the missing
      * arrivals; parking lets the scheduler make progress. */
-    const int MAXSTALLS = (barrier->N <= max_vcores()) ? 1000 : 0;
+    /* LITHE_BARRIER_SPINS (2026-10-20, A/B; default 1000): spins before
+     * blocking. 1000 PAUSEs are tens of us; hosted miniFE's per-iteration
+     * compute is ~150 us at 32^3, so ranks blocked in every dot-product
+     * barrier and paid a 230 us p50 wake->dispatch (Perfetto). */
+    static int spins = -1;
+    if (spins < 0) {
+      const char *e = getenv("LITHE_BARRIER_SPINS");
+      int v = e ? atoi(e) : 1000;
+      spins = v >= 0 ? v : 1000;
+    }
+    const int MAXSTALLS = (barrier->N <= max_vcores()) ? spins : 0;
     int nstalls = 0;
     while (barrier->signals[id].val == wait) { 
       nstalls++;

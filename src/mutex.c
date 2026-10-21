@@ -142,6 +142,35 @@ int lithe_mutex_lock(lithe_mutex_t *mutex)
         lithe_mutex_ensure_queue(mutex);
         continue;
       }
+      /* LITHE_MUTEX_SPIN=n (2026-10-20, default 256; 0 = block at once): poll
+       * the flag up to n times without the queue lock before blocking. The OMPI
+       * request-completion mutex (ompi_sync_wait_mt) is held for a few hundred
+       * ns, but a contended lock blocked the context and the unlock unblocked
+       * it through the scheduler and a hart wake: 2/3 of the syscalls of a
+       * hosted 8-byte allreduce. 4 reps, login node: hosted allreduce 64 KiB
+       * 22.3-22.6 -> 15.2-15.5 us/op, halo 4 KiB 16.2 -> 10.5, miniFE serial
+       * 32^3 CG 0.0178-0.0182 -> 0.0168-0.0174; hosted MPI+OpenMP, GPU ranks,
+       * ranks K=8, nested OpenMP, PaRSEC + OpenMP unchanged. 2048/16384 no
+       * better than 256. */
+      {
+        static int spin = -1;
+        if (spin < 0) {
+          const char *e = getenv("LITHE_MUTEX_SPIN");
+          int v = e ? atoi(e) : 256;
+          spin = v > 0 ? v : 0;
+        }
+        if (spin > 0) {
+          mcs_pdr_unlock(&mutex->lock, &qnode);
+          for (int i = 0; i < spin &&
+                          __atomic_load_n(&mutex->locked, __ATOMIC_ACQUIRE); i++)
+            cpu_relax();
+          memset(&qnode, 0, sizeof(mcs_lock_qnode_t));
+          mcs_pdr_lock(&mutex->lock, &qnode);
+          lithe_mutex_ensure_queue(mutex);
+          if (!mutex->locked)
+            continue;
+        }
+      }
       mutex->qnode = &qnode;
       lithe_context_block(block, mutex);
 
