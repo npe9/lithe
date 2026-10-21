@@ -960,6 +960,32 @@ static inline void fjs_lpt_count_out(lithe_fork_join_sched_t *sched, lithe_fork_
 	}
 }
 
+/* LITHE_FJS_STEAL_DELAY_US (2026-10-21, default 0 = off): another hart may take a
+ * queued context (steal, or LPT's global pick) only once it has waited this long in
+ * its home queue, so a context woken while its home hart is briefly busy goes back to
+ * the hart whose caches hold its data. Hosted MPI+OpenMP 2 ranks x 2 threads: the
+ * SpMV kernel ran 24 % more cycles than vanilla on the same work, with OpenMP contexts
+ * moving between harts every few regions (GAPS C18). Stealing stays possible after
+ * the delay, so nothing starves (LITHE_FJS_STEAL=none + LPT off hung at CG iter 3). */
+static uint64_t fjs_steal_delay_ns = (uint64_t)-1;
+static inline uint64_t fjs_lpt_now(void);
+static inline uint64_t fjs_steal_delay(void)
+{
+	uint64_t d = __atomic_load_n(&fjs_steal_delay_ns, __ATOMIC_RELAXED);
+	if (d == (uint64_t)-1) {
+		const char *e = getenv("LITHE_FJS_STEAL_DELAY_US");
+		d = e ? (uint64_t)strtoull(e, NULL, 10) * 1000ull : 0;
+		__atomic_store_n(&fjs_steal_delay_ns, d, __ATOMIC_RELAXED);
+	}
+	return d;
+}
+/* Under tqlock: may a hart other than the home one take this queued context? */
+static inline bool fjs_steal_ok(lithe_fork_join_context_t *f)
+{
+	uint64_t d = fjs_steal_delay();
+	return d == 0 || f->lpt_enq_ns == 0 || fjs_lpt_now() - f->lpt_enq_ns >= d;
+}
+
 static int __thread_enqueue_on(lithe_fork_join_sched_t *sched,
                                lithe_fork_join_context_t *ctx, bool athead)
 {
@@ -977,6 +1003,8 @@ static int __thread_enqueue_on(lithe_fork_join_sched_t *sched,
 		TAILQ_INSERT_TAIL(&tqueue_s(sched, vcoreid), &ctx->context, link);
 	tqsize_s(sched, vcoreid)++;
 	fjs_lpt_count_in(sched, ctx);
+	if (fjs_steal_delay() && !fjs_lpt_on())
+		ctx->lpt_enq_ns = fjs_lpt_now(); /* queued-since, as LPT records it */
 	/* CHANGE 1: bump the O(1) any-runnable indicator under tqlock, so any
 	 * vcore that could find this context in the queue also observes count>0. */
 	__atomic_fetch_add(&sched->runnable_count, 1, __ATOMIC_SEQ_CST);
@@ -1566,6 +1594,8 @@ static lithe_fork_join_context_t *__thread_dequeue()
 			lithe_context_t *c = TAILQ_FIRST(&tqueue(v));
 			for (int k = 0; c && k < FJS_LPT_SCAN; k++, c = TAILQ_NEXT(c, link)) {
 				lithe_fork_join_context_t *f = (lithe_fork_join_context_t *)c;
+				if (v != me && !fjs_steal_ok(f))
+					continue;
 				if (!best || fjs_lpt_key(f) > fjs_lpt_key(best)) {
 					best = f;
 					bv = v;
@@ -1640,6 +1670,16 @@ static lithe_fork_join_context_t *__thread_dequeue()
 		{
 			lithe_fork_join_context_t *ctx = NULL;
 			int num_to_steal = (tqsize(vcoreid) + 1) / 2;
+			if (num_to_steal && fjs_steal_delay()) {
+				lithe_context_t *h;
+				bool ok;
+				spin_pdr_lock(&tqlock(vcoreid));
+				h = TAILQ_FIRST(&tqueue(vcoreid));
+				ok = h && fjs_steal_ok((lithe_fork_join_context_t *)h);
+				spin_pdr_unlock(&tqlock(vcoreid));
+				if (!ok)
+					return NULL;
+			}
 			if (num_to_steal) {
 				ctx = tdequeue(vcoreid);
 				if (ctx) {
