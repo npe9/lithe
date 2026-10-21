@@ -3035,12 +3035,30 @@ void lithe_fork_join_sched_context_unblock(lithe_sched_t *__this,
 	schedule_context(ctx, false);
 }
 
+/* lithe_fork_join_context_yield_ranked: per-vcore flag read by the yield callback,
+ * which runs on the same vcore right after the context switches out. */
+static int fjs_yield_ranked[FJS_MAX_SLICE_VC];
+void lithe_fork_join_context_yield_ranked(void)
+{
+	int v = vcore_id();
+	if (v >= 0 && v < FJS_MAX_SLICE_VC)
+		fjs_yield_ranked[v] = 1;
+	lithe_context_yield();
+}
+
 void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
                                          lithe_context_t *c)
 {
 	lithe_fork_join_context_t *ctx = (void*)c;
 	assert(ctx->state == FJS_CTX_RUNNING);
-	fjs_lpt_stop(ctx, 1);
+	{
+		int v = vcore_id(), ranked = 0;
+		if (v >= 0 && v < FJS_MAX_SLICE_VC && fjs_yield_ranked[v]) {
+			fjs_yield_ranked[v] = 0;
+			ranked = 1;
+		}
+		fjs_lpt_stop(ctx, ranked ? 0 : 1);
+	}
 	fjs_stats_run_leave();
 	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
 	                   __ATOMIC_SEQ_CST);
