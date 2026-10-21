@@ -151,6 +151,11 @@ static void fjs_interfere_atexit(void)
  * unchanged; PaRSEC timed park 0.158-0.168 -> 0.147-0.149 (= untimed). Integration,
  * stress, connect/sleep/timed-futex reproducers clean with it on. */
 static int fjs_wake_parked_only = -1;
+/* For base_hart_request (lithe.c): harts parked in the reactor right now. */
+int lithe_fjs_reactor_parked_harts(void)
+{
+	return __atomic_load_n(&fjs_reactor_parked_harts, __ATOMIC_SEQ_CST);
+}
 static inline int fjs_wake_parked_only_on(void)
 {
 	if (fjs_wake_parked_only < 0) {

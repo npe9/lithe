@@ -505,6 +505,28 @@ static void base_child_exited(lithe_sched_t *__this, lithe_sched_t *child)
   root_sched = NULL;
 }
 
+/* LITHE_BASE_WAKE_PARKED_ONLY (2026-10-21, DEFAULT ON; =0 restores): the reactor poke
+ * below wrote the wake eventfd on every hart request with a deficit, even with no
+ * hart parked in the reactor (the only parkers are FJS harts in
+ * fjs_reactor_drive_parked). perf, hosted 4 KiB halo, 4 contexts / 3 harts: 22 %
+ * of the loop's samples in that syscall under lithe_context_unblock ->
+ * schedule_context -> lithe_hart_request. Same fix as C16's
+ * LITHE_FJS_WAKE_PARKED_ONLY for yields. A/B, 4 interleaved reps: halo 4 KiB
+ * 7.6-7.8 -> 5.1-5.2 us, 8 contexts / 3 harts 11.0 -> 6.8-7.3, allreduce 5.6 -> 5.3,
+ * hosted MPI+OpenMP 16^3 (2 threads, VCORE 3) CG 0.0111-0.0113 -> 0.0075-0.0079 s,
+ * serial 32^3 -2 %, ranks K=8 / GPU ranks / miniFE 32^3 unchanged. Stress (with
+ * nbc) ALL CLEAN at 4/3, 8/3, 8/2; 0/400 hang hunts; timed-futex reproducer 10/10. */
+int lithe_fjs_reactor_parked_harts(void);
+static int base_wake_parked_only = -1;
+static inline int base_wake_parked_only_on(void)
+{
+  if (base_wake_parked_only < 0) {
+    const char *e = getenv("LITHE_BASE_WAKE_PARKED_ONLY");
+    base_wake_parked_only = !(e && e[0] == '0');
+  }
+  return base_wake_parked_only;
+}
+
 static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h)
 {
   assert(root_sched == child);
@@ -552,7 +574,16 @@ static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h
      * any already-running vcores parked in reactor_drive don't, so we burn
      * extra OS pthreads on every wireup. parlib_reactor_wake() is a single
      * eventfd write — cheap. */
-    parlib_reactor_wake();
+    if (base_wake_parked_only_on()) {
+      /* Pairs with fjs_reactor_drive_parked: the parker increments
+       * parked_harts and then rechecks the run queue; we enqueued before
+       * getting here, fence, then read the count (Dekker, as in C16). */
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      if (lithe_fjs_reactor_parked_harts() > 0)
+        parlib_reactor_wake();
+    } else {
+      parlib_reactor_wake();
+    }
     maybe_vcore_request(wake_n);
   }
 }
