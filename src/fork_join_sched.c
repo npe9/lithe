@@ -1545,13 +1545,15 @@ static inline int fjs_lpt_scan_ok(lithe_fork_join_sched_t *s)
 	return hi >= lo + (uint64_t)fjs_lpt_gap_ns;
 }
 
-/* LITHE_FJS_YIELD_STEAL=1 (default off, 2026-10-22): a context that yields stays runnable and is
+/* LITHE_FJS_YIELD_STEAL (default ON since 2026-10-22; =0 disables): a context that yields stays runnable and is
  * re-queued on its own hart, so that hart's queue is never empty and the hart never steals: it
  * re-dispatches the yielder (an OpenMP thread spinning at a barrier) while a never-started worker
  * waits in another hart's queue. LAMMPS, 4 OpenMP threads on 2 harts per rank: ~310k sub-2 us
  * re-dispatches of the master per hart, ~1.1k steal attempts in total, 250 vs BOLT 314
  * timesteps/s. With the knob, when the local pick is the context that just yielded on this hart,
- * steal first and fall back to the yielder. */
+ * steal first and fall back to the yielder. Was default off for one SIGSEGV in joblib-nested
+ * scikit-learn; that was libomp's reaper race (GAPS B41), reproduced without this knob and fixed.
+ * Neutral on every other app, the AI modes and hosted ranks (GAPS C19). */
 #define FJS_JY_MAX_VC 1024
 static void *fjs_just_yielded[FJS_JY_MAX_VC];
 static int fjs_yield_steal = -1;
@@ -1559,7 +1561,7 @@ static inline int fjs_yield_steal_on(void)
 {
 	if (__builtin_expect(fjs_yield_steal < 0, 0)) {
 		const char *e = getenv("LITHE_FJS_YIELD_STEAL");
-		fjs_yield_steal = e && e[0] == '1';
+		fjs_yield_steal = !(e && e[0] == '0');
 	}
 	return fjs_yield_steal;
 }
