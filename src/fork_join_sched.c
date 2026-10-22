@@ -1902,16 +1902,27 @@ static void *fjs_fb_helper(void *arg)
     lithe_context_block(fjs_fb_park, NULL);
 }
 
+/* LITHE_FOREIGN_BOOTSTRAP=2: the MAIN thread goes through the helper too and stays a plain OS
+ * thread. As thread0 it runs on hart 0, and any kernel block it then makes (pthread_join, Python
+ * waiting on its worker threads) takes that hart with it: with 2 harts, waves of foreign OpenMP
+ * roots joined by main hung 1/200 (2 harts) and 60/60 (1 hart). Only for processes where nothing
+ * needs main to be a Lithe context -- hosted MPI does (its ranks are contexts started from main). */
+static int fjs_foreign_bootstrap_mode(void)
+{
+  static int mode = -1;
+  if (mode < 0) {
+    const char *e = getenv("LITHE_FOREIGN_BOOTSTRAP");
+    mode = e ? atoi(e) : 1;
+  }
+  return mode;
+}
+
 static int fjs_foreign_first_caller(void)
 {
-  static int enabled = -1;
-  if (enabled < 0) {
-    const char *e = getenv("LITHE_FOREIGN_BOOTSTRAP");
-    enabled = !(e && e[0] == '0');
-  }
-  return enabled && !fjs_fb_is_helper && current_uthread == NULL &&
+  int mode = fjs_foreign_bootstrap_mode();
+  return mode > 0 && !fjs_fb_is_helper && current_uthread == NULL &&
          __atomic_load_n(&lithe_root_fj_sched, __ATOMIC_ACQUIRE) == NULL &&
-         (pid_t)syscall(SYS_gettid) != getpid();
+         (mode >= 2 || (pid_t)syscall(SYS_gettid) != getpid());
 }
 
 static void fjs_foreign_bootstrap(void)
