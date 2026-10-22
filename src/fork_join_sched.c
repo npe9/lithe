@@ -168,6 +168,25 @@ static inline int fjs_spin_before_drive_on(void)
 	}
 	return fjs_spin_before_drive;
 }
+/* LITHE_FJS_WAKE_CHAIN (2026-10-22, GAPS B43): idle harts with no reactor work
+ * all park in the same epoll on the one wake eventfd, and N wakes coalesce into
+ * one eventfd count that the first woken hart drains, so the others sleep out
+ * their 1-64 ms idle-park timeout while contexts sit RUNNABLE. Oversubscribed
+ * With the chain, a hart that wakes from the idle park re-pokes when more
+ * runnable work and more parked harts remain. NEGATIVE RESULT: written for the
+ * B43 tasking stall (8 threads on 4 harts, 1000 regions x 64 tasks, 0.6-90 s),
+ * whose stalls shrank with LITHE_FJS_IDLE_PARK_MAX_MS=1 -- but the chain did not
+ * change them (8 pairs, both arms stalled). B43 was libomp donating the hart at
+ * every ticket-lock release (__kmp_yield_release). Kept, default OFF. */
+static int fjs_wake_chain = -1;
+static inline int fjs_wake_chain_on(void)
+{
+	if (fjs_wake_chain < 0) {
+		const char *e = getenv("LITHE_FJS_WAKE_CHAIN");
+		fjs_wake_chain = (e && *e) ? atoi(e) != 0 : 0;
+	}
+	return fjs_wake_chain;
+}
 static inline int fjs_wake_parked_only_on(void)
 {
 	if (fjs_wake_parked_only < 0) {
@@ -3025,6 +3044,10 @@ idle_park_again:
           idle_park_streak = 0;
           goto restart;
         }
+        if (fjs_wake_chain_on() &&
+            __atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 1 &&
+            __atomic_load_n(&fjs_reactor_parked_harts, __ATOMIC_SEQ_CST) > 0)
+          parlib_reactor_wake(); /* pass the drained poke on */
         if (parlib_reactor_pending() > 0 ||
             tqsize_s(sched, my_vc) > 0 ||
             __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
