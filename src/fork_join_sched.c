@@ -1819,6 +1819,13 @@ static int lithe_root_fj_entered;
  * it belongs to the application. */
 static int lithe_root_fj_adopted;
 
+/* The root fork-join scheduler if one exists, without bootstrapping one (safe from a
+ * foreign thread). */
+lithe_fork_join_sched_t *lithe_root_fork_join_sched_if_any(void)
+{
+  return __atomic_load_n(&lithe_root_fj_sched, __ATOMIC_ACQUIRE);
+}
+
 lithe_fork_join_sched_t *lithe_ensure_root_fork_join_sched(void)
 {
   /* Base bootstrap (owned by lithe/parlib, idempotent): main -> vcore 0 +

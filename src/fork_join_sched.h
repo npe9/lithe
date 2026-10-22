@@ -232,6 +232,8 @@ void lithe_fork_join_resume_warm(lithe_context_t *ctx);
  * child schedulers under it. See the lithe-bootstrap-any-runtime-combination
  * rule. NULL only if scheduler allocation failed. */
 lithe_fork_join_sched_t *lithe_ensure_root_fork_join_sched(void);
+/* The root fork-join scheduler if one exists; never bootstraps (foreign-thread safe). */
+lithe_fork_join_sched_t *lithe_root_fork_join_sched_if_any(void);
 /* Whether the root FJ sched has been entered (non-zero) yet. */
 int lithe_root_fork_join_sched_entered(void);
 

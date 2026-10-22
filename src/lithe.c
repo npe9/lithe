@@ -874,9 +874,22 @@ void lithe_sched_exit()
   }
 }
 
+struct lithe_fork_join_sched;
+struct lithe_fork_join_sched *lithe_root_fork_join_sched_if_any(void);
+
 void lithe_hart_request(int h)
 {
-  assert(current_sched);
+  if (current_sched == NULL) {
+    /* A foreign thread (a plain pthread, e.g. a Python thread calling into an OpenMP
+     * runtime) has no current scheduler. The runtimes put such a caller's workers in the
+     * process's root fork-join scheduler, so attribute the demand there. Lithe libomp's
+     * fork barrier reached here and dereferenced NULL (PyTorch concurrent inference,
+     * scikit-learn under joblib threads; bench/ai/omp_foreign_roots.c). */
+    lithe_sched_t *root = (lithe_sched_t *)lithe_root_fork_join_sched_if_any();
+    if (root != NULL)
+      lithe_hart_request_for(root, h);
+    return;
+  }
   lithe_sched_t *parent = current_sched->parent;
   lithe_sched_t *child = current_sched;
 
