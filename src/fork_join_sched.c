@@ -5,6 +5,9 @@
  */
 
 #include <time.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1826,8 +1829,81 @@ lithe_fork_join_sched_t *lithe_root_fork_join_sched_if_any(void)
   return __atomic_load_n(&lithe_root_fj_sched, __ATOMIC_ACQUIRE);
 }
 
+/* FOREIGN FIRST CALLER (B35, 2026-10-22). The base bootstrap turns its CALLER into thread0:
+ * parlib's vcore_request_init moves the caller's context onto vcore 0's pthread and parks the
+ * caller's OS thread forever. For the main thread that is the design (main's context continues on
+ * vcore 0; exit() ends the process). For any other pthread -- a Python thread making the process's
+ * first OpenMP call -- its start routine then returns on vcore 0's thread and pthread_join on it
+ * never returns (both Lithe runtimes hung). So a non-main first caller does not bootstrap itself:
+ * a lithe-internal helper pthread does, becomes thread0, enters the root, and parks its context
+ * forever as a BLOCKED context (it holds no hart). The caller stays a plain foreign thread and
+ * proceeds as one (B34). The root is never exited, so the parked context is never waited on.
+ * LITHE_FOREIGN_BOOTSTRAP=0 restores the old hijack (A/B). */
+lithe_fork_join_sched_t *lithe_ensure_root_fork_join_sched(void);
+static pthread_mutex_t fjs_fb_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fjs_fb_cond = PTHREAD_COND_INITIALIZER;
+static int fjs_fb_state;  /* 0 none, 1 helper running, 2 done */
+static __thread int fjs_fb_is_helper;
+
+static void fjs_fb_park(lithe_context_t *ctx, void *arg)
+{
+  (void)ctx; (void)arg;  /* never unblocked */
+}
+
+static void *fjs_fb_helper(void *arg)
+{
+  (void)arg;
+  fjs_fb_is_helper = 1;
+  lithe_ensure_root_fork_join_sched();
+  int became_thread0 = current_uthread != NULL;
+  pthread_mutex_lock(&fjs_fb_lock);
+  fjs_fb_state = 2;
+  pthread_cond_broadcast(&fjs_fb_cond);
+  pthread_mutex_unlock(&fjs_fb_lock);
+  if (!became_thread0)
+    return NULL;  /* the main thread won the bootstrap race; nothing to hold */
+  for (;;)
+    lithe_context_block(fjs_fb_park, NULL);
+}
+
+static int fjs_foreign_first_caller(void)
+{
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *e = getenv("LITHE_FOREIGN_BOOTSTRAP");
+    enabled = !(e && e[0] == '0');
+  }
+  return enabled && !fjs_fb_is_helper && current_uthread == NULL &&
+         __atomic_load_n(&lithe_root_fj_sched, __ATOMIC_ACQUIRE) == NULL &&
+         (pid_t)syscall(SYS_gettid) != getpid();
+}
+
+static void fjs_foreign_bootstrap(void)
+{
+  pthread_mutex_lock(&fjs_fb_lock);
+  if (fjs_fb_state == 0) {
+    pthread_t t;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, fjs_fb_helper, NULL) == 0)
+      fjs_fb_state = 1;
+    pthread_attr_destroy(&a);
+  }
+  while (fjs_fb_state == 1)
+    pthread_cond_wait(&fjs_fb_cond, &fjs_fb_lock);
+  pthread_mutex_unlock(&fjs_fb_lock);
+}
+
 lithe_fork_join_sched_t *lithe_ensure_root_fork_join_sched(void)
 {
+  if (fjs_foreign_first_caller()) {
+    fjs_foreign_bootstrap();
+    lithe_fork_join_sched_t *r = __atomic_load_n(&lithe_root_fj_sched, __ATOMIC_ACQUIRE);
+    if (r != NULL)
+      return r;
+    /* helper could not be created: fall through to the old (hijacking) path */
+  }
   /* Base bootstrap (owned by lithe/parlib, idempotent): main -> vcore 0 +
    * parlib vcore pool + base scheduler. Safe to call repeatedly. */
   lithe_ensure_main_on_vcore0();
