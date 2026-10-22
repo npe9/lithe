@@ -159,6 +159,15 @@ int lithe_fjs_reactor_parked_harts(void)
 {
 	return __atomic_load_n(&fjs_reactor_parked_harts, __ATOMIC_SEQ_CST);
 }
+static int fjs_spin_before_drive = -1;
+static inline int fjs_spin_before_drive_on(void)
+{
+	if (fjs_spin_before_drive < 0) {
+		const char *e = getenv("LITHE_FJS_SPIN_BEFORE_DRIVE");
+		fjs_spin_before_drive = !(e && e[0] == '0');
+	}
+	return fjs_spin_before_drive;
+}
 static inline int fjs_wake_parked_only_on(void)
 {
 	if (fjs_wake_parked_only < 0) {
@@ -2850,6 +2859,33 @@ restart:
    * timed park and the surplus yield to parlib, where vcore_request() wakes
    * exactly the vcores asked for through their own futex. */
   fjs_tradespace_init_once();
+  /* LITHE_FJS_SPIN_BEFORE_DRIVE (default ON since 2026-10-22, =0 disables): in a lithified MPI process pending is
+   * never 0, so the driver-slot hart blocked in epoll_wait on every idle moment and each
+   * schedule_context woke it with an eventfd write: LULESH 1 rank x 8 threads on 4 harts made
+   * ~60k write + ~20k epoll_wait + ~20k read per second, ~34 % of samples in the kernel, 1830 vs
+   * 2700 zones/s for the same libomp without lithified MPI (which never parks). Spin for runnable
+   * WORK first (the adaptive budget below; pending>0 alone is not work) and drive only if none
+   * appears. Socket readiness is still served: the driver after the spin, busy harts' timed polls.
+   * A/B (GAPS C20): lithified LULESH over 1792-1866 -> 2618-2735 zones/s (= Lithe libomp preload),
+   * GROMACS over 127-141 -> 159-161 ns/day; balanced cases, XSBench, LAMMPS, CoMD, miniAMR, hosted
+   * miniFE CG unchanged; hosted ranks K=8 8.69 vs 8.84 ms/iter median (9 pairs, within noise). */
+  if (fjs_spin_before_drive_on() && parlib_reactor_pending() > 0) {
+    fjs_hart_enter_spin_init();
+    int my_vc = vcore_id();
+    unsigned int budget = fjs_hart_enter_spin_loops > 0 ? fjs_hart_enter_spin_budget(my_vc) : 0;
+    for (unsigned int i = 0; i < budget; i++) {
+      cpu_relax();
+      if (tqsize_s(sched, my_vc) > 0 ||
+          __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
+          __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0 ||
+          ((i & 1023u) == 0u && fjs_any_child_needs_hart(sched))) {
+        fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
+        goto restart;
+      }
+    }
+    if (budget)
+      fjs_hart_enter_spin_update(my_vc, /*succeeded=*/0);
+  }
   while (parlib_reactor_pending() > 0) {
     if (fjs_reactor_drivers_max > 0) {
       long d = __atomic_load_n(&fjs_reactor_drivers, __ATOMIC_ACQUIRE);
