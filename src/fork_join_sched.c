@@ -1545,6 +1545,25 @@ static inline int fjs_lpt_scan_ok(lithe_fork_join_sched_t *s)
 	return hi >= lo + (uint64_t)fjs_lpt_gap_ns;
 }
 
+/* LITHE_FJS_YIELD_STEAL=1 (default off, 2026-10-22): a context that yields stays runnable and is
+ * re-queued on its own hart, so that hart's queue is never empty and the hart never steals: it
+ * re-dispatches the yielder (an OpenMP thread spinning at a barrier) while a never-started worker
+ * waits in another hart's queue. LAMMPS, 4 OpenMP threads on 2 harts per rank: ~310k sub-2 us
+ * re-dispatches of the master per hart, ~1.1k steal attempts in total, 250 vs BOLT 314
+ * timesteps/s. With the knob, when the local pick is the context that just yielded on this hart,
+ * steal first and fall back to the yielder. */
+#define FJS_JY_MAX_VC 1024
+static void *fjs_just_yielded[FJS_JY_MAX_VC];
+static int fjs_yield_steal = -1;
+static inline int fjs_yield_steal_on(void)
+{
+	if (__builtin_expect(fjs_yield_steal < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_YIELD_STEAL");
+		fjs_yield_steal = e && e[0] == '1';
+	}
+	return fjs_yield_steal;
+}
+
 static lithe_fork_join_context_t *__thread_dequeue()
 {
 	lithe_fork_join_sched_t *cur = (lithe_fork_join_sched_t *)lithe_sched_current();
@@ -1650,6 +1669,17 @@ static lithe_fork_join_context_t *__thread_dequeue()
 	if (fjs_steal_mode != LITHE_FJS_STEAL_DEFAULT)
 		return ctx;
 
+	lithe_fork_join_context_t *yielder = NULL;
+	if (ctx && vcoreid >= 0 && vcoreid < FJS_JY_MAX_VC &&
+	    fjs_just_yielded[vcoreid] == (void *)ctx) {
+		fjs_just_yielded[vcoreid] = NULL;
+		if (fjs_yield_steal_on() &&
+		    __atomic_load_n(&cur->runnable_count, __ATOMIC_ACQUIRE) > 0) {
+			yielder = ctx;
+			ctx = NULL;
+		}
+	}
+
 	/* If there isn't one, try and steal one from someone else's queue.
 	 *
 	 * CHANGE 1 (O(1) dispatch): first consult the global runnable indicator.
@@ -1666,7 +1696,7 @@ static lithe_fork_join_context_t *__thread_dequeue()
 	 * hart_enter which observes the post-increment value -- no lost wakeup. */
 	if (!ctx) {
 		if (__atomic_load_n(&cur->runnable_count, __ATOMIC_ACQUIRE) <= 0)
-			return NULL;
+			return yielder;
 
 		/* Steal up to half of the threads in the queue and return the first */
 		lithe_fork_join_context_t *steal_threads(int vcoreid)
@@ -1760,6 +1790,12 @@ static lithe_fork_join_context_t *__thread_dequeue()
 					                       &cur->runnable_count,
 					                       __ATOMIC_RELAXED));
 		}
+	}
+	if (yielder) {
+		if (ctx)
+			__thread_enqueue_on(cur, yielder, false);  /* stays on this hart's queue */
+		else
+			ctx = yielder;
 	}
 	return ctx;
 }
@@ -3141,6 +3177,8 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 			ranked = 1;
 		}
 		fjs_lpt_stop(ctx, ranked ? 0 : 1);
+		if (v >= 0 && v < FJS_JY_MAX_VC)
+			fjs_just_yielded[v] = ctx;
 	}
 	fjs_stats_run_leave();
 	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
