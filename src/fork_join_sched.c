@@ -3326,3 +3326,58 @@ void lithe_fork_join_sched_context_exit(lithe_sched_t *__this,
       lithe_fork_join_sched_join_one(sched);
   }
 }
+
+/* fork() child (lithe.c lithe_fork_child; 2026-10-22). Reset this fork-join
+ * scheduler and, recursively, its children: no queued context survives (they
+ * were the parent's; the forker is running, not queued), hart counts follow the
+ * one surviving hart -- owned by `cur`, the forker's scheduler, with every edge
+ * on the chain root..cur granted one -- and the join counters forget contexts
+ * that will never exit here. Non-FJS children are left alone. */
+static int fjs_on_chain(lithe_sched_t *s, lithe_sched_t *cur)
+{
+	for (lithe_sched_t *p = cur; p; p = p->parent)
+		if (p == s)
+			return 1;
+	return 0;
+}
+
+static void fjs_after_fork_one(lithe_fork_join_sched_t *s, lithe_sched_t *cur,
+                               int vcoreid, lithe_context_t *keep)
+{
+	int on = fjs_on_chain(&s->sched, cur);
+	int mv = (int)max_vcores();
+	for (int i = 0; i < mv; i++) {
+		TAILQ_INIT(&s->vc_mgmt[i].tqueue);
+		spin_pdr_init(&s->vc_mgmt[i].tqlock);
+		s->vc_mgmt[i].tqsize = 0;
+		s->vc_mgmt[i].vconline = on && i == vcoreid;
+		s->vc_mgmt[i].warm_ctx = NULL;
+	}
+	s->runnable_count = 0;
+	s->warm_ready_count = 0;
+	s->leaving_harts = 0;
+	s->granting_harts = 0;
+	s->lpt_ranked_queued = 0;
+	s->running_count = (&s->sched == cur) ? 1 : 0;
+	s->sched.harts = (parlib_atomic_t)PARLIB_ATOMIC_INITIALIZER(&s->sched == cur ? 1 : 0);
+	s->num_contexts = 1;   /* the scheduler's main context */
+	if (keep && keep->sched == &s->sched && keep != s->sched.main_context &&
+	    !((lithe_fork_join_context_t *)keep)->daemon)
+		s->num_contexts = 2;
+	spin_pdr_init(&s->child_sched_list_lock);
+	lithe_sched_t *c;
+	TAILQ_FOREACH(c, &s->child_sched_list, link) {
+		uint16_t *granted = (uint16_t *)&c->parent_data;
+		uint16_t *needed = (uint16_t *)&c->parent_data + 1;
+		*granted = *needed = fjs_on_chain(c, cur) ? 1 : 0;
+		if (c->funcs == &lithe_fork_join_sched_funcs)
+			fjs_after_fork_one((lithe_fork_join_sched_t *)c, cur, vcoreid, keep);
+	}
+}
+
+void lithe_fork_join_after_fork(lithe_sched_t *root, lithe_sched_t *cur,
+                                int vcoreid, lithe_context_t *keep)
+{
+	if (root && root->funcs == &lithe_fork_join_sched_funcs)
+		fjs_after_fork_one((lithe_fork_join_sched_t *)root, cur, vcoreid, keep);
+}

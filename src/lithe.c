@@ -152,6 +152,13 @@ static void lithe_lib_init_impl(void)
   /* Publish our sched_ops, overriding the defaults */
   sched_ops = &lithe_sched_ops;
 
+  /* fork() support: reset schedulers in the child (see lithe_fork_child). */
+  {
+    extern void lithe_fork_child(int vcoreid);
+    extern void parlib_register_fork_child(void (*fn)(int vcoreid));
+    parlib_register_fork_child(lithe_fork_child);
+  }
+
   /* Tell the parlib I/O reactor how to wake a uthread. The default
    * (uthread_runnable) bypasses lithe's per-context scheduler routing,
    * which trips FJS's "current_sched == ctx->sched" assertion in
@@ -1096,9 +1103,51 @@ void lithe_context_block(void (*func)(lithe_context_t *, void *), void *arg)
   while(parlib_atomic_read(&__arg.safe_to_unblock) == 0);
 }
 
+/* fork() child (parlib vcore.c drives it; 2026-10-22). Only the forking
+ * context exists in a child: every other context's TLS owner (its backing
+ * pthread) is gone and glibc has recycled that memory, and in CPython's model
+ * those threads have vanished. They must never run again -- including when a
+ * waiter list, futex word or timer later "wakes" one (releasing a lock that a
+ * vanished thread was waiting on). Context ids come from a counter, so the
+ * parent's contexts are exactly id < lithe_fork_thresh, minus the forker. */
+static int lithe_fork_thresh = 0;
+static int lithe_fork_keep = -1;
+
+static inline int lithe_context_is_stale(lithe_context_t *c)
+{
+  return lithe_fork_thresh > 0 && c->id < lithe_fork_thresh &&
+         c->id != lithe_fork_keep;
+}
+
+extern void lithe_fork_join_after_fork(lithe_sched_t *root, lithe_sched_t *cur,
+                                       int vcoreid, lithe_context_t *keep);
+
+void lithe_fork_child(int vcoreid)
+{
+  lithe_context_t *cur = vcoreid >= 0 ? current_context : NULL;
+  lithe_fork_thresh = (int)next_context_id;
+  lithe_fork_keep = cur ? cur->id : -1;
+  {
+    extern void lithe_futex_after_fork(void);
+    lithe_futex_after_fork();
+  }
+  /* Hart accounting: the forking hart (if any) is the only one, owned by the
+   * forker's scheduler; base and root demand start from that. */
+  base_sched.harts = (parlib_atomic_t)PARLIB_ATOMIC_INITIALIZER(0);
+  int root_on_chain = 0;
+  for (lithe_sched_t *s = cur ? cur->sched : NULL; s; s = s->parent)
+    if (s == root_sched)
+      root_on_chain = 1;
+  root_sched_harts_needed = (parlib_atomic_t)PARLIB_ATOMIC_INITIALIZER(root_on_chain);
+  if (root_sched)
+    lithe_fork_join_after_fork(root_sched, cur ? cur->sched : NULL, vcoreid, cur);
+}
+
 void lithe_context_unblock(lithe_context_t *context)
 {
   assert(context);
+  if (context == NULL || lithe_context_is_stale(context))
+    return;   /* a parent-process context in a fork() child: never runs */
   lithe_sched_t *sched = current_sched;
   current_sched = context->sched;
   uthread_runnable(&context->uth);

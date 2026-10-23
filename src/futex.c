@@ -71,6 +71,21 @@ static struct futex_list *get_futex_list(int *uaddr)
   return list;
 }
 
+/* fork() child (lithe.c lithe_fork_child): every waiter on every futex queue
+ * is a parent-process context (stale; it never runs here), an element may be
+ * half-built by a hart that was mid-wait at fork time, and a queue lock may be
+ * held by a hart that does not exist here. Empty the queues, reset the locks.
+ * The queue objects themselves stay (keyed by address, reused). */
+void lithe_futex_after_fork(void)
+{
+  struct futex_list *list;
+  spinlock_init(&futex_lists_lock);
+  wfl_foreach_unsafe(list, &futex_lists) {
+    STAILQ_INIT(&list->tailq);
+    spinlock_init(&list->lock);
+  }
+}
+
 static void __futex_timeout(void *arg)
 {
   struct futex_element *e = arg;
