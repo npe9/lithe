@@ -2356,6 +2356,12 @@ static void block_main_context(lithe_context_t *c, void *arg)
 void lithe_fork_join_sched_join_all(lithe_fork_join_sched_t *sched)
 {
   lithe_context_block(block_main_context, sched);
+  /* Take back the main context's own reference (num_contexts starts at 1 for it; the
+   * block above dropped it). Without this a second join_all returned when the first
+   * context of the round finished, and by the third a context exit unblocked main while
+   * it was running: main on two harts at once (2026-10-23, .build_logs/glibc_lithe/joinrep.c:
+   * hung 5/5 at one hart, segfaulted 4/5 at four). */
+  __sync_fetch_and_add(&sched->num_contexts, 1);
 }
 
 void lithe_fork_join_context_migrate(lithe_fork_join_sched_t *from,
