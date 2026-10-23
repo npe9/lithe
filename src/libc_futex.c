@@ -189,16 +189,38 @@ static uint64_t deadline_of(int cmd, int op, const struct timespec *ts)
   return t ? t : 1;
 }
 
+/* Shared (non-private) futexes can be woken by another process or by the kernel (the tid
+ * word cleared at thread exit), which never reach a Lithe waiter: a context waiting on one
+ * parks in slices and re-checks the word, returning 0 (a spurious wakeup, which every futex
+ * caller loops on) when a slice ends. libstdc++'s __cxa_guard and std::condition_variable
+ * wait this way through glibc's syscall() (2026-10-23: a contended static-local init hung a
+ * one-hart process). */
+#define SHARED_SLICE_NS 1000000ull
+/* A wake from inside a signal handler only reaches the kernel's waiters (taking the bucket
+ * lock or unblocking a context there is not async-signal-safe), so private waits also end
+ * every PRIVATE_SLICE_NS and re-check: such a wake costs latency, never a hang. */
+#define PRIVATE_SLICE_NS 50000000ull
+extern int parlib_libc_in_handler(void);
+
 static long lithe_libc_futex(int *uaddr, int op, int val, const struct timespec *ts,
                              int *uaddr2, int val3)
 {
   int cmd = op & FUTEX_CMD_MASK;
-  if (!(op & FUTEX_PRIVATE_FLAG))
-    return raw_futex(uaddr, op, val, ts, uaddr2, val3);
+  int priv = op & FUTEX_PRIVATE_FLAG;
   if ((cmd == FUTEX_WAIT || (cmd == FUTEX_WAIT_BITSET && val3 == (int)FUTEX_BITSET_MATCH_ANY))
-      && lithe_can_block())
-    return lw_wait(uaddr, val, deadline_of(cmd, op, ts));
+      && lithe_can_block()) {
+    if (parlib_libc_in_handler())
+      return raw_futex(uaddr, op, val, ts, uaddr2, val3);
+    uint64_t dl = deadline_of(cmd, op, ts);
+    uint64_t slice = mono_ns() + (priv ? PRIVATE_SLICE_NS : SHARED_SLICE_NS);
+    long r = lw_wait(uaddr, val, dl && dl < slice ? dl : slice);
+    return (r == -ETIMEDOUT && (!dl || dl > slice)) ? 0 : r;
+  }
+  if (!priv && cmd != FUTEX_WAKE)
+    return raw_futex(uaddr, op, val, ts, uaddr2, val3);
   if (cmd == FUTEX_WAKE || (cmd == FUTEX_WAKE_BITSET && val3 == (int)FUTEX_BITSET_MATCH_ANY)) {
+    if (parlib_libc_in_handler())
+      return raw_futex(uaddr, op, val, ts, uaddr2, val3);
     int n = lw_wake(uaddr, val);
     if (n >= val)
       return n;
