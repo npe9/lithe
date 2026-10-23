@@ -187,6 +187,16 @@ static inline int fjs_wake_chain_on(void)
 	}
 	return fjs_wake_chain;
 }
+static int fjs_idle_pending_needs_slot = -1;
+static inline int fjs_idle_pending_needs_slot_on(void)
+{
+	if (fjs_idle_pending_needs_slot < 0) {
+		/* default ON since 2026-10-23 (=0 restores): see fjs_pending_is_work */
+		const char *e = getenv("LITHE_FJS_IDLE_PENDING_NEEDS_SLOT");
+		fjs_idle_pending_needs_slot = (e && *e) ? atoi(e) != 0 : 1;
+	}
+	return fjs_idle_pending_needs_slot;
+}
 static inline int fjs_wake_parked_only_on(void)
 {
 	if (fjs_wake_parked_only < 0) {
@@ -209,6 +219,7 @@ static inline void fjs_maybe_reactor_wake(void)
 }
 
 /* Returns 1 if work appeared before park (caller should restart), 0 after drive. */
+static inline int fjs_pending_is_work(void);
 static inline int fjs_reactor_drive_parked(lithe_fork_join_sched_t *sched,
                                           int my_vc, int timeout_ms)
 {
@@ -221,8 +232,12 @@ static inline int fjs_reactor_drive_parked(lithe_fork_join_sched_t *sched,
 		__atomic_fetch_sub(&fjs_reactor_parked_harts, 1, __ATOMIC_ACQ_REL);
 		return 1;
 	}
+	/* timed (idle) park: a pending waiter another hart is already driving
+	 * is not a reason to skip it -- that bail-out kept the non-driver hart
+	 * of a 2-hart DataLoader worker cycling spin -> park -> restart at
+	 * 98 % CPU (see fjs_pending_is_work). */
 	if (timeout_ms >= 0 &&
-	    (parlib_reactor_pending() > 0 ||
+	    (fjs_pending_is_work() ||
 	     tqsize_s(sched, my_vc) > 0 ||
 	     __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
 	     __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0)) {
@@ -638,6 +653,28 @@ static int fjs_soft_hart_cap = 0;
  * mode (1454 vs 2710-2787 z/s), GROMACS and LAMMPS unchanged. */
 static long fjs_reactor_drivers_max = 1;
 static long fjs_reactor_drivers = 0;
+/* Is a pending reactor waiter work for THIS idle hart? Only if it could take a
+ * driver slot. Default ON since 2026-10-23: lithified CPython at VCORE_LIMIT=4
+ * burned 2.99 s CPU per 1 s time.sleep (three surplus harts spinning on the
+ * sleep's own timer; test_time test_process_time), 0.000 s with the gate.
+ * Under LITHE_FJS_IDLE_PENDING_NEEDS_SLOT=1 (=0 restores) a hart that cannot
+ * drive treats pending>0 as no work at every idle exit (spin-before-drive
+ * entry, adaptive spin, park recheck, leave guard), so it parks and then
+ * yields its hart; the slot holder serves the reactor and wakes contexts
+ * through vcore_request. Before (2026-10-22), every one of those exits
+ * restarted on pending>0, so in a process with any cooperative fd waiter the
+ * surplus harts never left: fork()ed DataLoader workers with 2 harts spun the
+ * second one at 97 % in the spin-before-drive loop and the trainer sharing
+ * their CPUs fell from 24 to 1.5 images/s. */
+static inline int fjs_pending_is_work(void)
+{
+	if (parlib_reactor_pending() <= 0)
+		return 0;
+	if (fjs_idle_pending_needs_slot_on() && fjs_reactor_drivers_max > 0 &&
+	    __atomic_load_n(&fjs_reactor_drivers, __ATOMIC_ACQUIRE) >= fjs_reactor_drivers_max)
+		return 0;
+	return 1;
+}
 /* Park-budget knobs (2026-10-17, audit section 3.5 / 8): how long an idle hart stays
  * resident before it is returned to parlib, and how much surplus is tolerated.
  *   LITHE_FJS_IDLE_PARK_ROUNDS  (default 24): timed-park rounds (1,1,4,4,...,MAX ms) before idle_yield
@@ -2914,7 +2951,7 @@ restart:
    * A/B (GAPS C20): lithified LULESH over 1792-1866 -> 2618-2735 zones/s (= Lithe libomp preload),
    * GROMACS over 127-141 -> 159-161 ns/day; balanced cases, XSBench, LAMMPS, CoMD, miniAMR, hosted
    * miniFE CG unchanged; hosted ranks K=8 8.69 vs 8.84 ms/iter median (9 pairs, within noise). */
-  if (fjs_spin_before_drive_on() && parlib_reactor_pending() > 0) {
+  if (fjs_spin_before_drive_on() && fjs_pending_is_work()) {
     fjs_hart_enter_spin_init();
     int my_vc = vcore_id();
     unsigned int budget = fjs_hart_enter_spin_loops > 0 ? fjs_hart_enter_spin_budget(my_vc) : 0;
@@ -2975,7 +3012,15 @@ restart:
        * child-list peeks go through PLT/spinlock — every-iter pending was
        * ~32% of hosted P1K4 cycles. Sample those every 64th pause. */
       if ((i & 63u) == 0u) {
-        if (parlib_reactor_pending() > 0 || fjs_any_child_needs_hart(sched)) {
+        /* LITHE_FJS_IDLE_PENDING_NEEDS_SLOT (2026-10-22): a pending reactor
+         * waiter is work for this hart only if it can take a driver slot.
+         * Otherwise a hart that lost the slot restarted here, failed the slot
+         * again and looped -- surplus harts never parked while anything
+         * waited on I/O. Fork()ed DataLoader workers (cooperative pipe waits)
+         * then burned the CPUs their trainer shared: lithified PyTorch
+         * dataloader_train 2 vs 20 images/s (worker profile: 56 % in this
+         * function, no syscalls). =0 restores the old test. */
+        if (fjs_pending_is_work() || fjs_any_child_needs_hart(sched)) {
           fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
           if (lithe_sched_trace_enabled())
             lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0,
@@ -3074,7 +3119,7 @@ idle_park_again:
             __atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 1 &&
             __atomic_load_n(&fjs_reactor_parked_harts, __ATOMIC_SEQ_CST) > 0)
           parlib_reactor_wake(); /* pass the drained poke on */
-        if (parlib_reactor_pending() > 0 ||
+        if (fjs_pending_is_work() ||
             tqsize_s(sched, my_vc) > 0 ||
             __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
             __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0 ||
@@ -3178,7 +3223,7 @@ idle_park_again:
   if (__atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 0 ||
       __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) > 0 ||
       tqsize_s(sched, vcore_id()) > 0 ||
-      parlib_reactor_pending() > 0) {
+      fjs_pending_is_work()) {
     long lv = __atomic_load_n(&sched->leaving_harts, __ATOMIC_SEQ_CST);
     while (lv > 0 &&
            !__atomic_compare_exchange_n(&sched->leaving_harts, &lv, lv - 1,
@@ -3378,6 +3423,18 @@ static void fjs_after_fork_one(lithe_fork_join_sched_t *s, lithe_sched_t *cur,
 void lithe_fork_join_after_fork(lithe_sched_t *root, lithe_sched_t *cur,
                                 int vcoreid, lithe_context_t *keep)
 {
+	/* Process-wide hart state belongs to the parent's harts (2026-10-23):
+	 * a hart parked as the reactor driver at fork time left
+	 * fjs_reactor_drivers = 1 in the child, so the child's harts saw the one
+	 * driver slot taken forever, never drove the reactor, and spun in
+	 * hart_enter while every cooperative fd wait went unanswered (lithified
+	 * CPython: Manager-hosted Pool workers forked while faulthandler's
+	 * watchdog parked the driver, test_manager test_apply, 99 % CPU each). */
+	fjs_reactor_drivers = 0;
+	fjs_reactor_parked_harts = 0;
+	fjs_running = 0;
+	memset(fjs_vc_busy, 0, sizeof(fjs_vc_busy));
+	memset(fjs_yield_streak, 0, sizeof(fjs_yield_streak));
 	if (root && root->funcs == &lithe_fork_join_sched_funcs)
 		fjs_after_fork_one((lithe_fork_join_sched_t *)root, cur, vcoreid, keep);
 }
