@@ -3098,7 +3098,10 @@ restart:
     }
     if (is_surplus) {
       /* Surplus: yield immediately after demand release (below). */
-    } else if (parlib_reactor_ensure_init() == 0) {
+    } else if (parlib_reactor_initialized()) {
+      /* (only a reactor someone uses: an idle hart creating one opened three fds in every
+       * process -- 2026-10-23, a file-read offload parked main at interpreter start and
+       * CPython test_close_fds saw the epoll/eventfd/timerfd in exec'd children) */
       static __thread unsigned idle_park_streak;
       int my_vc = vcore_id();
 idle_park_again:
