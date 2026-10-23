@@ -14,6 +14,7 @@ LIB_CFILES = \
   @SRCDIR@/condvar.c         \
   @SRCDIR@/semaphore.c         \
   @SRCDIR@/futex.c         \
+  @SRCDIR@/libc_futex.c    \
   @SRCDIR@/mutex.c \
   @SRCDIR@/sched_trace.c \
   @SRCDIR@/fork_join_sched.c

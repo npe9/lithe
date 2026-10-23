@@ -168,6 +168,13 @@ static void lithe_lib_init_impl(void)
   parlib_reactor_set_unblock_fn(
       (parlib_reactor_unblock_fn_t)lithe_context_unblock);
 
+  /* Lithe glibc: libc's own lock waits park contexts, not harts (libc_futex.c;
+   * LITHE_LIBC_FUTEX=1, default off). */
+  {
+    extern void lithe_libc_futex_init(void);
+    lithe_libc_futex_init();
+  }
+
   /* Handle syscall events. */
   /* These functions are declared in parlib for simulating async syscalls on linux */
   ev_handlers[EV_SYSCALL] = lithe_handle_syscall;
@@ -944,6 +951,8 @@ static void __lithe_context_yield(uthread_t *uthread, void *arg)
   current_sched->funcs->context_yield(current_sched, context);
 }
 
+extern void parlib_libc_context_gone(void *tcb);   /* parlib libc_lithe.c */
+
 static void __lithe_context_finished(uthread_t *uthread, void *__arg)
 {
   assert(uthread);
@@ -952,6 +961,9 @@ static void __lithe_context_finished(uthread_t *uthread, void *__arg)
   assert(in_vcore_context());
 
   lithe_context_t *context = (lithe_context_t*)uthread;
+  /* No longer a live context for signal-mask accounting (parlib libc_lithe.c): a finished
+   * context may sit in a cache with its TLS until reused. */
+  parlib_libc_context_gone(uthread->tls_desc);
   assert(current_sched->funcs->context_exit);
   current_sched->funcs->context_exit(current_sched, context);
 }
@@ -1129,7 +1141,9 @@ void lithe_fork_child(int vcoreid)
   lithe_fork_keep = cur ? cur->id : -1;
   {
     extern void lithe_futex_after_fork(void);
+    extern void lithe_libc_futex_after_fork(void);
     lithe_futex_after_fork();
+    lithe_libc_futex_after_fork();
   }
   /* Hart accounting: the forking hart (if any) is the only one, owned by the
    * forker's scheduler; base and root demand start from that. */
