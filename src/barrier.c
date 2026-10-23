@@ -97,7 +97,7 @@ void lithe_barrier_wait(lithe_barrier_t *barrier)
       int v = e ? atoi(e) : 1000;
       spins = v >= 0 ? v : 1000;
     }
-    const int MAXSTALLS = (barrier->N <= max_vcores()) ? spins : 0;
+    const int MAXSTALLS = (barrier->N <= parlib_vcore_limit()) ? spins : 0;
     int nstalls = 0;
     while (barrier->signals[id].val == wait) { 
       nstalls++;

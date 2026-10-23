@@ -740,14 +740,14 @@ static void fjs_tradespace_init_once(void)
 	if (e && *e) {
 		char *end = NULL;
 		unsigned long v = strtoul(e, &end, 10);
-		if (end != e && v >= 1 && v <= (unsigned long)max_vcores())
+		if (end != e && v >= 1 && v <= (unsigned long)parlib_vcore_limit())
 			fjs_soft_hart_cap = (int)v;
 	} else {
 		e = getenv("LITHE_CONTEXT_RANKS_PER_HOST");
 		if (e && *e) {
 			char *end = NULL;
 			unsigned long v = strtoul(e, &end, 10);
-			if (end != e && v >= 1 && v <= (unsigned long)max_vcores()) {
+			if (end != e && v >= 1 && v <= (unsigned long)parlib_vcore_limit()) {
 				unsigned long cap = v + (unsigned long)fjs_helper_harts;
 				/* Hosted MPI+OpenMP (2026-10-18): with OMP_NUM_THREADS=T each rank's
 				 * team wants T harts, but the RPH cap held ALL ranks' teams to RPH
@@ -761,8 +761,8 @@ static void fjs_tradespace_init_once(void)
 					if (t > 1)
 						cap = v * t + (unsigned long)fjs_helper_harts;
 				}
-				if (cap > (unsigned long)max_vcores())
-					cap = (unsigned long)max_vcores();
+				if (cap > (unsigned long)parlib_vcore_limit())
+					cap = (unsigned long)parlib_vcore_limit();
 				/* soft_cap = RPH + helper budget (MAX_ONLINE_HARTS wins above). */
 				fjs_soft_hart_cap = (int)cap;
 			}
@@ -1025,6 +1025,11 @@ static int __thread_enqueue_on(lithe_fork_join_sched_t *sched,
 
 	if (ctx->preferred_vcq == -1 || !vconline_s(sched, ctx->preferred_vcq))
 		ctx->preferred_vcq = get_next_queue_id_for(sched);
+	/* B42: never queue on a vcore blocked in the kernel (nobody would drain it). */
+	if (parlib_vcores_blocked() > 0) {
+		for (int k = 0; k < (int)max_vcores() && parlib_vcore_blocked(ctx->preferred_vcq); k++)
+			ctx->preferred_vcq = get_next_queue_id_for(sched);
+	}
 
 	int vcoreid = ctx->preferred_vcq;
 	spin_pdr_lock(&tqlock_s(sched, vcoreid));
@@ -1680,9 +1685,22 @@ static lithe_fork_join_context_t *__thread_dequeue()
 	lithe_fork_join_context_t *ctx = NULL;
 	int local_tq;
 
+	/* ORPHANED QUEUES (B42, with PARLIB_SPARE_VCORES): a vcore whose OS thread is
+	 * asleep in the kernel under a uthread (main in pthread_join) still owns a run
+	 * queue nobody drains -- its hart is gone, and the compensating hart's own queue
+	 * never empties (barrier spinners re-queue there), so it never stole: the queued
+	 * workers starved and their foreign masters waited forever. Drain such queues
+	 * first. One load when nothing is blocked. */
+	if (parlib_vcores_blocked() > 0) {
+		int mv = (int)max_vcores();
+		for (int v = 0; v < mv && !ctx; v++)
+			if (v != vcoreid && tqsize(v) && parlib_vcore_blocked(v))
+				ctx = tdequeue(v);
+	}
+
 	/* Try and grab a thread from our queue */
 	local_tq = tqsize(vcoreid);
-	if (fjs_lpt_on() && __atomic_load_n(&cur->lpt_ranked_queued, __ATOMIC_RELAXED) > 0 &&
+	if (!ctx && fjs_lpt_on() && __atomic_load_n(&cur->lpt_ranked_queued, __ATOMIC_RELAXED) > 0 &&
 	    fjs_lpt_scan_ok(cur))
 		ctx = lpt_pick_global();
 	if (!ctx)
@@ -2836,6 +2854,14 @@ restart:
     lithe_hart_yield();
   }
 
+  /* B42 kernel-block compensation: once the blocked vcore's thread is back, more
+   * vcores run than VCORE_LIMIT admits; shed the surplus here (harts pass through
+   * hart_enter on every switch; a lithified hart rarely reaches the base sched). */
+  if (parlib_vcores_over_cap()) {
+    vconline(vcore_id()) = false;
+    lithe_hart_yield();
+  }
+
   if (fjs_parent_starve_yield_on()) {
     int vc = vcore_id();
     if (vc < FJS_MAX_SLICE_VC && fjs_yield_streak[vc] >= fjs_starve_slice &&
@@ -3088,7 +3114,7 @@ idle_park_again:
     if (rc > 0)
       dec |= LITHE_ST_DEC_IDLE_WITH_RUNNABLE;
     /* Rapid idle under VCORE_LIMIT=1: flag for offline rate analysis. */
-    if (max_vcores() <= 1)
+    if (parlib_vcore_limit() <= 1)
       dec |= LITHE_ST_DEC_SELF_RESCHED_HOT;
     if (lithe_sched_trace_enabled())
       lithe_sched_trace_emit(LITHE_ST_IDLE_YIELD, sched, 0, dec, (int32_t)rc);

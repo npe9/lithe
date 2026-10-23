@@ -394,6 +394,15 @@ static void base_hart_enter(lithe_sched_t *__this)
   // back to the system, or we grant it to a child scheduler.  When one of
   // these two things happens, we will break out of this infinite loop...
   while (1) {
+    // B42 kernel-block compensation (PARLIB_SPARE_VCORES): once the blocked
+    // vcore's thread is back, more vcores run than the cap admits; the surplus
+    // leaves here, the next time any hart passes through the base scheduler,
+    // instead of being granted down again.
+    if (parlib_vcores_over_cap()) {
+      atomic_add(&__this->harts, -1);
+      current_sched = NULL;
+      vcore_yield();
+    }
     // We need to do a bunch of refcounting here to make sure that we are able
     // to access the root_sched before passing a hart to it.  Only if we can
     // access it and are able to up its hart count, do we even attempt to
