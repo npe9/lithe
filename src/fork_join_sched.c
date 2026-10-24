@@ -3344,6 +3344,16 @@ void lithe_fork_join_context_yield_ranked(void)
 	lithe_context_yield();
 }
 
+static int fjs_yield_request = -1;
+static inline int fjs_yield_request_on(void)
+{
+	if (__builtin_expect(fjs_yield_request < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_YIELD_REQUEST");
+		fjs_yield_request = (e && e[0] == '1');
+	}
+	return fjs_yield_request;
+}
+
 void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
                                          lithe_context_t *c)
 {
@@ -3379,6 +3389,21 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 	 * the timeout (HOSTED_FULLCORE soft_cap idle → ms-scale floors). */
 	__thread_enqueue(ctx, false);
 	fjs_maybe_reactor_wake();
+	/* LITHE_FJS_YIELD_REQUEST=1 (default 0, 2026-10-24): a yield is not
+	 * demand-aware -- it never requests a hart, so when waiters yield instead
+	 * of blocking (libgomp GOMP_LITHE_SPIN_YIELD) no context_unblock ever
+	 * issues the hart_request a park/wake would, and a hart that went back to
+	 * parlib in a quiet moment never returns: climml l1f ran 4 contexts on 3
+	 * harts for the rest of the run (trace: hart 3 out of the scheduler), 2x
+	 * dynamics, bimodal by whether a hart had parked. Request one hart when
+	 * runnable + running exceeds the harts owned. */
+	if (fjs_yield_request_on()) {
+		lithe_fork_join_sched_t *s = (lithe_fork_join_sched_t *)__this;
+		long want = __atomic_load_n(&s->runnable_count, __ATOMIC_ACQUIRE)
+		          + __atomic_load_n(&s->running_count, __ATOMIC_ACQUIRE);
+		if (want > (long)parlib_atomic_read(&s->sched.harts))
+			lithe_hart_request(1);
+	}
 	if (fjs_parent_starve_yield_on()) {
 		int vc = vcore_id();
 		if (vc < FJS_MAX_SLICE_VC)
