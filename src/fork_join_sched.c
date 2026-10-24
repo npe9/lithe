@@ -675,6 +675,32 @@ static inline int fjs_pending_is_work(void)
 		return 0;
 	return 1;
 }
+/* DRIVER HANDOFF (LITHE_FJS_DRIVER_HANDOFF, default on, =0 off; 2026-10-23). The driver
+ * slot holder leaves the drive to run work, and the harts that lost the slot have already
+ * parked and yielded to parlib (fjs_pending_is_work), so an armed timer has no hart left to
+ * fire it unless a busy hart re-enters. A context parked by the glibc futex hook waits on
+ * such a timer (its slice; a cross-process FUTEX_WAKE never reaches it otherwise), and
+ * oneDNN's backward convolution spins three OpenMP threads in a JIT barrier that never
+ * yields while the fourth sits parked: lithified PyTorch dataloader_train hung 6/13 with
+ * the futex hook, 0/8 without (.build_logs/glibc_lithe/dl_spawn). So when the driver leaves
+ * with runnable work and timers still armed, it asks for one hart to take the slot (granted
+ * only below the hart limit; the idle-yield surplus path returns it). fd waiters without a
+ * deadline do not trigger it: in a lithified MPI process they are always pending. */
+static int fjs_driver_handoff_mode = -1;
+static void fjs_driver_handoff(lithe_fork_join_sched_t *sched)
+{
+	if (fjs_driver_handoff_mode < 0) {
+		const char *e = getenv("LITHE_FJS_DRIVER_HANDOFF");
+		fjs_driver_handoff_mode = !(e && e[0] == '0');
+	}
+	if (!fjs_driver_handoff_mode || !parlib_reactor_timers_pending() ||
+	    __atomic_load_n(&fjs_reactor_drivers, __ATOMIC_ACQUIRE) > 0)
+		return;
+	if (tqsize_s(sched, vcore_id()) > 0 ||
+	    __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
+	    __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0)
+		lithe_hart_request(1);
+}
 /* Park-budget knobs (2026-10-17, audit section 3.5 / 8): how long an idle hart stays
  * resident before it is returned to parlib, and how much surplus is tolerated.
  *   LITHE_FJS_IDLE_PARK_ROUNDS  (default 24): timed-park rounds (1,1,4,4,...,MAX ms) before idle_yield
@@ -2987,6 +3013,7 @@ restart:
                                (int32_t)parlib_reactor_pending());
       (void)fjs_reactor_drive_parked(sched, vcore_id(), -1);
       __atomic_fetch_sub(&fjs_reactor_drivers, 1, __ATOMIC_ACQ_REL);
+      fjs_driver_handoff(sched);
       goto restart;
     }
     if (lithe_sched_trace_enabled())
