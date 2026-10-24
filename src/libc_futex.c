@@ -1,4 +1,4 @@
-/* glibc futex hook (lithe-docker install-glibc-lithe, 2026-10-23; LITHE_LIBC_FUTEX=1, default
+/* glibc futex hook (lithe-docker install-glibc-lithe, 2026-10-23; default on, LITHE_LIBC_FUTEX=0
  * off). The Lithe glibc sends every futex operation of its own locks -- the lowlevellock
  * waits behind malloc's arena locks, stdio, the loader lock, pthread mutexes, condvars,
  * once, semaphores, barriers -- through __lithe_futex_hook. Here:
@@ -241,8 +241,11 @@ extern void *parlib_libc_symbol(const char *name);
 /* lithe.c, at library init. */
 void lithe_libc_futex_init(void)
 {
+  /* default on with the Lithe glibc (2026-10-23: AI 14 workloads x 5 reps 0.97-1.03, StarPU
+   * mix equal, fixes a contended C++ static init and glibc lock waits that held harts);
+   * LITHE_LIBC_FUTEX=0 turns it off. Inert on a stock glibc (no __lithe_libc_set_hooks). */
   const char *e = getenv("LITHE_LIBC_FUTEX");
-  if (!(e && e[0] == '1'))
+  if (e && e[0] == '0')
     return;
   for (int i = 0; i < NBUCKETS; i++) {
     spinlock_init(&buckets[i].lock);
