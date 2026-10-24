@@ -60,6 +60,10 @@ typedef enum {
 	LITHE_ST_HART_REQUEST = 33,      /* FJS fjs_request_harts: ctx=h requested, aux=h after clamp (0 = clamped away) */
 	LITHE_ST_BASE_REQUEST = 34,      /* base_hart_request: ctx=(needed<<16)|have after the add, aux=vcores woken (-1: no deficit) */
 	LITHE_ST_BASE_GRANT = 35,        /* base_hart_enter decision: ctx=(needed<<16)|harts_before, aux=1 granted / 0 denied -> vcore parks */
+	/* Runtime phases and resource brokers (2026-10-24). */
+	LITHE_ST_PHASE_BEGIN = 36,       /* a runtime phase on the ctx track; ctx=ctx key aux=lithe_sched_trace_intern() id */
+	LITHE_ST_PHASE_END = 37,
+	LITHE_ST_TCM_PERMIT = 38,        /* TCM permit state: ctx=permit key aux=granted concurrency (0 = released/idle) */
 	LITHE_ST_DUMP_MARKER = 255
 } lithe_sched_trace_ev_t;
 
@@ -148,6 +152,16 @@ int lithe_sched_trace_dump_perfetto(const char *path);
  * current scheduler is a fork-join scheduler, otherwise a pointer-derived key
  * with the top bit set. 0 when there is no current context. */
 uint32_t lithe_sched_trace_ctx_key(void);
+
+/* Names for the trace (2026-10-24). label_self: name the current context ("tbb worker",
+ * "omp thread"); its hart slices read "ctx N <label>". intern: a small id for a phase
+ * name, for LITHE_ST_PHASE_BEGIN's aux (the same name returns the same id; 0 when the
+ * table is full or tracing is off). phase_begin/end: emit PHASE_BEGIN/END for the current
+ * context. All are no-ops when tracing is off; call intern once and keep the id. */
+void lithe_sched_trace_label_self(const char *label);
+int32_t lithe_sched_trace_intern(const char *name);
+void lithe_sched_trace_phase_begin(int32_t id);
+void lithe_sched_trace_phase_end(void);
 
 #ifdef __cplusplus
 }
