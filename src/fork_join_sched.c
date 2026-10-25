@@ -677,6 +677,15 @@ static void fjs_topo_build(int vc, int mv)
 }
 static lithe_fjs_hart_order_t fjs_hart_order = LITHE_FJS_HART_ORDER_CHILD_FIRST;
 static int fjs_progress_sched_child = 0;
+static int fjs_progress_child_drive_v = -1;
+static int fjs_progress_child_drive(void)
+{
+	if (__builtin_expect(fjs_progress_child_drive_v < 0, 0)) {
+		const char *e = getenv("LITHE_PROGRESS_CHILD_DRIVE");
+		fjs_progress_child_drive_v = (e && atoi(e) > 0) ? 1 : 0;
+	}
+	return fjs_progress_child_drive_v;
+}
 static int fjs_tradespace_init = 0;
 /* Soft cap on FJS online harts (0 = unset). From LITHE_FJS_MAX_ONLINE_HARTS
  * or LITHE_CONTEXT_RANKS_PER_HOST (+ helper budget). Clamps *helper* hart
@@ -920,18 +929,30 @@ lithe_fork_join_sched_t *lithe_fork_join_sched_progress_sched(void)
 		lithe_fork_join_sched_t *s = lithe_fork_join_sched_create();
 		if (s == NULL)
 			return root;
+		/* Parent set before publication: a racing caller may create a context on it
+		 * before registration below finishes (GAPS E9). */
+		s->sched.parent = (lithe_sched_t *)root;
+		s->sched.harts = PARLIB_ATOMIC_INITIALIZER(0);
 		if (!__sync_bool_compare_and_swap(&lithe_progress_child_sched, NULL, s))
 			lithe_fork_join_sched_destroy(s);
 	}
 
-	if (!lithe_progress_child_registered && lithe_progress_child_sched != NULL) {
-		lithe_fork_join_sched_child_enter((lithe_sched_t *)root,
-		                                  (lithe_sched_t *)lithe_progress_child_sched);
-		uint16_t *harts_needed =
-			(uint16_t *)&lithe_progress_child_sched->sched.parent_data + 1;
-		if (*harts_needed < 1)
-			*harts_needed = 1;
-		lithe_progress_child_registered = 1;
+	/* GAPS E9 (2026-10-25): this child is registered in the root's child list but never
+	 * entered by lithe_sched_enter(), so nothing set its parent (the first context created on
+	 * it SIGSEGV'd in lithe_hart_request: parent NULL, 6/6) and child_enter's 1/1 ledger --
+	 * which assumes the entering hart is the child's first hart -- claimed a hart it never
+	 * held, and the old "needed >= 1" pin made that claim permanent. Wire it the way
+	 * lithe_sched_enter would, but with an empty 0/0 ledger: demand now comes only from
+	 * schedule_context -> lithe_hart_request_for(child) and is released by the child's
+	 * idle-yield path like any other child's. */
+	if (!lithe_progress_child_registered && lithe_progress_child_sched != NULL &&
+	    __sync_bool_compare_and_swap(&lithe_progress_child_registered, 0, 1)) {
+		lithe_sched_t *c = (lithe_sched_t *)lithe_progress_child_sched;
+		lithe_fork_join_sched_child_enter((lithe_sched_t *)root, c);
+		uint16_t *harts_granted = (uint16_t *)&c->parent_data;
+		uint16_t *harts_needed = (uint16_t *)&c->parent_data + 1;
+		*harts_granted = 0;
+		*harts_needed = 0;
 	}
 
 	return lithe_progress_child_sched ? lithe_progress_child_sched : root;
@@ -2917,6 +2938,11 @@ void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
 {
   lithe_fork_join_sched_t *sched = (void *)__this;
   int idle_yield_released_demand = 0;
+  /* GAPS E9: set on the progress-child idle-leave path. Reactor waiters are not this child's
+   * work (pending is process-global): counting them in the lost-wakeup re-check below sent a
+   * leaving hart back to restart forever, and the child kept all 3 harts (granted=3,
+   * needed=0, nothing runnable; LITHE_PROGRESS_SCHED=child + LITHE_SC_DMA=1, nbc, 2/20). */
+  int prog_child_leave = 0;
   if (!vconline(vcore_id()))
     vconline(vcore_id()) = true;
 
@@ -2940,6 +2966,7 @@ void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
   }
 
 restart:
+  prog_child_leave = 0;
   /* Scheduler-driven netpoll: drain completed fd waits before selecting the
    * next continuation. This keeps I/O readiness in the normal Lithe handoff
    * path instead of requiring a helper pthread. */
@@ -3020,6 +3047,24 @@ restart:
    * timed park and the surplus yield to parlib, where vcore_request() wakes
    * exactly the vcores asked for through their own futex. */
   fjs_tradespace_init_once();
+  /* GAPS E9 (2026-10-25): the LITHE_PROGRESS_SCHED=child progress scheduler must not wait.
+   * parlib_reactor_pending() is process-global, so its idle hart took the driver slot and
+   * parked in the reactor for the whole run while the child's ledger said granted=1: the
+   * rank sched lost one of its 3 harts (p2p 8 B, 4 ctx: 56 -> ~105 us/op). Only the bottom
+   * drives the reactor; a woken progress context re-requests a hart for this child through
+   * schedule_context. So an idle progress-child hart releases its demand down to the harts
+   * the child will still hold, and leaves through the lost-wakeup protocol below.
+   * LITHE_PROGRESS_CHILD_DRIVE=1 restores the old spin/park/drive path. */
+  if (fjs_progress_sched_child && (void *)sched == (void *)lithe_progress_child_sched &&
+      !fjs_progress_child_drive()) {
+    uint16_t *pg = (uint16_t *)&sched->sched.parent_data;
+    uint16_t *pn = (uint16_t *)&sched->sched.parent_data + 1;
+    int surplus = (int)*pn - ((int)*pg - 1);
+    if (surplus > 0)
+      lithe_hart_request(-surplus);
+    prog_child_leave = 1;
+    goto fjs_idle_leave;
+  }
   /* LITHE_FJS_SPIN_BEFORE_DRIVE (default ON since 2026-10-22, =0 disables): in a lithified MPI process pending is
    * never 0, so the driver-slot hart blocked in epoll_wait on every idle moment and each
    * schedule_context woke it with an eventfd write: LULESH 1 rank x 8 threads on 4 harts made
@@ -3291,6 +3336,7 @@ idle_park_again:
    * leaving credit and its hart request is granted. Never yield after
    * observing runnable work (the old path logged IDLE_WITH_RUNNABLE and
    * yielded anyway). */
+fjs_idle_leave:
   __atomic_fetch_add(&sched->leaving_harts, 1, __ATOMIC_SEQ_CST);
   /* SELF-HEAL at last exit: before this hart leaves, rescue any child whose
    * ledger drifted to needed <= granted while RUNNABLE/warm work is queued
@@ -3311,7 +3357,7 @@ idle_park_again:
   if (__atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 0 ||
       __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) > 0 ||
       tqsize_s(sched, vcore_id()) > 0 ||
-      fjs_pending_is_work()) {
+      (!prog_child_leave && fjs_pending_is_work())) {
     long lv = __atomic_load_n(&sched->leaving_harts, __ATOMIC_SEQ_CST);
     while (lv > 0 &&
            !__atomic_compare_exchange_n(&sched->leaving_harts, &lv, lv - 1,
