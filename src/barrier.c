@@ -9,6 +9,26 @@
 #include "internal/assert.h"
 #include "barrier.h"
 
+long lithe_fork_join_current_hartless_runnable(void);
+
+/* LITHE_BARRIER_SPIN_DEMAND (2026-10-24, GAPS B57; default 0): the pre-block spin
+ * also stops as soon as a runnable context in this scheduler has no hart, so the
+ * spin never holds a hart anyone else wants. Why the spin is kept at all:
+ * hosted miniFE MPI+OpenMP 32^3 (2 ranks x 2 threads, 4 harts, n=7) CG
+ * 0.0153-0.0155 s with it, 0.0166-0.0168 s at LITHE_BARRIER_SPINS=0 -- in every
+ * idle-path arm (FJS spin on or off, bottom window 0-200 us), so the cost is the
+ * block -> unblock -> dispatch round trip itself (~2 us per rank barrier), not
+ * where the idle hart waits. Remove the spin once that path is cheaper. */
+static int barrier_spin_demand_on(void)
+{
+  static int on = -1;
+  if (__builtin_expect(on < 0, 0)) {
+    const char *e = getenv("LITHE_BARRIER_SPIN_DEMAND");
+    on = (e && *e) ? (atoi(e) != 0) : 0;
+  }
+  return on;
+}
+
 void lithe_barrier_init(lithe_barrier_t *barrier, int N) 
 {
   assert(barrier != NULL);
@@ -99,8 +119,12 @@ void lithe_barrier_wait(lithe_barrier_t *barrier)
     }
     const int MAXSTALLS = (barrier->N <= parlib_vcore_limit()) ? spins : 0;
     int nstalls = 0;
+    const int demand = barrier_spin_demand_on();
     while (barrier->signals[id].val == wait) { 
       nstalls++;
+      if (demand && nstalls < MAXSTALLS && (nstalls & 63) == 1 &&
+          lithe_fork_join_current_hartless_runnable() > 0)
+        nstalls = MAXSTALLS;   /* someone runnable has no hart: block now */
       if (nstalls >= MAXSTALLS) {
         contextq_t *blocked = &barrier->blocked[wait];
         mcs_lock_qnode_t qnode = {0};

@@ -678,6 +678,72 @@ static void __lithe_hart_grant(lithe_sched_t *child, void (*unlock_func) (void *
   fatal("lithe: returned from enter");
 }
 
+/* EXIT BLOCK (LITHE_SCHED_EXIT_BLOCK, 2026-10-24, GAPS B57; default 0).
+ * lithe_sched_exit's drain was a yield loop (up to 2M yields) on the parent
+ * context: it stayed runnable and took a hart in turns with real work until the
+ * exiting child's other harts left. =1: the parent context BLOCKS; the hart
+ * that takes the child's count to 0 unblocks it (exit_waiters_wake, called
+ * after every decrement of a sched's harts that can happen while it exits). */
+#define EXIT_WAITERS_MAX 64
+static struct { lithe_sched_t *sched; lithe_context_t *ctx; } exit_waiters[EXIT_WAITERS_MAX];
+static int exit_waiters_n;
+static spin_pdr_lock_t exit_waiters_lock = SPINPDR_INITIALIZER;
+
+static int lithe_sched_exit_block_on(void)
+{
+  static int on = -1;
+  if (__builtin_expect(on < 0, 0)) {
+    const char *e = getenv("LITHE_SCHED_EXIT_BLOCK");
+    on = (e && *e) ? (atoi(e) != 0) : 0;
+  }
+  return on;
+}
+
+static inline void exit_waiters_wake(lithe_sched_t *sched)
+{
+  if (__builtin_expect(__atomic_load_n(&exit_waiters_n, __ATOMIC_ACQUIRE) == 0, 1))
+    return;
+  if (parlib_atomic_read(&sched->harts) != 0)
+    return;
+  lithe_context_t *ctx = NULL;
+  spin_pdr_lock(&exit_waiters_lock);
+  for (int i = 0; i < EXIT_WAITERS_MAX; i++)
+    if (exit_waiters[i].sched == sched) {
+      ctx = exit_waiters[i].ctx;
+      exit_waiters[i].sched = NULL;
+      exit_waiters[i].ctx = NULL;
+      __atomic_fetch_sub(&exit_waiters_n, 1, __ATOMIC_RELEASE);
+      break;
+    }
+  spin_pdr_unlock(&exit_waiters_lock);
+  if (ctx)
+    lithe_context_unblock(ctx);
+}
+
+/* Block callback (vcore context): register, then recheck, so a decrement that
+ * raced ahead of the registration is not lost. Returns 0 if the registry was
+ * full (caller falls back to the yield drain). */
+static void exit_block_cb(lithe_context_t *ctx, void *arg)
+{
+  lithe_sched_t *sched = arg;
+  int slot = -1;
+  spin_pdr_lock(&exit_waiters_lock);
+  for (int i = 0; i < EXIT_WAITERS_MAX; i++)
+    if (exit_waiters[i].sched == NULL) {
+      exit_waiters[i].sched = sched;
+      exit_waiters[i].ctx = ctx;
+      __atomic_fetch_add(&exit_waiters_n, 1, __ATOMIC_SEQ_CST);
+      slot = i;
+      break;
+    }
+  spin_pdr_unlock(&exit_waiters_lock);
+  if (slot < 0) {
+    lithe_context_unblock(ctx); /* full: run again, the caller yields instead */
+    return;
+  }
+  exit_waiters_wake(sched);   /* count may already be 0 */
+}
+
 void lithe_hart_grant(lithe_sched_t *child, void (*unlock_func) (void *), void *lock)
 {
   assert(child);
@@ -689,6 +755,7 @@ void lithe_hart_grant(lithe_sched_t *child, void (*unlock_func) (void *), void *
   /* Leave parent, join child. */
   atomic_add(&parent->harts, -1);
   atomic_add(&child->harts, 1);
+  exit_waiters_wake(parent);
 
   /* Enter the child scheduler */
   __lithe_hart_grant(child, unlock_func, lock);
@@ -714,6 +781,7 @@ void lithe_hart_yield()
   /* Leave child, reenter on parent. */
   atomic_add(&child->harts, -1);
   atomic_add(&parent->harts, 1);
+  exit_waiters_wake(child);
 
   vcore_reenter(__lithe_sched_reenter);
   fatal("lithe: returned from hart yield");
@@ -873,6 +941,10 @@ void lithe_sched_exit()
   clock_gettime(CLOCK_MONOTONIC, &t_start);
   while ((n = parlib_atomic_read(&child->harts)) != 0) {
     assert(n >= 0);
+    if (lithe_sched_exit_block_on() && lithe_can_block()) {
+      lithe_context_block(exit_block_cb, child);
+      continue;   /* woken at 0 (or the registry was full): recheck */
+    }
     if (wait) {
       /* EXIT WAIT (2026-10-17, LITHE_SCHED_EXIT_WAIT): the old drain
        * yield-spun ~4 us per iteration until the child's other harts left,

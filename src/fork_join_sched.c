@@ -109,6 +109,53 @@ static inline int fjs_quiesce_ignore_pending_on(void)
   return cached;
 }
 
+/* LITHE_FJS_SPIN_QUIESCE (2026-10-24, GAPS B57): the adaptive idle spin in
+ * hart_enter (up to LITHE_FJS_HART_ENTER_SPIN_MAX pauses) did not test
+ * teardown_quiesce, so an exiting sched's idle harts finished the whole spin
+ * before reaching the quiesce gate, and lithe_sched_exit's drain waited for
+ * them. =1 leaves the spin as soon as the sched is exiting. */
+static inline int fjs_spin_quiesce_on(void)
+{
+  static int cached = -1;
+  if (__builtin_expect(cached < 0, 0)) {
+    const char *e = getenv("LITHE_FJS_SPIN_QUIESCE");
+    cached = (e && *e) ? (e[0] != '0') : 0;
+  }
+  return cached;
+}
+
+/* LITHE_FJS_IDLE_DIRECT (2026-10-24, GAPS B57; default 0). User: "why should
+ * fjs schedulers ever spin?" An FJS with no work spun (adaptive, up to 16384
+ * pauses, ~300 us) and then kernel-parked on the reactor (1->64 ms) while
+ * holding the hart, instead of returning it to its parent, which is an
+ * in-process hand-off (~0.4 us for a whole sched enter+exit). The spin hid the
+ * park's wake latency; the spin-vs-sleep choice belongs only at the bottom
+ * (parlib's maybe_vcore_yield window, then the kernel). 1 = a CHILD sched
+ * (parent is not base) skips the spin and the idle park and yields the hart up
+ * at once; 2 = every FJS, the root too (its hart goes back to base/parlib).
+ * Reactor waiters (pending > 0, the drive(-1) path) are unchanged.
+ * DEFAULT 2 (2026-10-24, with LITHE_VCORE_PARK_SPIN_US=20; =0 restores the
+ * spin + park). Login A/B vs the old defaults, 4 harts, n=5 interleaved, every
+ * run ec=0 (.build_logs/despin/lithe/final_results.txt): fine libgomp regions
+ * 126.6 -> 84.1 us/rep; duty cycle with 50 us gaps region p50 350 -> 244 us,
+ * CPU/wall at 500 us gaps 1.73 -> 1.42; nested sched_exit 297 -> 0.4 us;
+ * hosted miniFE serial/omp 32^3/48^3, lithe_barrier, nested OpenMP (n=12),
+ * climml, hosted stress (ALL CLEAN) at parity. The FJS spin-before-drive
+ * (LITHE_FJS_SPIN_BEFORE_DRIVE, MPI processes) is separate and still on: off
+ * costs hosted miniFE 48^3 2.5-3.5 % (it hides the reactor driver's eventfd
+ * wake). */
+static inline int fjs_idle_direct(lithe_fork_join_sched_t *sched)
+{
+  static int mode = -1;
+  if (__builtin_expect(mode < 0, 0)) {
+    const char *e = getenv("LITHE_FJS_IDLE_DIRECT");
+    mode = (e && *e) ? atoi(e) : 2;   /* default 2 since 2026-10-24, see below */
+  }
+  if (mode >= 2)
+    return 1;
+  return mode == 1 && sched->sched.parent && sched->sched.parent->parent;
+}
+
 static inline int fjs_interfere_on(void)
 {
 	if (fjs_interfere_enabled < 0) {
@@ -3033,7 +3080,7 @@ restart:
    * LITHE_FJS_HART_ENTER_SPIN_{MIN,MAX}. LITHE_FJS_HART_ENTER_SPIN_LOOPS=0
    * disables. */
   fjs_hart_enter_spin_init();
-  if (fjs_hart_enter_spin_loops > 0) {
+  if (fjs_hart_enter_spin_loops > 0 && !fjs_idle_direct(sched)) {
     int my_vc = vcore_id();
     unsigned int budget = fjs_hart_enter_spin_budget(my_vc);
     /* NOTE: clamping budget to spin_min when empty+soft_cap was tried with
@@ -3053,6 +3100,9 @@ restart:
          * then burned the CPUs their trainer shared: lithified PyTorch
          * dataloader_train 2 vs 20 images/s (worker profile: 56 % in this
          * function, no syscalls). =0 restores the old test. */
+        if (fjs_spin_quiesce_on() &&
+            __atomic_load_n(&sched->teardown_quiesce, __ATOMIC_ACQUIRE))
+          goto restart; /* exiting: the quiesce gate at restart lets us leave */
         if (fjs_pending_is_work() || fjs_any_child_needs_hart(sched)) {
           fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
           if (lithe_sched_trace_enabled())
@@ -3113,6 +3163,8 @@ restart:
      * ranks that could satisfy the wait sat RUNNABLE with zero harts. */
     if (!is_surplus && fjs_parent_starve_yield_on() && fjs_parent_starved(sched))
       is_surplus = 1;
+    if (!is_surplus && fjs_idle_direct(sched))
+      is_surplus = 1; /* no idle park: the hart goes up now */
     if (fjs_interfere_on()) {
       static int once;
       if (!once && __sync_bool_compare_and_swap(&once, 0, 1))

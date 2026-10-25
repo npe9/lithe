@@ -2,6 +2,7 @@
 #define LITHE_INTERNAL_VCORE_H
 
 #include <stdlib.h>
+#include <time.h>
 #include <sys/queue.h>
 #include <parlib/vcore.h>
 #include "assert.h"
@@ -44,6 +45,12 @@ static struct {
 static unsigned int park_spin_min = 8192u;
 static unsigned int park_spin_max = (1u << 21); /* ~2M cpu_relax: > futex wake latency */
 static int park_spin_fixed = -1;                /* >=0: fixed window (LITHE_SPIN_COUNT) */
+/* LITHE_VCORE_PARK_SPIN_US (2026-10-24, GAPS B57; unset = the pause-count window
+ * above). This is the only spin the de-spin rules allow (the bottom of the
+ * hierarchy, before the kernel park), but 2^21 pauses is ~38 ms of a burned core
+ * per idle episode, doubling on every quick reclaim -- far beyond a futex wake
+ * (tens of us). Set, it caps the window in wall time (0 = park at once). */
+static long park_spin_ns = 20000L; /* default 20 us since 2026-10-24 */
 static int park_adaptive = 1;
 
 static inline unsigned int __env_uint(const char *name, unsigned int dflt)
@@ -72,6 +79,16 @@ static inline void lithe_vcore_init()
   const char *adaptive_string = getenv("LITHE_VCORE_PARK_ADAPTIVE");
   if (adaptive_string != NULL)
     park_adaptive = atoi(adaptive_string) ? 1 : 0;
+
+  {
+    const char *us = getenv("LITHE_VCORE_PARK_SPIN_US");
+    /* <0 restores the pure pause-count window. DEFAULT 20 us: with the FJS no
+     * longer spinning (LITHE_FJS_IDLE_DIRECT=2) this is the only idle spin; a
+     * blocked lithe_barrier waiter costs 0.75 us at >= 20 us vs 1.33 us at 0
+     * (kernel park + futex wake), 2 contexts / 4 harts (barlat.c). */
+    if (us && *us)
+      park_spin_ns = atol(us) < 0 ? -1 : atol(us) * 1000L;
+  }
 
   /* LITHE_SPIN_COUNT: legacy fixed window (overrides adaptive). */
   const char *spin_count_string = getenv("LITHE_SPIN_COUNT");
@@ -102,8 +119,21 @@ static inline void maybe_vcore_yield()
     budget = wake_me_up[vc].spin_budget;          /* adaptive per-vcore window */
 
   unsigned int spins;
-  for (spins = 0; spins < budget && *flag; spins++)
-    cpu_relax();
+  if (park_spin_ns >= 0) {
+    struct timespec t0, t;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (spins = 0; spins < budget && *flag; spins++) {
+      if ((spins & 255u) == 0) {
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        if ((t.tv_sec - t0.tv_sec) * 1000000000L + (t.tv_nsec - t0.tv_nsec) >= park_spin_ns)
+          break;
+      }
+      cpu_relax();
+    }
+  } else {
+    for (spins = 0; spins < budget && *flag; spins++)
+      cpu_relax();
+  }
 
   if (*flag && __sync_lock_test_and_set(flag, 0)) {
     /* Spun out without being claimed: this vcore is genuinely idle. Shrink the

@@ -7,6 +7,8 @@
 #include "futex.h"
 #include <time.h>
 #include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <parlib/reactor.h>
 
 struct futex_list;
@@ -37,7 +39,33 @@ struct futex_list {
   struct futex_tailq tailq;
   int *uaddr;
   spinlock_t lock;
+  struct futex_list *hnext;   /* hash chain (FUTEX_HASH) */
 };
+
+/* FUTEX HASH (2026-10-24, GAPS B57): queues were found by a linear walk of ONE
+ * insert-only list of every address ever waited on, so a runtime that futex-waits
+ * on per-allocation words grows every lookup without bound. The OpenMP de-spin lane
+ * hit it: libgomp doacross with one futex word per entry under schedule(dynamic,1)
+ * spent 62 % of cycles in get_futex_list, 6x slower. Now: 4096 buckets keyed by
+ * address, each an insert-only chain read without a lock (publish with release
+ * CAS, read with acquire). Queues are still never freed (their addresses are
+ * reused). LITHE_FUTEX_LINEAR=1 restores the single list for A/B. */
+#define FUTEX_HASH_BITS 12
+static struct futex_list *futex_hash[1u << FUTEX_HASH_BITS];
+static inline unsigned futex_hash_of(int *uaddr)
+{
+  uintptr_t a = (uintptr_t)uaddr >> 2;
+  return (unsigned)((a * 0x9E3779B97F4A7C15ull) >> (64 - FUTEX_HASH_BITS));
+}
+static int futex_linear_on(void)
+{
+  static int on = -1;
+  if (__builtin_expect(on < 0, 0)) {
+    const char *e = getenv("LITHE_FUTEX_LINEAR");
+    on = (e && *e) ? (atoi(e) != 0) : 0;
+  }
+  return on;
+}
 
 /* A list of futex blocking queues, one per uaddr. */
 static struct wfl futex_lists = WFL_INITIALIZER(futex_lists);
@@ -47,6 +75,29 @@ static spinlock_t futex_lists_lock = SPINLOCK_INITIALIZER;
 static struct futex_list *get_futex_list(int *uaddr)
 {
   struct futex_list *list;
+  if (!futex_linear_on()) {
+    struct futex_list **b = &futex_hash[futex_hash_of(uaddr)];
+    for (list = __atomic_load_n(b, __ATOMIC_ACQUIRE); list; list = list->hnext)
+      if (list->uaddr == uaddr)
+        return list;
+    spinlock_lock(&futex_lists_lock);
+      for (list = __atomic_load_n(b, __ATOMIC_ACQUIRE); list; list = list->hnext)
+        if (list->uaddr == uaddr)
+          break;
+      if (list == NULL) {
+        list = malloc(sizeof(struct futex_list));
+        if (list == NULL)
+          abort();
+        STAILQ_INIT(&list->tailq);
+        list->uaddr = uaddr;
+        spinlock_init(&list->lock);
+        list->hnext = *b;
+        __atomic_store_n(b, list, __ATOMIC_RELEASE);
+        /* not on the wfl: wfl_insert scans for a free slot, O(n) per new queue */
+      }
+    spinlock_unlock(&futex_lists_lock);
+    return list;
+  }
   wfl_foreach_unsafe(list, &futex_lists) {
     if (list->uaddr == uaddr)
       return list;
@@ -64,6 +115,7 @@ static struct futex_list *get_futex_list(int *uaddr)
       STAILQ_INIT(&list->tailq);
       list->uaddr = uaddr;
       spinlock_init(&list->lock);
+      list->hnext = NULL;
       wfl_insert(&futex_lists, list);
     }
   spinlock_unlock(&futex_lists_lock);
@@ -84,6 +136,11 @@ void lithe_futex_after_fork(void)
     STAILQ_INIT(&list->tailq);
     spinlock_init(&list->lock);
   }
+  for (unsigned i = 0; i < (1u << FUTEX_HASH_BITS); i++)
+    for (list = futex_hash[i]; list; list = list->hnext) {
+      STAILQ_INIT(&list->tailq);
+      spinlock_init(&list->lock);
+    }
 }
 
 static void __futex_timeout(void *arg)
