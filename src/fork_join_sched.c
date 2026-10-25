@@ -2747,6 +2747,16 @@ static void fjs_try_hart_grant_child(lithe_fork_join_sched_t *sched,
   atomic_add(harts_granted, -1);
 }
 
+static int fjs_idle_trim = -1;
+static inline int fjs_idle_trim_on(void)
+{
+  if (__builtin_expect(fjs_idle_trim < 0, 0)) {
+    const char *e = getenv("LITHE_FJS_IDLE_TRIM");
+    fjs_idle_trim = (e && e[0] == '0') ? 0 : 1;
+  }
+  return fjs_idle_trim;
+}
+
 static void fjs_hart_grant_children(lithe_fork_join_sched_t *sched)
 {
   if (TAILQ_EMPTY(&sched->child_sched_list))
@@ -3367,6 +3377,39 @@ fjs_idle_leave:
     if (lithe_sched_trace_enabled())
       lithe_sched_trace_emit(LITHE_ST_IDLE_SPIN, sched, 0, LITHE_ST_DEC_OK, 3);
     goto restart;
+  }
+  /* GAPS B60 (2026-10-25) LITHE_FJS_IDLE_TRIM (DEFAULT 1, =0 disables): a hart leaving an idle
+   * CHILD scheduler trims the child's needed ledger to what it can still use -- the harts it
+   * keeps plus its runnable and warm contexts. The release above fires only when owned >>
+   * demand, so a child that holds one hart never corrects a leaked `needed`: libomp nested
+   * mode (LITHE_OMP_FLAT=0) left needed=3360 on a team scheduler with nothing runnable, and
+   * the parent's harts, which grant children before running their own work, cycled
+   * parent -> empty child -> parent for ~30 s while the parent's own context stayed runnable
+   * (cotenant 2x4, 4 harts: makespan 11-46 s for 0.4 s of rounds; gdb ledger + perf in
+   * .build_logs/b60). Same rule as the E9 progress child. A context made runnable later
+   * re-requests its hart through schedule_context. A/B n=10 (.build_logs/b60/ab.txt): libomp
+   * nested 13.9 s -> 0.41 s makespan (10/10), everything else 0.985-1.002x (flat gompl/ompl,
+   * gompl own-sched, hosted ranks K=8, hosted miniFE serial + MPI+OpenMP). */
+  /* A scheduler whose children still want harts keeps that demand: its needed ledger carries
+   * theirs (a first cut that trimmed to its own runnable count starved the libomp team
+   * schedulers under the cotenant scheduler: p99 3.5-4 ms in 2/3 runs). Children trim first
+   * when their own idle harts leave, then the parent may. */
+  if (fjs_idle_trim_on() && sched->sched.parent &&
+      sched->sched.parent->funcs == &lithe_fork_join_sched_funcs &&
+      !fjs_any_child_needs_hart(sched)) {
+    uint16_t *pg = (uint16_t *)&sched->sched.parent_data;
+    uint16_t *pn = (uint16_t *)&sched->sched.parent_data + 1;
+    long want = ((long)*pg - 1) +
+                __atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) +
+                __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST);
+    long surplus = (long)*pn - (want > 0 ? want : 0);
+    /* Only pathological inflation: a needed beyond every hart the process can have. Trimming
+     * ordinary transient inflation cost hosted serial miniFE 1 % (CG 0.5755 -> 0.5811, slower
+     * in 7/10 pairs, ab.txt): that slack is demand the next wake would re-request anyway. */
+    if (surplus > (long)max_vcores()) {
+      lithe_hart_request(-(int)surplus);
+      idle_yield_released_demand = 0;
+    }
   }
   /* Truly leaving: only now release surplus demand (see deferred note
    * above) so restarts never drain or churn the needed ledger. */
