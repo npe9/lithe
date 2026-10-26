@@ -287,6 +287,8 @@ long lithe_fork_join_current_hartless_runnable(void);
  * progress hart on single-OS shapes (multi-OS park+pump may regress).
  */
 int lithe_fork_join_should_yield_to_runnable(void);
+/* GAPS B61: unmet hart demand on the scheduler chain above the current one. */
+int lithe_fork_join_hart_wanted_elsewhere(void);
 
 /* Scheduler creation, initialization, etc. for the lithe_fork_join_sched. */
 lithe_fork_join_sched_t *lithe_fork_join_sched_create();

@@ -2262,6 +2262,17 @@ long lithe_fork_join_current_hartless_runnable(void)
   return r > 0 ? r : 0;
 }
 
+static int fjs_parent_starved(lithe_fork_join_sched_t *sched);
+static int fjs_wanted_elsewhere = -1;
+static inline int fjs_wanted_elsewhere_on(void)
+{
+  if (fjs_wanted_elsewhere < 0) {
+    const char *e = getenv("LITHE_FJS_WANTED_ELSEWHERE");
+    fjs_wanted_elsewhere = (e && e[0] == '0') ? 0 : 1; /* default on, B61 */
+  }
+  return fjs_wanted_elsewhere;
+}
+
 int lithe_fork_join_should_yield_to_runnable(void)
 {
   long r = lithe_fork_join_current_runnable_count();
@@ -2326,6 +2337,21 @@ int lithe_fork_join_should_yield_to_runnable(void)
    * progress helpers park/multiplex instead of CQ-contending with ranks. */
   if (soft_cap > 0 && owned > (long)soft_cap)
     return 1;
+  /* B61 (LITHE_FJS_WANTED_ELSEWHERE, default 1): "no runnable peer" above only looks at
+   * the CURRENT scheduler. Nested libomp keeps each rank master inside its
+   * per-team child, so three masters idle-spinning in MPI waits (wait_sync
+   * lithe_wsd_idle_spin: "nobody wants this hart") held all three harts while
+   * the fourth rank's team sat runnable with granted 0 -- hosted miniFE R=4
+   * OMP=2 VCORE_LIMIT=3 hung 5/5. Someone does want the hart if any FJS
+   * ancestor on the chain is starved (itself runnable with no harts, or a
+   * sibling child that needs one and owns none). */
+  if (fjs_wanted_elsewhere_on() && cur != NULL &&
+      cur->funcs == &lithe_fork_join_sched_funcs) {
+    for (lithe_sched_t *c = cur; c->parent != NULL &&
+         c->parent->funcs == &lithe_fork_join_sched_funcs; c = c->parent)
+      if (fjs_parent_starved((lithe_fork_join_sched_t *)c))
+        return 1;
+  }
   return 0;
 }
 
@@ -2757,6 +2783,16 @@ static inline int fjs_idle_trim_on(void)
   return fjs_idle_trim;
 }
 
+static int fjs_child_idle_leave = -1;
+static inline int fjs_child_idle_leave_on(void)
+{
+  if (__builtin_expect(fjs_child_idle_leave < 0, 0)) {
+    const char *e = getenv("LITHE_FJS_CHILD_IDLE_LEAVE");
+    fjs_child_idle_leave = (e && e[0] == '0') ? 0 : 1; /* default on, B61 */
+  }
+  return fjs_child_idle_leave;
+}
+
 static void fjs_hart_grant_children(lithe_fork_join_sched_t *sched)
 {
   if (TAILQ_EMPTY(&sched->child_sched_list))
@@ -2898,7 +2934,7 @@ static int fjs_parent_starve_yield_on(void)
 {
   if (fjs_parent_starve_yield < 0) {
     const char *e = getenv("LITHE_FJS_PARENT_STARVE_YIELD");
-    fjs_parent_starve_yield = (e && e[0] == '1') ? 1 : 0;
+    fjs_parent_starve_yield = (e && e[0] == '0') ? 0 : 1; /* default on, B61 */
     const char *sl = getenv("LITHE_FJS_STARVE_YIELD_SLICE");
     if (sl && atoi(sl) > 0)
       fjs_starve_slice = atoi(sl);
@@ -2933,6 +2969,41 @@ static int fjs_parent_starved(lithe_fork_join_sched_t *sched)
   }
   spin_pdr_unlock(&pf->child_sched_list_lock);
   return starved;
+}
+/* Unmet demand at some FJS edge from sched up to the root: an ancestor with
+ * runnable contexts of its own, or a sibling (on the way up) whose ledger has
+ * needed > granted. Ledger-only, like fjs_child_needs_hart. */
+static int fjs_chain_demand(lithe_fork_join_sched_t *sched)
+{
+  for (lithe_sched_t *c = &sched->sched; c->parent != NULL &&
+       c->parent->funcs == &lithe_fork_join_sched_funcs; c = c->parent) {
+    lithe_fork_join_sched_t *pf = (lithe_fork_join_sched_t *)c->parent;
+    if (__atomic_load_n(&pf->runnable_count, __ATOMIC_ACQUIRE) > 0)
+      return 1;
+    int want = 0;
+    lithe_sched_t *sib;
+    spin_pdr_lock(&pf->child_sched_list_lock);
+    TAILQ_FOREACH(sib, &pf->child_sched_list, link)
+      if (sib != c && fjs_child_needs_hart(sib)) {
+        want = 1;
+        break;
+      }
+    spin_pdr_unlock(&pf->child_sched_list_lock);
+    if (want)
+      return 1;
+  }
+  return 0;
+}
+/* Exported for runtimes that keep a hart while idle (libomp's fork/join
+ * barrier, wait_sync): 1 when the current FJS scheduler's chain to the root
+ * has unmet demand elsewhere, so the waiter should block and let the hart go.
+ * Takes each ancestor's child-list lock; callers rate-limit it. */
+int lithe_fork_join_hart_wanted_elsewhere(void)
+{
+  lithe_sched_t *cur = lithe_sched_current();
+  if (cur == NULL || cur->funcs != &lithe_fork_join_sched_funcs)
+    return 0;
+  return fjs_chain_demand((lithe_fork_join_sched_t *)cur);
 }
 /* Own work first when this hart is the only one this sched owns and its own
  * contexts are waiting: otherwise a hart handed back by a child is granted
@@ -3065,8 +3136,25 @@ restart:
    * schedule_context. So an idle progress-child hart releases its demand down to the harts
    * the child will still hold, and leaves through the lost-wakeup protocol below.
    * LITHE_PROGRESS_CHILD_DRIVE=1 restores the old spin/park/drive path. */
-  if (fjs_progress_sched_child && (void *)sched == (void *)lithe_progress_child_sched &&
-      !fjs_progress_child_drive()) {
+  /* GAPS B61 (2026-10-25) LITHE_FJS_CHILD_IDLE_LEAVE (default 1; =0 disables): the same rule for
+   * EVERY child fork-join scheduler. Hosted miniFE, 4 ranks x 2 libomp threads in nested mode
+   * (a team scheduler per rank under the rank scheduler), 3 harts: one team scheduler held 2
+   * harts with 1 context running -- its idle hart parked in the reactor driver slot -- while two
+   * sibling teams sat runnable with granted=0 (gdb ledger, .build_logs/b60/mfe_hang). Hung 5/5.
+   * An idle child hart now sheds its surplus demand and returns to its parent at once: no spin,
+   * no park, no reactor drive; only the bottom scheduler waits.
+   * Only when some FJS ancestor or a sibling on the way up has unmet demand (fjs_chain_demand):
+   * gating on fjs_parent_starved up the chain (owns NO harts) instead hung nested 1/10 -- a sibling holding
+   * one hart but needing two, or a parent whose harts are all lent to children, was not
+   * "starved" -- and slowed it (CG 0.487 -> 0.549 s). Leaving
+   * unconditionally made every flat rank scheduler (child of the root) drop its hart on each
+   * idle moment and re-request it, hosted ranks K=8 mean 536 -> 563 us, p99 831 -> 1043 us,
+   * flat miniFE+OMP CG +1.7 % (n=8, .build_logs/b60/b61_gate.txt). */
+  if ((fjs_progress_sched_child && (void *)sched == (void *)lithe_progress_child_sched &&
+       !fjs_progress_child_drive()) ||
+      (fjs_child_idle_leave_on() && sched->sched.parent &&
+       sched->sched.parent->funcs == &lithe_fork_join_sched_funcs &&
+       !fjs_any_child_needs_hart(sched) && fjs_chain_demand(sched))) {
     uint16_t *pg = (uint16_t *)&sched->sched.parent_data;
     uint16_t *pn = (uint16_t *)&sched->sched.parent_data + 1;
     int surplus = (int)*pn - ((int)*pg - 1);
