@@ -550,6 +550,47 @@ static inline int base_wake_parked_only_on(void)
   return base_wake_parked_only;
 }
 
+/* DIRECTED WAKE (LITHE_WAKE_HINT, GAPS B62, default 0 until A/B'd). An unblocked
+ * FJS context is queued on its home vcore (preferred_vcq), like a qthreads
+ * waiter going back to its home shepherd's queue. But maybe_vcore_request()
+ * claimed whichever idle hart a scan from vcore 0 found first, so the hart that
+ * came down found its own queue empty and had to steal from the home queue
+ * (tdequeue 12 % of a cross-hart fanout profile; qthreads nemesis, whose idle
+ * worker spins on the home queue itself, does the same fan-out 3.2x faster).
+ * schedule_context records each woken context's home vcore here (per thread:
+ * the release loop runs on the waker's stack, batched or not); the next base
+ * request claims those vcores' spinning harts first. A stale hint costs a
+ * steal, as before. */
+#define LITHE_WAKE_HINT_MAX 16
+static __thread int lithe_wake_hint_vc[LITHE_WAKE_HINT_MAX];
+static __thread int lithe_wake_hint_n;
+static int lithe_wake_hint_on = -1;
+int lithe_wake_hint_enabled(void)
+{
+  if (__builtin_expect(lithe_wake_hint_on < 0, 0)) {
+    const char *e = getenv("LITHE_WAKE_HINT");
+    lithe_wake_hint_on = (e && e[0] == '1') ? 1 : 0;
+  }
+  return lithe_wake_hint_on;
+}
+void lithe_wake_hint(int vc)
+{
+  if (lithe_wake_hint_enabled() && vc >= 0 && lithe_wake_hint_n < LITHE_WAKE_HINT_MAX)
+    lithe_wake_hint_vc[lithe_wake_hint_n++] = vc;
+}
+static int lithe_wake_hinted(int k)
+{
+  int n = lithe_wake_hint_n, claimed = 0;
+  lithe_wake_hint_n = 0;
+  for (int i = 0; i < n && claimed < k; i++) {
+    int v = lithe_wake_hint_vc[i];
+    if (v < (int)max_vcores() && wake_me_up[v].vcid &&
+        __sync_lock_test_and_set(&wake_me_up[v].vcid, 0))
+      claimed++;
+  }
+  return claimed;
+}
+
 static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h)
 {
   assert(root_sched == child);
@@ -607,7 +648,10 @@ static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h
     } else {
       parlib_reactor_wake();
     }
-    maybe_vcore_request(wake_n);
+    if (lithe_wake_hint_n > 0)
+      wake_n -= lithe_wake_hinted(wake_n);
+    if (wake_n > 0)
+      maybe_vcore_request(wake_n);
   }
 }
 

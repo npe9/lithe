@@ -1333,12 +1333,15 @@ static void fjs_request_harts(int h)
 	fjs_maybe_reactor_wake();
 }
 
+void lithe_wake_hint(int vc); /* lithe.c, LITHE_WAKE_HINT */
+static unsigned int fjs_home_grace = 256; /* pauses */
+int lithe_wake_hint_enabled(void);
 static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 {
 	lithe_sched_t *owner;
 	lithe_sched_t *cur;
 
-	__thread_enqueue(ctx, athead);
+	lithe_wake_hint(__thread_enqueue(ctx, athead));
 	/* CHANGE 2: when a team-wake batch is open (master's fork/join release
 	 * loop), enqueue all workers first and defer a single hart_request(N) +
 	 * reactor_wake to lithe_fork_join_wake_batch_end().
@@ -3229,6 +3232,7 @@ restart:
     /* NOTE: clamping budget to spin_min when empty+soft_cap was tried with
      * wake-on-yield and still regressed P1K2 (timeouts / ~0.5–1ms). Keep
      * full adaptive spin before timed park. */
+    unsigned int home_wait = 0;
     for (unsigned int i = 0; i < budget; i++) {
       cpu_relax();
       /* Hot path: only cheap atomics every iter. parlib_reactor_pending() and
@@ -3255,9 +3259,21 @@ restart:
         }
       }
       /* Peek local runqueue OR any sched-wide RUNNABLE/WARM (stealable on
-       * other vcores). Checking only tqsize(my_vc) missed ready peers. */
-      if (tqsize_s(sched, my_vc) > 0 ||
-          __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0 ||
+       * other vcores). Checking only tqsize(my_vc) missed ready peers.
+       * LITHE_WAKE_HINT (GAPS B62): a woken context is queued on the hart it
+       * blocked on, so every idle spinner reacting to the sched-wide count
+       * herded onto one queue lock (57 % of tdequeue in a cross-hart fan-out
+       * was that xchg). Like a qthreads nemesis worker, watch the OWN queue
+       * first; react to work elsewhere only after it stayed queued for
+       * fjs_home_grace pauses (its home hart did not take it: steal). */
+      int other = __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0;
+      if (other && lithe_wake_hint_enabled() && tqsize_s(sched, my_vc) == 0) {
+        if (++home_wait < fjs_home_grace)
+          other = 0;
+      } else {
+        home_wait = 0;
+      }
+      if (tqsize_s(sched, my_vc) > 0 || other ||
           __atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0) {
         fjs_hart_enter_spin_update(my_vc, /*succeeded=*/1);
         if (lithe_sched_trace_enabled())
@@ -3519,6 +3535,10 @@ void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
 	assert(ctx->state == FJS_CTX_RUNNING);
 	fjs_lpt_stop(ctx, 0);
 	ctx->state = FJS_CTX_BLOCKED;
+	/* LITHE_WAKE_HINT: home = the hart it blocks on (about to go idle), so the
+	 * wake queues it there and claims that hart (lithe.c DIRECTED WAKE). */
+	if (lithe_wake_hint_enabled())
+		ctx->preferred_vcq = vcore_id();
 	fjs_stats_run_leave();
 	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
 	                   __ATOMIC_SEQ_CST);
