@@ -591,6 +591,42 @@ static int lithe_wake_hinted(int k)
   return claimed;
 }
 
+/* SHEPHERD-STYLE WAKE DOMAIN (LITHE_WAKE_DOMAIN, GAPS B62, default 0).
+ * qthreads keeps a woken thread inside its shepherd (a locality domain); Lithe claimed
+ * whichever idle hart a scan from vcore 0 found, so a synchronous handoff migrated across
+ * L3 groups on every wake: ulth_bench pingpong 1.5 us inside one L3, 5.0 us over two L3s,
+ * 11.0 us over two NUMA nodes (cores 32-35 / 32,33,40,41 / 32,33,56,57). Claim a spinning
+ * hart in the WAKER's L3 group first, then its NUMA node, then anywhere; the claimed hart
+ * then dequeues or steals the context, so it runs next to the cache that just touched it.
+ * MEASURED (2026-10-26, n=3 interleaved): no change except cross-NUMA pingpong 10.8 -> 9.2;
+ * fanout 2.6 / 8.3 / 21.0 us either way. Which hart is claimed is not the cost: the
+ * wake's base -> root -> child descent is (docs/PLAN-alt-runtimes.md "Locality"). Kept off. */
+#include <parlib/vcore.h>
+static int lithe_wake_domain_on = -1;
+static int lithe_wake_domain(int k)
+{
+  if (__builtin_expect(lithe_wake_domain_on < 0, 0)) {
+    const char *e = getenv("LITHE_WAKE_DOMAIN");
+    lithe_wake_domain_on = (e && e[0] == '1') ? 1 : 0;
+  }
+  if (!lithe_wake_domain_on || k <= 0)
+    return 0;
+  int me = vcore_id(), mv = (int)max_vcores(), claimed = 0;
+  int l3 = parlib_vcore_l3_group(me), numa = parlib_vcore_numa_node(me);
+  if (l3 < 0)
+    return 0;
+  for (int pass = 0; pass < 2 && claimed < k; pass++)
+    for (int i = 1; i < mv && claimed < k; i++) {
+      int v = (me + i) % mv;
+      int ok = pass == 0 ? parlib_vcore_l3_group(v) == l3
+                         : (numa >= 0 && parlib_vcore_numa_node(v) == numa &&
+                            parlib_vcore_l3_group(v) != l3);
+      if (ok && wake_me_up[v].vcid && __sync_lock_test_and_set(&wake_me_up[v].vcid, 0))
+        claimed++;
+    }
+  return claimed;
+}
+
 static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h)
 {
   assert(root_sched == child);
@@ -650,6 +686,8 @@ static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h
     }
     if (lithe_wake_hint_n > 0)
       wake_n -= lithe_wake_hinted(wake_n);
+    if (wake_n > 0)
+      wake_n -= lithe_wake_domain(wake_n);
     if (wake_n > 0)
       maybe_vcore_request(wake_n);
   }

@@ -82,14 +82,20 @@ struct lithe_fork_join_vc_mgmt {
 #define rseed(i)    rseed_s((lithe_fork_join_sched_t*)lithe_sched_current(), i)
 #define vconline(i) vconline_s((lithe_fork_join_sched_t*)lithe_sched_current(), i)
 
+/* Hot words each get their own cache line (GAPS B62, 2026-10-26): runnable_count,
+ * warm_ready_count, leaving_harts, running_count, the child list and its lock had
+ * shared two lines, so every enqueue/dequeue/idle-yield invalidated the line other
+ * harts read on every hart_enter. Padding: fan-out wake 12-18 % faster in one L3,
+ * across L3s and across NUMA nodes (ulth fanout/pingpong n=5, ranges disjoint).
+ * FJS-internal layout; liblithe allocates the struct, no client reads its fields. */
 typedef struct {
   lithe_sched_t sched;
   size_t num_contexts;
   size_t granting_harts;
   volatile int next_queue_id;
-  struct lithe_sched_queue child_sched_list;
-  spin_pdr_lock_t child_sched_list_lock;
-  struct lithe_fork_join_vc_mgmt *vc_mgmt;
+  struct lithe_sched_queue __attribute__((aligned(ARCH_CL_SIZE))) child_sched_list;
+  spin_pdr_lock_t __attribute__((aligned(ARCH_CL_SIZE))) child_sched_list_lock;
+  struct lithe_fork_join_vc_mgmt * __attribute__((aligned(ARCH_CL_SIZE))) vc_mgmt;
   /* CHANGE 1 (O(1) dispatch): total RUNNABLE contexts currently sitting on this
    * scheduler's per-vcore runqueues (sum of tqsize over all vcores), maintained
    * as a single atomic. A vcore in hart_enter whose own queue is empty reads
@@ -104,9 +110,9 @@ typedef struct {
    * parlib); the field is FJS-internal (callers only hold opaque pointers and
    * the offset-0 embedded lithe_sched_t), so appending it is ABI-safe for
    * libomp/OMPI which link liblithe.so dynamically. */
-  long runnable_count;
+  long __attribute__((aligned(ARCH_CL_SIZE))) runnable_count;
   /* When set, hart_enter yields immediately (process teardown). */
-  volatile int teardown_quiesce;
+  volatile int __attribute__((aligned(ARCH_CL_SIZE))) teardown_quiesce;
   /* WARM VCORES: number of warm-parked workers (FJS_WARM_SLOT) that have been
    * marked GO by a fork (lithe_fork_join_resume_warm) and not yet claimed by a
    * hart_enter. A vcore reads this once: if 0, no warm worker is resumable, so
@@ -114,7 +120,7 @@ typedef struct {
    * same release/acquire discipline as runnable_count (incremented before the
    * paired hart_request, decremented on claim), so a hart woken for a warm
    * resume always observes count>0 and finds the worker -- no lost wakeup. */
-  long warm_ready_count;
+  long __attribute__((aligned(ARCH_CL_SIZE))) warm_ready_count;
   /* LOST-WAKEUP GUARD: harts that have committed to lithe_hart_yield() from
    * the idle path but whose sched.harts decrement may not yet be visible.
    * Incremented (SEQ_CST) BEFORE the idler's final runnable re-check;
@@ -127,14 +133,14 @@ typedef struct {
    * the remaining harts spin inside their own contexts (single-OS hosted
    * miniFE P1K4 nx=80 CG stall). Plain C11 atomics; appended field is
    * ABI-safe (FJS-internal, callers hold opaque pointers). */
-  long leaving_harts;
+  long __attribute__((aligned(ARCH_CL_SIZE))) leaving_harts;
   /* IDLE-AWARE PEER CHECK (2026-10-16, GAPS C11 part 2): contexts of this
    * sched currently RUNNING on a hart (the main context counts from sched
    * creation). owned - running_count = harts of this sched that are inside
    * hart_enter with nothing to run; such a hart dequeues a RUNNABLE peer
    * itself, so a hart-holding spinner need not yield for that peer. Plain
    * C11 atomics, appended field, ABI-safe like the ones above. */
-  long running_count;
+  long __attribute__((aligned(ARCH_CL_SIZE))) running_count;
   /* LPT (LITHE_FJS_LPT): queued contexts that carry a long-burst prediction.
    * While 0 a hart takes the plain local-queue fast path; only when some
    * queued context could be ranked does it scan all queues. Appended field. */
@@ -144,6 +150,9 @@ typedef struct {
    * scan is skipped. Racy relaxed updates; appended fields. */
   uint64_t lpt_hi_ns;
   uint64_t lpt_lo_ns;
+  /* LITHE_FJS_WAKE_LOCAL (GAPS B62): unclaimed harts spinning idle in this sched's
+   * hart_enter. A waker claims one (CAS) instead of walking hart_request up the chain. */
+  long __attribute__((aligned(ARCH_CL_SIZE))) idle_spinning;
 } lithe_fork_join_sched_t;
 
 typedef struct {

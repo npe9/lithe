@@ -1148,6 +1148,48 @@ static inline bool fjs_steal_ok(lithe_fork_join_context_t *f)
 	return d == 0 || f->lpt_enq_ns == 0 || fjs_lpt_now() - f->lpt_enq_ns >= d;
 }
 
+/* LITHE_FJS_WAKE_LOCAL (GAPS B62, default 0). A wake in a child scheduler walked
+ * lithe_hart_request up to the root even when the child already owned a hart spinning
+ * idle in its hart_enter; across L3/NUMA domains that root<->child ledger and grant
+ * traffic was 4x the far-cache fills of the same wake in the root (fanout 17 vs 5.6 us).
+ * Spinners register in idle_spinning; a waker claims units (CAS) and requests harts only
+ * for the rest. Units are fungible: a spinner leaving the loop takes one back if any is
+ * left, and if none is, its unit was claimed, so it restarts to serve the wake. Both
+ * sides order through SEQ_CST on idle_spinning after the runnable_count bump. */
+static int fjs_wake_local = -1;
+static inline int fjs_wake_local_on(void)
+{
+	int v = __atomic_load_n(&fjs_wake_local, __ATOMIC_RELAXED);
+	if (v < 0) {
+		const char *e = getenv("LITHE_FJS_WAKE_LOCAL");
+		v = (e && *e == '1') ? 1 : 0;
+		__atomic_store_n(&fjs_wake_local, v, __ATOMIC_RELAXED);
+	}
+	return v;
+}
+/* Claim up to h spinning harts of s; returns how many were claimed. */
+static inline int fjs_claim_spinners(lithe_fork_join_sched_t *s, int h)
+{
+	long n = __atomic_load_n(&s->idle_spinning, __ATOMIC_SEQ_CST);
+	while (n > 0) {
+		long t = n < h ? n : h;
+		if (__atomic_compare_exchange_n(&s->idle_spinning, &n, n - t, false,
+		                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+			return (int)t;
+	}
+	return 0;
+}
+/* Spinner leaving: returns 1 if its unit had been claimed (it must serve a wake). */
+static inline int fjs_spinner_leave(lithe_fork_join_sched_t *s)
+{
+	long n = __atomic_load_n(&s->idle_spinning, __ATOMIC_SEQ_CST);
+	while (n > 0)
+		if (__atomic_compare_exchange_n(&s->idle_spinning, &n, n - 1, false,
+		                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+			return 0;
+	return 1;
+}
+
 static int __thread_enqueue_on(lithe_fork_join_sched_t *sched,
                                lithe_fork_join_context_t *ctx, bool athead)
 {
@@ -1309,6 +1351,11 @@ static void fjs_request_harts(int h)
 		cur = lithe_sched_current();
 		if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs) {
 			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)cur, h);
+			if (h > 0 && fjs_wake_local_on() && fjs_wake_batch_depth <= 0) {
+				h -= fjs_claim_spinners((lithe_fork_join_sched_t *)cur, h);
+				if (h <= 0)
+					return;
+			}
 			if (lithe_sched_trace_enabled())
 				lithe_sched_trace_emit(LITHE_ST_HART_REQUEST, cur,
 				                       (uint32_t)h_req, LITHE_ST_DEC_OK, (int32_t)h);
@@ -1354,8 +1401,11 @@ static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 	cur = lithe_sched_current();
 	if (owner != NULL && owner != cur) {
 		int h = 1;
-		if (owner->funcs == &lithe_fork_join_sched_funcs)
+		if (owner->funcs == &lithe_fork_join_sched_funcs) {
 			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)owner, 1);
+			if (h > 0 && fjs_wake_local_on())
+				h -= fjs_claim_spinners((lithe_fork_join_sched_t *)owner, h);
+		}
 		if (h > 0)
 			lithe_hart_request_for(owner, h);
 		fjs_maybe_reactor_wake();
@@ -2388,6 +2438,7 @@ void lithe_fork_join_sched_init(lithe_fork_join_sched_t *sched,
   sched->granting_harts = 0;
   sched->teardown_quiesce = 0;
   sched->runnable_count = 0;  /* CHANGE 1: O(1) any-runnable indicator */
+  sched->idle_spinning = 0;
   sched->warm_ready_count = 0;  /* WARM VCORES: GO-and-unclaimed warm workers */
   sched->leaving_harts = 0;  /* LOST-WAKEUP GUARD: committed-to-yield harts */
   sched->running_count = 1;  /* IDLE-AWARE PEER CHECK: the main context is running */
@@ -3027,6 +3078,7 @@ void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
    * leaving hart back to restart forever, and the child kept all 3 harts (granted=3,
    * needed=0, nothing runnable; LITHE_PROGRESS_SCHED=child + LITHE_SC_DMA=1, nbc, 2/20). */
   int prog_child_leave = 0;
+  int spin_counted = 0; /* LITHE_FJS_WAKE_LOCAL: registered in idle_spinning */
   if (!vconline(vcore_id()))
     vconline(vcore_id()) = true;
 
@@ -3051,6 +3103,10 @@ void lithe_fork_join_sched_hart_enter(lithe_sched_t *__this)
 
 restart:
   prog_child_leave = 0;
+  if (spin_counted) {
+    (void)fjs_spinner_leave(sched); /* restarting serves any claimed wake */
+    spin_counted = 0;
+  }
   /* Scheduler-driven netpoll: drain completed fd waits before selecting the
    * next continuation. This keeps I/O readiness in the normal Lithe handoff
    * path instead of requiring a helper pthread. */
@@ -3192,6 +3248,12 @@ restart:
     }
     if (budget)
       fjs_hart_enter_spin_update(my_vc, /*succeeded=*/0);
+    if (spin_counted) {
+      spin_counted = 0;
+      if (fjs_spinner_leave(sched) ||
+          __atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 0)
+        goto restart; /* a waker counted on this hart */
+    }
   }
   while (parlib_reactor_pending() > 0) {
     if (fjs_reactor_drivers_max > 0) {
@@ -3233,6 +3295,10 @@ restart:
      * wake-on-yield and still regressed P1K2 (timeouts / ~0.5–1ms). Keep
      * full adaptive spin before timed park. */
     unsigned int home_wait = 0;
+    if (fjs_wake_local_on()) {
+      __atomic_fetch_add(&sched->idle_spinning, 1, __ATOMIC_SEQ_CST);
+      spin_counted = 1;
+    }
     for (unsigned int i = 0; i < budget; i++) {
       cpu_relax();
       /* Hot path: only cheap atomics every iter. parlib_reactor_pending() and
@@ -3266,6 +3332,10 @@ restart:
        * was that xchg). Like a qthreads nemesis worker, watch the OWN queue
        * first; react to work elsewhere only after it stayed queued for
        * fjs_home_grace pauses (its home hart did not take it: steal). */
+      /* Tried and refuted (GAPS B62, 2026-10-26): per-L3 runnable words polled here
+       * instead of the sched-wide count (the qthreads-shepherd idea applied to the
+       * spin) measured 0.98-1.07x across one L3 / two L3 / two NUMA. The cross-domain
+       * cost of a wake is the hops it makes, not spinners re-reading this line. */
       int other = __atomic_load_n(&sched->runnable_count, __ATOMIC_ACQUIRE) > 0;
       if (other && lithe_wake_hint_enabled() && tqsize_s(sched, my_vc) == 0) {
         if (++home_wait < fjs_home_grace)
@@ -3709,6 +3779,7 @@ static void fjs_after_fork_one(lithe_fork_join_sched_t *s, lithe_sched_t *cur,
 		s->vc_mgmt[i].warm_ctx = NULL;
 	}
 	s->runnable_count = 0;
+	s->idle_spinning = 0;
 	s->warm_ready_count = 0;
 	s->leaving_harts = 0;
 	s->granting_harts = 0;
