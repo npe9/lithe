@@ -186,6 +186,7 @@ static int fast_unlock_wake(lithe_mutex_t *mutex)
 #include <dlfcn.h>
 #include "futex.h"
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <parlib/vcore.h>
@@ -319,9 +320,19 @@ static void lprof_dump(void)
     Dl_info di;
     const char *sym = "?";
     long off = 0;
-    if (dladdr(m[j].pc, &di) && di.dli_sname) {
-      sym = di.dli_sname;
-      off = (long)((char *)m[j].pc - (char *)di.dli_saddr);
+    char fb[512];
+    if (dladdr(m[j].pc, &di)) {
+      if (di.dli_sname) {
+        sym = di.dli_sname;
+        off = (long)((char *)m[j].pc - (char *)di.dli_saddr);
+      } else if (di.dli_fname && di.dli_fbase) {
+        /* static symbol in a shared object: file + offset for addr2line -e */
+        const char *b = strrchr(di.dli_fname, '/');
+        snprintf(fb, sizeof fb, "%s@0x%lx", di.dli_fname,
+                 (unsigned long)((char *)m[j].pc - (char *)di.dli_fbase));
+        sym = fb;
+        (void)b;
+      }
     }
     fprintf(f, "[lock_prof] %-18p %10lu %9lu %8lu %8lu %9lu %10.3f %9.1f  %s+%ld\n",
             m[j].pc, m[j].acq, m[j].cont, m[j].parked, m[j].owner_off, m[j].try_fail,
