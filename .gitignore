@@ -40,3 +40,23 @@ build-aux/missing
 config.h.in~
 # Autoconf mkdtemp dirs like confk0qTCw (must not match /configure — fourth char is i)
 /conf[!i]*
+
+# Build artifacts (configure/automake/libtool outputs); untracked 2026-10-26
+.deps/
+.libs/
+*.lo
+*.la
+*.o
+*.a
+*.so
+*.so.*
+*.Plo
+*.Po
+*.Tpo
+Makefile
+!Makefile.am
+config.h
+config.log
+config.status
+libtool
+stamp-h1
