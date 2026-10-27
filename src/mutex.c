@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* Copyright (c) 2011 The Regents of the University of California
  * Ben Hindman <benh@cs.berkeley.edu>
  * Kevin Klues <klueska@cs.berkeley.edu>
@@ -172,10 +173,367 @@ static int fast_unlock_wake(lithe_mutex_t *mutex)
   return 0;
 }
 
+
+/* ====================== Lock profiler (docs/PLAN-locking.md P0) ======================
+ * LITHE_LOCK_PROF=1: per call site (return address of lithe_mutex_lock/trylock),
+ * count acquisitions, contended acquisitions, parks, contentions where the owner was
+ * not on a hart, and wait time. Per-hart tables (no shared lines on the hot path);
+ * merged and printed to stderr (or LITHE_LOCK_PROF_FILE.<pid>) at exit, top 25 by
+ * wait. Symbolize with dladdr; for static binaries the raw pc goes to addr2line. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <dlfcn.h>
+#include "futex.h"
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+#include <parlib/vcore.h>
+#include <parlib/uthread.h>
+
+#define LPROF_SLOTS 512
+struct lprof_ent {
+  void *pc;
+  unsigned long acq, cont, parked, owner_off, try_fail;
+  unsigned long long wait_ns, max_wait_ns;
+};
+static struct lprof_ent *lprof_tab;   /* [max_vcores()+1][LPROF_SLOTS] */
+static int lprof_nv, lprof_on = -1;
+
+static inline uint64_t lk_now_ns(void)
+{
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+static void lprof_dump(void);
+static int lprof_enabled(void)
+{
+  if (__builtin_expect(lprof_on < 0, 0)) {
+    const char *e = getenv("LITHE_LOCK_PROF");
+    int on = (e && e[0] == '1');
+    if (on) {
+      lprof_nv = max_vcores() + 1;
+      lprof_tab = calloc((size_t)lprof_nv * LPROF_SLOTS, sizeof(struct lprof_ent));
+      if (!lprof_tab)
+        on = 0;
+      else
+        atexit(lprof_dump);
+    }
+    __atomic_store_n(&lprof_on, on, __ATOMIC_RELEASE);
+  }
+  return lprof_on;
+}
+
+static inline struct lprof_ent *lprof_slot(void *pc)
+{
+  int v = (current_uthread && !in_vcore_context()) ? vcore_id() : lprof_nv - 1;
+  if (v < 0 || v >= lprof_nv)
+    v = lprof_nv - 1;   /* the last row is shared by non-hart callers (racy, fine) */
+  struct lprof_ent *t = lprof_tab + (size_t)v * LPROF_SLOTS;
+  unsigned h = (unsigned)(((uintptr_t)pc >> 3) * 0x9E3779B1u) % LPROF_SLOTS;
+  for (int i = 0; i < 16; i++) {
+    struct lprof_ent *e = &t[(h + i) % LPROF_SLOTS];
+    if (e->pc == pc)
+      return e;
+    if (e->pc == NULL) {
+      e->pc = pc;
+      return e;
+    }
+  }
+  return NULL;
+}
+
+static void lprof_record(void *pc, int contended, int parked, int owner_off,
+                         uint64_t wait_ns)
+{
+  struct lprof_ent *e = lprof_slot(pc);
+  if (!e)
+    return;
+  e->acq++;
+  if (contended) {
+    e->cont++;
+    e->parked += parked;
+    e->owner_off += owner_off;
+    e->wait_ns += wait_ns;
+    if (wait_ns > e->max_wait_ns)
+      e->max_wait_ns = wait_ns;
+  }
+}
+
+static int lprof_cmp(const void *a, const void *b)
+{
+  const struct lprof_ent *x = a, *y = b;
+  if (x->wait_ns != y->wait_ns)
+    return x->wait_ns < y->wait_ns ? 1 : -1;
+  return x->acq < y->acq ? 1 : (x->acq > y->acq ? -1 : 0);
+}
+
+static void lprof_dump(void)
+{
+  struct lprof_ent *m = calloc(LPROF_SLOTS * 4, sizeof(*m));
+  int n = 0;
+  if (!m)
+    return;
+  for (int v = 0; v < lprof_nv; v++)
+    for (int i = 0; i < LPROF_SLOTS; i++) {
+      struct lprof_ent *e = &lprof_tab[(size_t)v * LPROF_SLOTS + i];
+      if (!e->pc)
+        continue;
+      int j;
+      for (j = 0; j < n && m[j].pc != e->pc; j++)
+        ;
+      if (j == n) {
+        if (n == LPROF_SLOTS * 4)
+          continue;
+        m[n++].pc = e->pc;
+      }
+      m[j].acq += e->acq; m[j].cont += e->cont; m[j].parked += e->parked;
+      m[j].owner_off += e->owner_off; m[j].try_fail += e->try_fail;
+      m[j].wait_ns += e->wait_ns;
+      if (e->max_wait_ns > m[j].max_wait_ns)
+        m[j].max_wait_ns = e->max_wait_ns;
+    }
+  qsort(m, n, sizeof(*m), lprof_cmp);
+  FILE *f = stderr;
+  const char *path = getenv("LITHE_LOCK_PROF_FILE");
+  char buf[512];
+  if (path) {
+    snprintf(buf, sizeof(buf), "%s.%d", path, (int)getpid());
+    FILE *g = fopen(buf, "w");
+    if (g)
+      f = g;
+  }
+  unsigned long ta = 0, tc = 0, tp = 0, to = 0;
+  unsigned long long tw = 0;
+  for (int j = 0; j < n; j++) {
+    ta += m[j].acq; tc += m[j].cont; tp += m[j].parked; to += m[j].owner_off; tw += m[j].wait_ns;
+  }
+  fprintf(f, "[lock_prof] pid %d sites %d acq %lu contended %lu (%.2f%%) parked %lu "
+          "owner_off %lu wait_ms %.3f\n", (int)getpid(), n, ta, tc,
+          ta ? 100.0 * tc / ta : 0.0, tp, to, tw / 1e6);
+  fprintf(f, "[lock_prof] %-18s %10s %9s %8s %8s %9s %10s %9s  %s\n", "pc", "acq", "cont",
+          "parked", "own_off", "tryfail", "wait_ms", "max_us", "symbol");
+  for (int j = 0; j < n && j < 25; j++) {
+    Dl_info di;
+    const char *sym = "?";
+    long off = 0;
+    if (dladdr(m[j].pc, &di) && di.dli_sname) {
+      sym = di.dli_sname;
+      off = (long)((char *)m[j].pc - (char *)di.dli_saddr);
+    }
+    fprintf(f, "[lock_prof] %-18p %10lu %9lu %8lu %8lu %9lu %10.3f %9.1f  %s+%ld\n",
+            m[j].pc, m[j].acq, m[j].cont, m[j].parked, m[j].owner_off, m[j].try_fail,
+            m[j].wait_ns / 1e6, m[j].max_wait_ns / 1e3, sym, off);
+  }
+  if (f != stderr)
+    fclose(f);
+  free(m);
+}
+
+/* ====================== Parking-lot mutex (docs/PLAN-locking.md P2) ==================
+ * LITHE_MUTEX_LOT=1 (2026-10-26, default off for A/B; non-recursive mutexes; takes
+ * precedence over LITHE_MUTEX_FAST). `locked` is a word with LOCKED=1, PARKED=2; the
+ * waiters live in the parking lot keyed by &locked, so the mutex's own queue and MCS lock
+ * are unused. `owner` is a hint (relaxed) and `qnode` carries the owner's vcore + 1, so
+ * the struct layout (embedded by libfabric, OMPI) is unchanged.
+ *
+ * Contended lock: spin only while the owner is on a hart (uth.state == UT_RUNNING) and for
+ * at most LITHE_LOCK_SPIN_NS (default 1500 ns, about one same-L3 wake, B62); with
+ * LITHE_LOCK_SPIN_TOPO=1 the budget is scaled by the owner's distance (x3 another L3,
+ * x6 another NUMA node: B62 wake costs 1.3 / 4.7 / 9.8 us). Otherwise set PARKED and park.
+ * A holder that is not running never has spinners.
+ *
+ * Unlock: CAS LOCKED -> 0; if PARKED, unpark one. If the woken waiter has waited longer
+ * than LITHE_LOT_FAIR_NS (1 ms), ownership is handed to it (LOCKED stays set) so a hot
+ * lock cannot starve it; otherwise the word becomes PARKED-if-more and the waiter races.
+ */
+#define LK_LOCKED 1
+#define LK_PARKED 2
+#define LK_HANDOFF 1L
+static int lithe_mutex_lot = -1;
+static uint64_t lk_spin_ns = 1500, lk_fair_ns = 1000000;
+static int lk_spin_topo = 0;
+/* LITHE_LOCK_RQ_AWARE=1 (default 0 until A/B'd): spinning is free only when this
+ * hart has nothing else to run. If our fork-join scheduler has runnable contexts
+ * without a hart, park at once even if the holder runs -- the hart goes to them.
+ * LITHE_LOCK_OFF_SPIN_NS=n (default 0): when the holder is off its hart, still spin
+ * up to n ns before parking (a holder that only yielded is often back sooner than a
+ * park+wake). */
+static int lk_rq_aware = 0;
+static uint64_t lk_off_spin_ns = 0;
+extern long lithe_fork_join_current_hartless_runnable(void);
+static inline int mutex_lot(const lithe_mutex_t *mutex)
+{
+  if (__builtin_expect(lithe_mutex_lot < 0, 0)) {
+    const char *e = getenv("LITHE_MUTEX_LOT");
+    const char *sp = getenv("LITHE_LOCK_SPIN_NS");
+    const char *fa = getenv("LITHE_LOT_FAIR_NS");
+    const char *tp = getenv("LITHE_LOCK_SPIN_TOPO");
+    if (sp && atol(sp) >= 0) lk_spin_ns = (uint64_t)atol(sp);
+    if (fa && atol(fa) > 0) lk_fair_ns = (uint64_t)atol(fa);
+    lk_spin_topo = (tp && tp[0] == '1');
+    const char *rq = getenv("LITHE_LOCK_RQ_AWARE");
+    lk_rq_aware = (rq && rq[0] == '1');
+    const char *os = getenv("LITHE_LOCK_OFF_SPIN_NS");
+    if (os && atol(os) > 0) lk_off_spin_ns = (uint64_t)atol(os);
+    lithe_mutex_lot = (e && e[0] == '1') ? 1 : 0;
+  }
+  return lithe_mutex_lot && mutex->attr.type != LITHE_MUTEX_RECURSIVE;
+}
+
+static inline void lk_set_owner(lithe_mutex_t *mutex)
+{
+  __atomic_store_n(&mutex->owner, lithe_context_self(), __ATOMIC_RELAXED);
+  if (lk_spin_topo)
+    __atomic_store_n(&mutex->qnode,
+                     (mcs_lock_qnode_t *)(intptr_t)((current_uthread ? vcore_id() : -1) + 1),
+                     __ATOMIC_RELAXED);
+}
+
+static int lk_validate(void *arg)
+{
+  lithe_mutex_t *m = arg;
+  return __atomic_load_n(&m->locked, __ATOMIC_ACQUIRE) == (LK_LOCKED | LK_PARKED);
+}
+
+static uint64_t lk_budget(lithe_mutex_t *mutex)
+{
+  if (!lk_spin_topo)
+    return lk_spin_ns;
+  int ov = (int)(intptr_t)__atomic_load_n(&mutex->qnode, __ATOMIC_RELAXED) - 1;
+  int me = current_uthread ? vcore_id() : -1;
+  if (ov < 0 || me < 0)
+    return lk_spin_ns;
+  if (parlib_vcore_l3_group(ov) == parlib_vcore_l3_group(me))
+    return lk_spin_ns;
+  if (parlib_vcore_numa_node(ov) == parlib_vcore_numa_node(me))
+    return lk_spin_ns * 3;
+  return lk_spin_ns * 6;
+}
+
+/* returns 1 if it parked at least once, for the profiler; *owner_off likewise */
+static int lot_lock_slow(lithe_mutex_t *mutex, int *owner_off)
+{
+  uint64_t t0 = 0, budget = 0;
+  int parked = 0;
+  unsigned i = 0;
+  for (;;) {
+    int s = __atomic_load_n(&mutex->locked, __ATOMIC_RELAXED);
+    if (!(s & LK_LOCKED)) {
+      if (__atomic_compare_exchange_n(&mutex->locked, &s, s | LK_LOCKED, true,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        break;
+      continue;
+    }
+    {
+      /* The owner hint is NULL between a holder's CAS and its store, and after unlock:
+       * unknown counts as running (spin within budget), only a known off-hart holder
+       * parks at once. Spin even when others are parked (PARKED set): parking at once
+       * behind a parked waiter convoyed -- every acquisition contended, the lock idle
+       * while each woken waiter waited for a hart (lock_bench holder: 97 % contended
+       * vs 12 % with the B67 spin; 2026-10-26). */
+      lithe_context_t *o = __atomic_load_n(&mutex->owner, __ATOMIC_RELAXED);
+      int running = !o || __atomic_load_n(&o->uth.state, __ATOMIC_RELAXED) == UT_RUNNING;
+      if (!running && owner_off)
+        *owner_off = 1;
+      uint64_t lim = running ? lk_spin_ns : lk_off_spin_ns;
+      if (lim > 0) {
+        if ((++i & 31u) && t0) {
+          cpu_relax();
+          continue;
+        }
+        /* Every 32nd pass (and the first): clock, and -- RQ_AWARE -- whether contexts
+         * in our scheduler wait for a hart; then spinning would steal this one. */
+        if (!(lk_rq_aware && lithe_fork_join_current_hartless_runnable() > 0)) {
+          if (t0 == 0) {
+            t0 = lk_now_ns();
+            budget = running ? lk_budget(mutex) : lim;
+          }
+          if (lk_now_ns() - t0 < budget) {
+            cpu_relax();
+            continue;
+          }
+        }
+      }
+    }
+    if (!(s & LK_PARKED) &&
+        !__atomic_compare_exchange_n(&mutex->locked, &s, s | LK_PARKED, true,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+      continue;
+    if (!lithe_can_block()) {
+      /* Not a Lithe context (GAPS B29): kernel-yield until free. */
+      while (__atomic_load_n(&mutex->locked, __ATOMIC_ACQUIRE) & LK_LOCKED)
+        sched_yield();
+      continue;
+    }
+    long token = 0;
+    int r = lithe_park(&mutex->locked, lk_validate, mutex, 0, &token);
+    parked = 1;
+    if (r == LITHE_PARK_UNPARKED && token == LK_HANDOFF)
+      break;   /* the unlocker handed us the lock (fairness) */
+    t0 = 0;
+    i = 0;
+  }
+  lk_set_owner(mutex);
+  return parked;
+}
+
+static long lk_unpark_cb(void *arg, int unparked, int more, unsigned long long waited)
+{
+  lithe_mutex_t *m = arg;
+  if (unparked && waited > lk_fair_ns) {
+    __atomic_store_n(&m->locked, LK_LOCKED | (more ? LK_PARKED : 0), __ATOMIC_RELEASE);
+    return LK_HANDOFF;
+  }
+  __atomic_store_n(&m->locked, more ? LK_PARKED : 0, __ATOMIC_RELEASE);
+  return 0;
+}
+
+static inline int lot_unlock(lithe_mutex_t *mutex)
+{
+  __atomic_store_n(&mutex->owner, NULL, __ATOMIC_RELAXED);
+  int s = LK_LOCKED;
+  if (__atomic_compare_exchange_n(&mutex->locked, &s, 0, false,
+                                  __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+    return 0;
+  (void)lithe_unpark_one(&mutex->locked, lk_unpark_cb, mutex);
+  return 0;
+}
+
+/* For lithe_condvar's requeue (condvar.c): mark the mutex PARKED if it is held, so its
+ * unlock will unpark the requeued waiters. Returns 0 if it is not held (wake instead). */
+int __lithe_mutex_lot_mark_parked(lithe_mutex_t *mutex)
+{
+  int s = __atomic_load_n(&mutex->locked, __ATOMIC_RELAXED);
+  do {
+    if (!(s & LK_LOCKED))
+      return 0;
+  } while (!__atomic_compare_exchange_n(&mutex->locked, &s, s | LK_PARKED, true,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
+  return 1;
+}
+int __lithe_mutex_is_lot(lithe_mutex_t *mutex) { return mutex_lot(mutex); }
+void __lithe_mutex_lot_took_handoff(lithe_mutex_t *mutex) { lk_set_owner(mutex); }
+/* ===================================================================================== */
+
 int lithe_mutex_trylock(lithe_mutex_t *mutex)
 {
   if(mutex == NULL)
     return EINVAL;
+  if (mutex_lot(mutex)) {
+    int z = 0;
+    int ok = __atomic_compare_exchange_n(&mutex->locked, &z, LK_LOCKED, false,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+    if (ok)
+      lk_set_owner(mutex);
+    if (__builtin_expect(lprof_on > 0, 0) || (lprof_on < 0 && lprof_enabled())) {
+      struct lprof_ent *e = lprof_slot(__builtin_return_address(0));
+      if (e) { e->acq += ok; e->try_fail += !ok; }
+    }
+    return ok ? 0 : EBUSY;
+  }
   if (mutex_fast(mutex)) {
     int z = 0;
     if (__atomic_compare_exchange_n(&mutex->locked, &z, 1, false,
@@ -209,6 +567,41 @@ int lithe_mutex_lock(lithe_mutex_t *mutex)
 {
   if(mutex == NULL)
     return EINVAL;
+  if (mutex_lot(mutex) || __builtin_expect(lprof_on != 0, 0)) {
+    int prof = lprof_on > 0 || (lprof_on < 0 && lprof_enabled());
+    if (mutex_lot(mutex)) {
+      int z = 0;
+      if (__atomic_compare_exchange_n(&mutex->locked, &z, LK_LOCKED, false,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        lk_set_owner(mutex);
+        if (prof)
+          lprof_record(__builtin_return_address(0), 0, 0, 0, 0);
+        return 0;
+      }
+      int owner_off = 0;
+      uint64_t t = prof ? lk_now_ns() : 0;
+      int parked = lot_lock_slow(mutex, &owner_off);
+      if (prof)
+        lprof_record(__builtin_return_address(0), 1, parked, owner_off, lk_now_ns() - t);
+      return 0;
+    }
+    if (prof && mutex_fast(mutex)) {
+      /* Profile the B67 fast path too (contended = the first CAS failed). */
+      int z = 0;
+      if (__atomic_compare_exchange_n(&mutex->locked, &z, 1, false,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        mutex->owner = lithe_context_self();
+        lprof_record(__builtin_return_address(0), 0, 0, 0, 0);
+        return 0;
+      }
+      lithe_context_t *o = mutex->owner;
+      int owner_off = !(o && o->uth.state == UT_RUNNING);
+      uint64_t t = lk_now_ns();
+      fast_lock_slow(mutex);
+      lprof_record(__builtin_return_address(0), 1, 0, owner_off, lk_now_ns() - t);
+      return 0;
+    }
+  }
   if (mutex_fast(mutex)) {
     int z = 0;
     if (__atomic_compare_exchange_n(&mutex->locked, &z, 1, false,
@@ -294,6 +687,8 @@ int lithe_mutex_unlock(lithe_mutex_t *mutex)
 {
   if(mutex == NULL)
     return EINVAL;
+  if (mutex_lot(mutex))
+    return lot_unlock(mutex);
   if (mutex_fast(mutex)) {
     mutex->owner = NULL;
     if (__atomic_exchange_n(&mutex->locked, 0, __ATOMIC_RELEASE) == 2)
