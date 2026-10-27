@@ -85,10 +85,106 @@ static void block(lithe_context_t *context, void *arg)
   mcs_pdr_unlock(&mutex->lock, mutex->qnode);
 }
 
+/*
+ * LITHE_MUTEX_FAST (2026-10-26, default ON since the B67 A/B, =0 restores; spin audit, GAPS B67).
+ * Every lock, unlock and trylock took the internal MCS pdr lock (two notif toggles
+ * and two MCS cycles per lock/unlock pair, ~12 locked ops) even uncontended; libfabric's
+ * CQ/EP/MR-cache mutexes made that ~50 % of a hosted 4x4 allreduce (perf). Fast mode,
+ * for non-recursive mutexes only, makes `locked` a state word -- 0 free, 1 locked,
+ * 2 locked and maybe waiters (Drepper's futex mutex) -- and takes the MCS lock only
+ * to queue or wake a waiter:
+ *   lock:   CAS 0->1; else bounded poll, then under MCS xchg(2): 0 means ours,
+ *           otherwise queue and block (the block callback drops MCS). A woken waiter
+ *           retries only with xchg(2), never CAS 0->1, so a later unlock still wakes
+ *           the rest of the queue.
+ *   unlock: xchg(0); if it was 2, under MCS pop one waiter and unblock it.
+ * The xchg(2) and the enqueue happen under MCS, and an unlocker that saw 2 takes MCS
+ * before popping, so it cannot miss a waiter that is mid-enqueue.
+ */
+static int lithe_mutex_fast = -1;
+static inline int mutex_fast(const lithe_mutex_t *mutex)
+{
+  if (__builtin_expect(lithe_mutex_fast < 0, 0)) {
+    const char *e = getenv("LITHE_MUTEX_FAST");
+    lithe_mutex_fast = (e && e[0] == '0') ? 0 : 1;
+  }
+  return lithe_mutex_fast && mutex->attr.type != LITHE_MUTEX_RECURSIVE;
+}
+
+static int mutex_spin_budget(void)
+{
+  static int spin = -1;
+  if (spin < 0) {
+    const char *e = getenv("LITHE_MUTEX_SPIN");
+    int v = e ? atoi(e) : 256;
+    spin = v > 0 ? v : 0;
+  }
+  return spin;
+}
+
+static int fast_lock_slow(lithe_mutex_t *mutex)
+{
+  int woken = 0;
+  for (;;) {
+    int spin = mutex_spin_budget();
+    for (int i = 0; i < spin && __atomic_load_n(&mutex->locked, __ATOMIC_RELAXED); i++)
+      cpu_relax();
+    if (!woken) {
+      int z = 0;
+      if (__atomic_compare_exchange_n(&mutex->locked, &z, 1, false,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        break;
+    }
+    if (!lithe_can_block()) {
+      /* Not a Lithe context (GAPS B29): poll with kernel yields, never queue. */
+      while (__atomic_load_n(&mutex->locked, __ATOMIC_ACQUIRE))
+        sched_yield();
+      if (__atomic_exchange_n(&mutex->locked, 2, __ATOMIC_ACQUIRE) == 0)
+        break;
+      continue;
+    }
+    mcs_lock_qnode_t qnode = {0};
+    mcs_pdr_lock(&mutex->lock, &qnode);
+    lithe_mutex_ensure_queue(mutex);
+    if (__atomic_exchange_n(&mutex->locked, 2, __ATOMIC_ACQUIRE) == 0) {
+      mcs_pdr_unlock(&mutex->lock, &qnode);
+      break;
+    }
+    mutex->qnode = &qnode;
+    lithe_context_block(block, mutex);
+    woken = 1;
+  }
+  mutex->owner = lithe_context_self();
+  return 0;
+}
+
+static int fast_unlock_wake(lithe_mutex_t *mutex)
+{
+  mcs_lock_qnode_t qnode = {0};
+  mcs_pdr_lock(&mutex->lock, &qnode);
+  lithe_mutex_ensure_queue(mutex);
+  lithe_context_t *context = TAILQ_FIRST(&mutex->queue);
+  if (context)
+    TAILQ_REMOVE(&mutex->queue, context, link);
+  mcs_pdr_unlock(&mutex->lock, &qnode);
+  if (context)
+    lithe_context_unblock(context);
+  return 0;
+}
+
 int lithe_mutex_trylock(lithe_mutex_t *mutex)
 {
   if(mutex == NULL)
     return EINVAL;
+  if (mutex_fast(mutex)) {
+    int z = 0;
+    if (__atomic_compare_exchange_n(&mutex->locked, &z, 1, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      mutex->owner = lithe_context_self();
+      return 0;
+    }
+    return EBUSY;
+  }
 
   int retval = 0;
   mcs_lock_qnode_t qnode = {0};
@@ -113,6 +209,15 @@ int lithe_mutex_lock(lithe_mutex_t *mutex)
 {
   if(mutex == NULL)
     return EINVAL;
+  if (mutex_fast(mutex)) {
+    int z = 0;
+    if (__atomic_compare_exchange_n(&mutex->locked, &z, 1, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      mutex->owner = lithe_context_self();
+      return 0;
+    }
+    return fast_lock_slow(mutex);
+  }
 
   mcs_lock_qnode_t qnode = {0};
   mcs_pdr_lock(&mutex->lock, &qnode);
@@ -189,6 +294,12 @@ int lithe_mutex_unlock(lithe_mutex_t *mutex)
 {
   if(mutex == NULL)
     return EINVAL;
+  if (mutex_fast(mutex)) {
+    mutex->owner = NULL;
+    if (__atomic_exchange_n(&mutex->locked, 0, __ATOMIC_RELEASE) == 2)
+      return fast_unlock_wake(mutex);
+    return 0;
+  }
 
   mcs_lock_qnode_t qnode = {0};
   mcs_pdr_lock(&mutex->lock, &qnode);

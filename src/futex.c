@@ -68,6 +68,25 @@ static int futex_linear_on(void)
 }
 
 /* A list of futex blocking queues, one per uaddr. */
+/* LITHE_FUTEX_WAKE_PEEK=1 (2026-10-26, default off: NULL at n=13, GAPS B67).
+ * Every wake looked up -- and on a new address created, under the global
+ * futex_lists_lock, with a malloc never freed -- the address's list, then took its
+ * spinlock, even with nobody waiting. Hosted MPI wakes the waiter's (stack) sync on
+ * every completion, and libgomp wakes on every barrier release. Peek mode: a wake
+ * only looks lists up (no list = no waiter) and returns without the lock when the
+ * queue is empty. Safe because the waiter now enqueues BEFORE checking *uaddr, with
+ * a full fence between, and the waker fences between its store to *uaddr (made by
+ * the caller) and the peek: one of the two sees the other (Dekker). */
+static int futex_peek_on(void)
+{
+  static int on = -1;
+  if (__builtin_expect(on < 0, 0)) {
+    const char *e = getenv("LITHE_FUTEX_WAKE_PEEK");
+    on = (e && e[0] == '1') ? 1 : 0;
+  }
+  return on;
+}
+
 static struct wfl futex_lists = WFL_INITIALIZER(futex_lists);
 static spinlock_t futex_lists_lock = SPINLOCK_INITIALIZER;
 
@@ -172,10 +191,60 @@ static inline int __futex_claim_locked(struct futex_element *e)
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
+/* Peek mode: the list for uaddr if one exists, NULL otherwise (no allocation). */
+static struct futex_list *find_futex_list(int *uaddr)
+{
+  struct futex_list *list;
+  if (futex_linear_on())
+    return get_futex_list(uaddr);
+  for (list = __atomic_load_n(&futex_hash[futex_hash_of(uaddr)], __ATOMIC_ACQUIRE);
+       list; list = list->hnext)
+    if (list->uaddr == uaddr)
+      return list;
+  return NULL;
+}
+
+/* Peek mode: NULL if no waiter can be queued on uaddr, else its list. */
+static inline struct futex_list *futex_wake_list(int *uaddr)
+{
+  if (!futex_peek_on())
+    return get_futex_list(uaddr);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST); /* the caller's store to *uaddr before the peek */
+  struct futex_list *list = find_futex_list(uaddr);
+  if (list == NULL ||
+      __atomic_load_n(&list->tailq.stqh_first, __ATOMIC_ACQUIRE) == NULL)
+    return NULL;
+  return list;
+}
+
 /* lithe_context_block callback.  Atomically checks uaddr == val and blocks. */
 static void __futex_block(lithe_context_t *context, void *arg) {
   struct futex_element *e = arg;
   bool block = true;
+
+  if (futex_peek_on()) {
+    /* Enqueue, fence, then check (pairs with futex_wake_list). */
+    spinlock_lock(&e->list->lock);
+      e->context = context;
+      STAILQ_INSERT_TAIL(&e->list->tailq, e, next);
+      e->on_list = 1;
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      if (*(volatile int *)e->list->uaddr == e->val) {
+        if (e->deadline_ns &&
+            parlib_timer_start(&e->timer, e->deadline_ns, __futex_timeout, e) < 0)
+          e->deadline_ns = 0;
+      } else {
+        /* still ours: wakers claim only under this lock */
+        STAILQ_REMOVE(&e->list->tailq, e, futex_element, next);
+        e->on_list = 0;
+        block = false;
+        e->deadline_ns = 0;
+      }
+    spinlock_unlock(&e->list->lock);
+    if (!block)
+      lithe_context_unblock(context);
+    return;
+  }
 
   spinlock_lock(&e->list->lock);
     if (*e->list->uaddr == e->val) {
@@ -240,8 +309,10 @@ int futex_wait_timeout(int *uaddr, int val, const struct timespec *rel)
 
 int futex_wake_one(int *uaddr)
 {
-  struct futex_list *list = get_futex_list(uaddr);
+  struct futex_list *list = futex_wake_list(uaddr);
   struct futex_element *e;
+  if (list == NULL)
+    return 0;
   spinlock_lock(&list->lock);
     while ((e = STAILQ_FIRST(&list->tailq)) != NULL) {
       STAILQ_REMOVE_HEAD(&list->tailq, next);
@@ -278,9 +349,11 @@ int futex_wake_all(int *uaddr)
 int futex_wake_some(int *uaddr, int count)
 {
   struct futex_tailq q = STAILQ_HEAD_INITIALIZER(q);
-  struct futex_list *list = get_futex_list(uaddr);
+  struct futex_list *list = futex_wake_list(uaddr);
   struct futex_element *e;
 
+  if (list == NULL)
+    return 0;
   spinlock_lock(&list->lock);
     /* Remove up to count claimable entries from the queue, and remember them locally. */
     while (count > 0 && (e = STAILQ_FIRST(&list->tailq)) != NULL) {
