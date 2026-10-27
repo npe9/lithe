@@ -300,6 +300,11 @@ int lithe_fork_join_should_yield_to_runnable(void);
 int lithe_fork_join_hart_wanted_elsewhere(void);
 
 /* Scheduler creation, initialization, etc. for the lithe_fork_join_sched. */
+/* Cache-affine blocking policy (GAPS B73): on by default; a runtime that hosts many
+ * rank contexts per process (OMPI, LITHE_CONTEXT_RANKS_PER_HOST>1) calls this with 0.
+ * LITHE_FJS_IDLE_DIRECT / LITHE_FJS_STEAL_DELAY_US override it. */
+void lithe_fork_join_set_affine_policy(int on);
+
 lithe_fork_join_sched_t *lithe_fork_join_sched_create();
 void lithe_fork_join_sched_init(lithe_fork_join_sched_t *sched,
                                 lithe_fork_join_context_t *main_context);

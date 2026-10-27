@@ -144,13 +144,38 @@ static inline int fjs_spin_quiesce_on(void)
  * (LITHE_FJS_SPIN_BEFORE_DRIVE, MPI processes) is separate and still on: off
  * costs hosted miniFE 48^3 2.5-3.5 % (it hides the reactor driver's eventfd
  * wake). */
+/* CACHE-AFFINE BLOCKING POLICY (GAPS B73, 2026-10-27). With blocking OpenMP waits
+ * (LITHE_OMP_NOSPIN=2) and IDLE_DIRECT=2, a blocked worker's hart went back to base and
+ * the next wake landed on whichever hart base granted, which found its own queue empty
+ * and stole: LULESH contexts changed hart on nearly every region (22791 moves), each
+ * thread's compute time rose 104 -> 134 ms for the same static chunk, -35 % overall.
+ * Affine = the root FJS keeps its idle harts in its own hart_enter loop (IDLE_DIRECT=1:
+ * the root is the one scheduler allowed to spin), each watching its own queue, and
+ * another hart steals a queued context only after LITHE_FJS_STEAL_DELAY_US (5 us), so a
+ * woken context goes back to the hart whose cache holds its data. LULESH +38 %, region
+ * cost -19 %, tasking -7..-11 %, mixes/miniFE/ranks8 at parity (n=10). Hosted MPI
+ * (many rank contexts per process) loses 10 % on the 1 MiB allreduce, so a runtime
+ * that hosts rank contexts turns it off: OMPI calls lithe_fork_join_set_affine_policy(0)
+ * when LITHE_CONTEXT_RANKS_PER_HOST>1. The env knobs override either way. */
+static int fjs_affine_policy = 1;
+void lithe_fork_join_set_affine_policy(int on)
+{
+  __atomic_store_n(&fjs_affine_policy, on ? 1 : 0, __ATOMIC_RELAXED);
+}
+static inline int fjs_affine(void)
+{
+  return __atomic_load_n(&fjs_affine_policy, __ATOMIC_RELAXED);
+}
+
 static inline int fjs_idle_direct(lithe_fork_join_sched_t *sched)
 {
-  static int mode = -1;
-  if (__builtin_expect(mode < 0, 0)) {
+  static int env_mode = -1;  /* -1 unread, -2 unset */
+  if (__builtin_expect(env_mode == -1, 0)) {
     const char *e = getenv("LITHE_FJS_IDLE_DIRECT");
-    mode = (e && *e) ? atoi(e) : 2;   /* default 2 since 2026-10-24, see below */
+    env_mode = (e && *e) ? atoi(e) : -2;
   }
+  /* default 2 since 2026-10-24 (below); 1 under the affine policy (B73) */
+  int mode = env_mode != -2 ? env_mode : (fjs_affine() ? 1 : 2);
   if (mode >= 2)
     return 1;
   return mode == 1 && sched->sched.parent && sched->sched.parent->parent;
@@ -1129,23 +1154,32 @@ static inline void fjs_lpt_count_out(lithe_fork_join_sched_t *sched, lithe_fork_
  * SpMV kernel ran 24 % more cycles than vanilla on the same work, with OpenMP contexts
  * moving between harts every few regions (GAPS C18). Stealing stays possible after
  * the delay, so nothing starves (LITHE_FJS_STEAL=none + LPT off hung at CG iter 3). */
-static uint64_t fjs_steal_delay_ns = (uint64_t)-1;
+static uint64_t fjs_steal_delay_ns = (uint64_t)-1;  /* -1 unread, -2 unset */
 static inline uint64_t fjs_lpt_now(void);
 static inline uint64_t fjs_steal_delay(void)
 {
 	uint64_t d = __atomic_load_n(&fjs_steal_delay_ns, __ATOMIC_RELAXED);
 	if (d == (uint64_t)-1) {
 		const char *e = getenv("LITHE_FJS_STEAL_DELAY_US");
-		d = e ? (uint64_t)strtoull(e, NULL, 10) * 1000ull : 0;
+		d = (e && *e) ? (uint64_t)strtoull(e, NULL, 10) * 1000ull : (uint64_t)-2;
 		__atomic_store_n(&fjs_steal_delay_ns, d, __ATOMIC_RELAXED);
 	}
+	if (d == (uint64_t)-2)
+		return fjs_affine() ? 5000ull : 0; /* affine policy (B73): 5 us */
 	return d;
 }
+/* The delay holds only while the refused hart stays in this sched and polls again
+ * (a non-idle-direct FJS: its hart_enter spin / park loop re-runs the dequeue). An
+ * idle-direct sched hands a hart that found nothing straight back up, and nothing
+ * re-requests one when the delay expires: nested hosted miniFE (child FJS, IDLE_DIRECT=1)
+ * hung 10/10 with STEAL_DELAY_US=5 (GAPS B73). Set per dequeue in __thread_dequeue. */
+static __thread bool fjs_steal_delay_live;
 /* Under tqlock: may a hart other than the home one take this queued context? */
 static inline bool fjs_steal_ok(lithe_fork_join_context_t *f)
 {
 	uint64_t d = fjs_steal_delay();
-	return d == 0 || f->lpt_enq_ns == 0 || fjs_lpt_now() - f->lpt_enq_ns >= d;
+	return d == 0 || !fjs_steal_delay_live || f->lpt_enq_ns == 0 ||
+	       fjs_lpt_now() - f->lpt_enq_ns >= d;
 }
 
 /* LITHE_FJS_WAKE_LOCAL (GAPS B62, default 0). A wake in a child scheduler walked
@@ -1778,9 +1812,25 @@ static inline int fjs_yield_steal_on(void)
 {
 	if (__builtin_expect(fjs_yield_steal < 0, 0)) {
 		const char *e = getenv("LITHE_FJS_YIELD_STEAL");
-		fjs_yield_steal = !(e && e[0] == '0');
+		fjs_yield_steal = !(e && e[0] == '0') ? ((e && e[0] == '2') ? 2 : 1) : 0;
 	}
 	return fjs_yield_steal;
+}
+
+/* LITHE_FJS_YIELD_STEAL=2 (GAPS B71, 2026-10-27, A/B; 1 stays the default): steal first
+ * when the local pick is ANY context whose last switch-out was a yield, not only the one
+ * that yielded last on this hart. With two yield-spinners on one hart's queue (OpenMP
+ * barrier waiters, A yields -> B runs -> B yields -> A runs) the pick is never "the one
+ * that just yielded", so the hart never steals, and a woken lock holder queued on a
+ * vcore that has since left starves: libomp tasks + taskwait, 4 threads on 4 harts,
+ * hung 6/10 with the holder of the master's deque lock runnable on vc 2/3, one hart in
+ * the scheduler. Keyed by context id (lithe_fork_join_context_t is embedded by clients:
+ * no new field); a collision only costs or skips one steal. */
+#define FJS_YF_SLOTS 4096
+static unsigned char fjs_yielded_flag[FJS_YF_SLOTS];
+static inline unsigned char *fjs_yf(lithe_fork_join_context_t *c)
+{
+	return &fjs_yielded_flag[(unsigned)c->context.id & (FJS_YF_SLOTS - 1)];
 }
 
 static lithe_fork_join_context_t *__thread_dequeue()
@@ -1869,6 +1919,9 @@ static lithe_fork_join_context_t *__thread_dequeue()
 	lithe_fork_join_context_t *ctx = NULL;
 	int local_tq;
 
+	if (fjs_steal_delay())
+		fjs_steal_delay_live = !fjs_idle_direct(cur);
+
 	/* ORPHANED QUEUES (B42, with PARLIB_SPARE_VCORES): a vcore whose OS thread is
 	 * asleep in the kernel under a uthread (main in pthread_join) still owns a run
 	 * queue nobody drains -- its hart is gone, and the compensating hart's own queue
@@ -1910,6 +1963,13 @@ static lithe_fork_join_context_t *__thread_dequeue()
 			yielder = ctx;
 			ctx = NULL;
 		}
+	}
+	if (ctx && fjs_yield_steal_on() == 2 && *fjs_yf(ctx) &&
+	    __atomic_load_n(&cur->runnable_count, __ATOMIC_ACQUIRE) >
+	    (long)tqsize(vcoreid)) {
+		/* B71: work queued on another hart; this pick only yielded last time */
+		yielder = ctx;
+		ctx = NULL;
 	}
 
 	/* If there isn't one, try and steal one from someone else's queue.
@@ -3621,6 +3681,8 @@ void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
 	lithe_fork_join_context_t *ctx = (void*)c;
 	assert(ctx->state == FJS_CTX_RUNNING);
 	fjs_lpt_stop(ctx, 0);
+	if (fjs_yield_steal_on() == 2)
+		*fjs_yf(ctx) = 0;   /* B71: last switch-out is a block, not a yield */
 	ctx->state = FJS_CTX_BLOCKED;
 	/* LITHE_WAKE_HINT: home = the hart it blocks on (about to go idle), so the
 	 * wake queues it there and claims that hart (lithe.c DIRECTED WAKE). */
@@ -3685,7 +3747,9 @@ static inline int fjs_yield_request_on(void)
 {
 	if (__builtin_expect(fjs_yield_request < 0, 0)) {
 		const char *e = getenv("LITHE_FJS_YIELD_REQUEST");
-		fjs_yield_request = (e && e[0] == '1');
+		/* DEFAULT 1 since 2026-10-27 (GAPS B71): fixes the libomp tasking hang
+		 * (15/20 -> 0/20); regression set, apps and hosted MPI at parity, n=10. */
+		fjs_yield_request = (e && *e) ? (e[0] == '1') : 1;
 	}
 	return fjs_yield_request;
 }
@@ -3704,6 +3768,8 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 		fjs_lpt_stop(ctx, ranked ? 0 : 1);
 		if (v >= 0 && v < FJS_JY_MAX_VC)
 			fjs_just_yielded[v] = ctx;
+		if (fjs_yield_steal_on() == 2)
+			*fjs_yf(ctx) = 1;
 	}
 	fjs_stats_run_leave();
 	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
@@ -3725,7 +3791,7 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 	 * the timeout (HOSTED_FULLCORE soft_cap idle → ms-scale floors). */
 	__thread_enqueue(ctx, false);
 	fjs_maybe_reactor_wake();
-	/* LITHE_FJS_YIELD_REQUEST=1 (default 0, 2026-10-24): a yield is not
+	/* LITHE_FJS_YIELD_REQUEST=1 (default 1 since 2026-10-27, B71): a yield is not
 	 * demand-aware -- it never requests a hart, so when waiters yield instead
 	 * of blocking (libgomp GOMP_LITHE_SPIN_YIELD) no context_unblock ever
 	 * issues the hart_request a park/wake would, and a hart that went back to
