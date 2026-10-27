@@ -1255,6 +1255,56 @@ void __lithe_context_block(uthread_t *uthread, void *__arg)
   parlib_atomic_set(&arg->safe_to_unblock, 1);
 }
  
+/* LITHE_BLOCK_SITES=1 (debug, default off; 2026-10-27): record a short backtrace of
+ * every lithe_context_block, clear it on unblock, and on SIGUSR2 print every context
+ * still blocked (to stderr, or LITHE_BLOCK_SITES_FILE.<pid>). For hangs where every hart
+ * is idle and the question is "what is each context waiting in". Side table keyed by
+ * context id (lithe_context_t is embedded by value elsewhere: no new fields). */
+#include <execinfo.h>
+#include <fcntl.h>
+#include <signal.h>
+#define BS_SLOTS 4096
+#define BS_DEPTH 12
+static int bs_on = -1;
+static struct { int id; int n; void *bt[BS_DEPTH]; } bs_tab[BS_SLOTS];
+static void bs_dump(int sig)
+{
+  (void)sig;
+  char path[512]; int fd = 2;
+  const char *f = getenv("LITHE_BLOCK_SITES_FILE");
+  if (f) { snprintf(path, sizeof path, "%s.%d", f, (int)getpid()); fd = open(path, O_WRONLY|O_CREAT|O_APPEND, 0644); if (fd < 0) fd = 2; }
+  dprintf(fd, "[block_sites] pid %d blocked contexts:\n", (int)getpid());
+  for (int i = 0; i < BS_SLOTS; i++) {
+    int n = __atomic_load_n(&bs_tab[i].n, __ATOMIC_ACQUIRE);
+    if (n <= 0) continue;
+    dprintf(fd, "[block_sites] ctx %d\n", bs_tab[i].id);
+    backtrace_symbols_fd(bs_tab[i].bt, n, fd);
+  }
+  if (fd != 2) close(fd);
+}
+static inline int bs_enabled(void)
+{
+  if (bs_on < 0) {
+    const char *e = getenv("LITHE_BLOCK_SITES");
+    bs_on = (e && e[0] == '1');
+    if (bs_on) signal(SIGUSR2, bs_dump);
+  }
+  return bs_on;
+}
+static inline void bs_record(lithe_context_t *c)
+{
+  if (!bs_enabled() || !c) return;
+  int s = c->id & (BS_SLOTS - 1);
+  bs_tab[s].id = c->id;
+  int n = backtrace(bs_tab[s].bt, BS_DEPTH);
+  __atomic_store_n(&bs_tab[s].n, n, __ATOMIC_RELEASE);
+}
+static inline void bs_clear(lithe_context_t *c)
+{
+  if (bs_on > 0 && c)
+    __atomic_store_n(&bs_tab[c->id & (BS_SLOTS - 1)].n, 0, __ATOMIC_RELEASE);
+}
+
 void lithe_context_block(void (*func)(lithe_context_t *, void *), void *arg)
 {
   assert(!in_vcore_context());
@@ -1265,6 +1315,7 @@ void lithe_context_block(void (*func)(lithe_context_t *, void *), void *arg)
     void *arg;
     parlib_atomic_t safe_to_unblock;
   } __arg = {func, arg, 0};
+  bs_record(current_context);
   uthread_yield(true, __lithe_context_block, &__arg);
   while(parlib_atomic_read(&__arg.safe_to_unblock) == 0);
 }
@@ -1316,6 +1367,7 @@ void lithe_context_unblock(lithe_context_t *context)
   assert(context);
   if (context == NULL || lithe_context_is_stale(context))
     return;   /* a parent-process context in a fork() child: never runs */
+  bs_clear(context);
   lithe_sched_t *sched = current_sched;
   current_sched = context->sched;
   uthread_runnable(&context->uth);

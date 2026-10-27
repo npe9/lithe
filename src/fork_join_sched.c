@@ -2286,13 +2286,30 @@ int lithe_root_fork_join_sched_adopted(void)
  * Returns 0 when the current sched is not a fork-join sched (e.g. the base
  * sched) or there is no current sched. One relaxed-acquire atomic load; safe to
  * call from any lithe context. */
+/* LITHE_FJS_TIMER_DUE (default 1; GAPS B69, 2026-10-27): a context in a timed wait
+ * whose deadline has passed counts as runnable. Timers fire only when some hart enters
+ * the scheduler; spin loops that yield only when runnable_count > 0 (direct wait_sync
+ * idle spin, MTL CQ spin) never did while the sleeper was "blocked", so with every hart
+ * spinning its 100 us timeout never fired: hosted 4x4 on 3 harts with the peer CQ sweep
+ * off hung 20/20 (the sweep had hidden it by draining the sleeper's CQ). 0 restores. */
+static int fjs_timer_due_on = -1;
 long lithe_fork_join_current_runnable_count(void)
 {
   lithe_sched_t *cur = lithe_sched_current();
+  long r;
   if (cur == NULL || cur->funcs != &lithe_fork_join_sched_funcs)
     return 0;
-  return __atomic_load_n(&((lithe_fork_join_sched_t *)cur)->runnable_count,
-                         __ATOMIC_ACQUIRE);
+  r = __atomic_load_n(&((lithe_fork_join_sched_t *)cur)->runnable_count,
+                      __ATOMIC_ACQUIRE);
+  if (r <= 0) {
+    if (__builtin_expect(fjs_timer_due_on < 0, 0)) {
+      const char *e = getenv("LITHE_FJS_TIMER_DUE");
+      fjs_timer_due_on = !(e && e[0] == '0');
+    }
+    if (fjs_timer_due_on && parlib_reactor_timer_due())
+      return 1;
+  }
+  return r;
 }
 
 long lithe_fork_join_current_hartless_runnable(void)
