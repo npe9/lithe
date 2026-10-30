@@ -4017,6 +4017,20 @@ void lithe_fork_join_context_yield_ranked(void)
 	lithe_context_yield();
 }
 
+/* A yield that hands this hart to a hartless runnable peer (libgomp's
+ * demand-yield, GAPS B89): the peer gets the hart, so no hart_request.  The
+ * YIELD_REQUEST below is for blind yield-spinners; on a handoff it requested a
+ * hart the process could not use (hgb_fit 4/10 runs at 0.88, hgb_joblib c4
+ * request storm, ~1.6 M requests/s). */
+static unsigned char fjs_yield_noreq[FJS_MAX_SLICE_VC];
+void lithe_fork_join_context_yield_handoff(void)
+{
+	int v = vcore_id();
+	if (v >= 0 && v < FJS_MAX_SLICE_VC)
+		fjs_yield_noreq[v] = 1;
+	lithe_context_yield();
+}
+
 static int fjs_yield_request = -1;
 static inline int fjs_yield_request_on(void)
 {
@@ -4033,9 +4047,14 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
                                          lithe_context_t *c)
 {
 	lithe_fork_join_context_t *ctx = (void*)c;
+	int noreq = 0;
 	assert(ctx->state == FJS_CTX_RUNNING);
 	{
 		int v = vcore_id(), ranked = 0;
+		if (v >= 0 && v < FJS_MAX_SLICE_VC && fjs_yield_noreq[v]) {
+			fjs_yield_noreq[v] = 0;
+			noreq = 1;
+		}
 		if (v >= 0 && v < FJS_MAX_SLICE_VC && fjs_yield_ranked[v]) {
 			fjs_yield_ranked[v] = 0;
 			ranked = 1;
@@ -4076,7 +4095,7 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 	 * harts for the rest of the run (trace: hart 3 out of the scheduler), 2x
 	 * dynamics, bimodal by whether a hart had parked. Request one hart when
 	 * runnable + running exceeds the harts owned. */
-	if (fjs_yield_request_on()) {
+	if (!noreq && fjs_yield_request_on()) {
 		lithe_fork_join_sched_t *s = (lithe_fork_join_sched_t *)__this;
 		long want = __atomic_load_n(&s->runnable_count, __ATOMIC_ACQUIRE)
 		          + __atomic_load_n(&s->running_count, __ATOMIC_ACQUIRE);

@@ -276,6 +276,8 @@ long lithe_fork_join_current_runnable_count(void);
  * pick the longest predicted burst next (GAPS C17.11). A plain lithe_context_yield after a
  * short slice ranks the context last. */
 void lithe_fork_join_context_yield_ranked(void);
+/* Yield handing the hart to a hartless runnable peer: no hart_request (GAPS B89). */
+void lithe_fork_join_context_yield_handoff(void);
 /* RUNNABLE peers that no idle hart of the current FJ sched will serve:
  * max(0, runnable_count - max(0, owned_harts - running_count)). 0 when the
  * current sched is not a fork-join sched. See fork_join_sched.h running_count
