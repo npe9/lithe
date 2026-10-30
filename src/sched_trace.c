@@ -123,6 +123,19 @@ static void st_start_dumper(void)
 	pthread_attr_destroy(&a);
 }
 
+/* fork() child (2026-10-30, GAPS B87): the dumper thread does not survive fork, so a
+ * SIGUSR2 to a forked DataLoader worker poked a pipe nobody read and no trace was
+ * written. The child gets its own pipe and dumper (the trace path's %p is its pid). */
+static void st_dumper_after_fork(void)
+{
+	if (st_dump_pipe[0] < 0)
+		return;
+	close(st_dump_pipe[0]);
+	close(st_dump_pipe[1]);
+	st_dump_pipe[0] = st_dump_pipe[1] = -1;
+	st_start_dumper();
+}
+
 static void st_on_sigusr2(int sig)
 {
 	(void)sig;
@@ -251,6 +264,7 @@ static void st_init_once(void)
 	atexit(st_atexit_dump);
 	parlib_reactor_set_trace_fn(st_reactor_trace);
 	st_start_dumper();
+	pthread_atfork(NULL, NULL, st_dumper_after_fork);
 
 	st_inited = 1;
 	fprintf(stderr,
