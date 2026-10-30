@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <parlib/vcore.h>
+#include <parlib/tool.h>
 
 #ifndef LITHE_SCHED_TRACE_MAX_VCORES
 #define LITHE_SCHED_TRACE_MAX_VCORES MAX_VCORES
@@ -274,32 +275,89 @@ int lithe_sched_trace_enabled(void)
  * labels by context id (open addressing, first writer wins), names by intern id. */
 #define ST_LABELS 4096
 #define ST_LABEL_LEN 24
-static struct { uint32_t key; char s[ST_LABEL_LEN]; } st_labels[ST_LABELS];
+/* rank: lithe_context_rank_self (2026-10-27), -1 when unset. Labels and ranks are also
+ * kept when tracing is off but a profiling tool registered with parlib (parlib/tool.h),
+ * which reads them through lithe_tool_describe. */
+static struct { uint32_t key; int rank; char s[ST_LABEL_LEN]; } st_labels[ST_LABELS];
 static int st_labels_used[ST_LABELS];
 #define ST_NAMES 64
 static char st_names[ST_NAMES][32];
 static int st_n_names;
 static int st_names_lock;
 
-void lithe_sched_trace_label_self(const char *label)
+/* The entry for context id k, claimed if absent; NULL when the table is full. */
+static int st_label_slot(uint32_t k)
 {
-	uint32_t k;
-	unsigned h, i;
-	if (!lithe_sched_trace_enabled() || !label)
-		return;
-	k = lithe_sched_trace_ctx_key();
-	h = (k * 2654435761u) & (ST_LABELS - 1);
+	unsigned h = (k * 2654435761u) & (ST_LABELS - 1), i;
 	for (i = 0; i < ST_LABELS; i++, h = (h + 1) & (ST_LABELS - 1)) {
 		int z = 0;
-		if (__atomic_load_n(&st_labels_used[h], __ATOMIC_ACQUIRE) == 2 && st_labels[h].key == k)
-			return;
-		if (__atomic_compare_exchange_n(&st_labels_used[h], &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		int u = __atomic_load_n(&st_labels_used[h], __ATOMIC_ACQUIRE);
+		if (u == 2 && st_labels[h].key == k)
+			return (int)h;
+		if (u == 0 && __atomic_compare_exchange_n(&st_labels_used[h], &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
 			st_labels[h].key = k;
-			strncpy(st_labels[h].s, label, ST_LABEL_LEN - 1);
+			st_labels[h].rank = -1;
+			st_labels[h].s[0] = 0;
 			__atomic_store_n(&st_labels_used[h], 2, __ATOMIC_RELEASE);
-			return;
+			return (int)h;
+		}
+		while (__atomic_load_n(&st_labels_used[h], __ATOMIC_ACQUIRE) == 1)
+			;   /* another writer is filling this slot (a few stores) */
+		if (st_labels[h].key == k)
+			return (int)h;
+	}
+	return -1;
+}
+
+static int st_labels_wanted(void)
+{
+	return lithe_sched_trace_enabled() || parlib_tool_active();
+}
+
+void lithe_sched_trace_label_self(const char *label)
+{
+	int h;
+	if (!label || !st_labels_wanted())
+		return;
+	h = st_label_slot(lithe_sched_trace_ctx_key());
+	if (h >= 0 && !st_labels[h].s[0])   /* first writer wins */
+		strncpy(st_labels[h].s, label, ST_LABEL_LEN - 1);
+}
+
+void lithe_context_rank_self(int rank)
+{
+	int h;
+	if (!st_labels_wanted())
+		return;
+	h = st_label_slot(lithe_sched_trace_ctx_key());
+	if (h >= 0)
+		st_labels[h].rank = rank;
+}
+
+/* parlib tool describer (parlib/tool.h): context id, rank, label. Called from vcore
+ * context by the tool; reads only (never claims a slot). */
+int lithe_tool_describe(struct uthread *u, struct parlib_tool_uthread_info *out)
+{
+	lithe_context_t *c = (lithe_context_t *)u;   /* uth is the first member */
+	unsigned h, i;
+	out->id = c ? c->id : -1;
+	out->rank = -1;
+	out->label[0] = 0;
+	if (!c)
+		return 0;
+	h = ((uint32_t)c->id * 2654435761u) & (ST_LABELS - 1);
+	for (i = 0; i < ST_LABELS; i++, h = (h + 1) & (ST_LABELS - 1)) {
+		int s = __atomic_load_n(&st_labels_used[h], __ATOMIC_ACQUIRE);
+		if (s == 0)
+			break;
+		if (s == 2 && st_labels[h].key == (uint32_t)c->id) {
+			out->rank = st_labels[h].rank;
+			strncpy(out->label, st_labels[h].s, sizeof(out->label) - 1);
+			out->label[sizeof(out->label) - 1] = 0;
+			break;
 		}
 	}
+	return 0;
 }
 
 static const char *st_label_of(uint32_t k)
@@ -824,6 +882,20 @@ static void pf_clock_snapshot(pb_out_t *o)
  * This pass pairs, per context and in time across all harts, each dispatch with the
  * latest unblock since the previous dispatch; the emit pass reads the flow ids back
  * in record order. */
+/* The records a perfetto dump walks on one hart (2026-10-30). Harts keep recording while the
+ * dump runs, so once a ring has wrapped its oldest slots are being overwritten under the
+ * reader: pf_match_wakes counted one set of records and filled another -- more matches than
+ * it had allocated (heap overflow) or fewer (qsort over uninitialised pointers). Every
+ * GROMACS 2000-step trace segfaulted at exit and left 0-byte files
+ * (.build_logs/gmx_gompl_gap/core_run). A wrapped ring's oldest quarter is left out, so the
+ * passes read slots the writers will not reach during the dump. */
+static void pf_window(uint64_t seq, uint64_t *start, uint64_t *nrec)
+{
+	if (seq <= st_ring_cap) { *nrec = seq; *start = 0; return; }
+	*nrec = st_ring_cap - st_ring_cap / 4;
+	*start = seq - *nrec;
+}
+
 typedef struct { uint64_t ns, g, fid; uint32_t ctx; uint8_t disp; } pf_wake_t;
 static int pf_wake_cmp_ctx_time(const void *a, const void *b)
 {
@@ -850,7 +922,7 @@ static pf_wake_t *pf_match_wakes(const uint64_t *seqs, uint32_t pid, uint64_t *f
 	for (i = 0; i < st_n_vcores; i++) {
 		uint64_t seq = seqs[i], nrec, start;
 		if (seq == 0 || !st_rings[i]) continue;
-		if (seq <= st_ring_cap) { nrec = seq; start = 0; } else { nrec = st_ring_cap; start = seq - st_ring_cap; }
+		pf_window(seq, &start, &nrec);
 		for (k = 0; k < nrec; k++) {
 			uint8_t ev = st_rings[i][(start + k) & st_ring_mask].ev;
 			cnt += ev == LITHE_ST_CTX_UNBLOCK || pf_is_dispatch(ev);
@@ -865,15 +937,17 @@ static pf_wake_t *pf_match_wakes(const uint64_t *seqs, uint32_t pid, uint64_t *f
 	for (i = 0; i < st_n_vcores; i++) {
 		uint64_t seq = seqs[i], nrec, start;
 		if (seq == 0 || !st_rings[i]) continue;
-		if (seq <= st_ring_cap) { nrec = seq; start = 0; } else { nrec = st_ring_cap; start = seq - st_ring_cap; }
+		pf_window(seq, &start, &nrec);
 		for (k = 0; k < nrec; k++, g++) {
 			const lithe_sched_trace_rec_t *r = &st_rings[i][(start + k) & st_ring_mask];
 			int d = pf_is_dispatch(r->ev);
 			if (!d && r->ev != LITHE_ST_CTX_UNBLOCK) continue;
+			if (j == cnt) break; /* the record changed since the count: never overrun */
 			w[j].ns = r->ns; w[j].g = g; w[j].ctx = r->ctx_id; w[j].disp = (uint8_t)d;
 			ix[j] = &w[j]; j++;
 		}
 	}
+	cnt = j; /* and never sort slots the fill did not reach */
 	qsort(ix, cnt, sizeof(*ix), pf_wake_cmp_ctx_time);
 	for (c = 0; c < cnt; ) {
 		pf_wake_t *pend = NULL;
@@ -980,7 +1054,7 @@ int lithe_sched_trace_dump_perfetto(const char *path)
 		int cur = 0; /* 0 none, -1 idle, >0 ctx */
 		uint64_t last_ts = 0; /* last slice begin/end on this hart track */
 		if (seq == 0 || !st_rings[i]) continue;
-		if (seq <= st_ring_cap) { nrec = seq; start = 0; } else { nrec = st_ring_cap; start = seq - st_ring_cap; }
+		pf_window(seq, &start, &nrec);
 		total += nrec;
 		for (k = 0; k < nrec && !o.err; k++, g++) {
 			const lithe_sched_trace_rec_t *r = &st_rings[i][(start + k) & st_ring_mask];

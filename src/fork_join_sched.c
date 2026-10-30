@@ -660,6 +660,26 @@ static inline void fjs_vc_set_busy(int on)
 	if (v >= 0 && v < FJS_TOPO_MAX_VC)
 		__atomic_store_n(&fjs_vc_busy[v], (unsigned char)on, __ATOMIC_RELEASE);
 }
+/* GAPS B77: set by a hart from before it takes a context off a queue (runnable/warm count
+ * decremented) until that context is counted in running_count, so fjs_ledger_has_surplus,
+ * reading queued -> these -> running, never misses a context in transit. One line per vcore,
+ * written only by its own hart. */
+static struct { unsigned char on; } __attribute__((aligned(ARCH_CL_SIZE)))
+    fjs_vc_disp[FJS_TOPO_MAX_VC];
+static int fjs_vc_disp_hwm; /* 1 + highest vcore id that ever set its flag: bounds the scan */
+static inline void fjs_vc_set_disp(int on)
+{
+	int v = vcore_id();
+	if (v >= 0 && v < FJS_TOPO_MAX_VC) {
+		if (__builtin_expect(v >= __atomic_load_n(&fjs_vc_disp_hwm, __ATOMIC_RELAXED), 0)) {
+			int h = __atomic_load_n(&fjs_vc_disp_hwm, __ATOMIC_RELAXED);
+			while (h <= v && !__atomic_compare_exchange_n(&fjs_vc_disp_hwm, &h, v + 1, false,
+			                                              __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
+				;
+		}
+		__atomic_store_n(&fjs_vc_disp[v].on, (unsigned char)on, __ATOMIC_SEQ_CST);
+	}
+}
 static void fjs_l3_confine_init(void)
 {
 	/* Default: on for hosted multi-rank processes (LITHE_CONTEXT_RANKS_PER_HOST > 1), whose rank
@@ -1174,12 +1194,101 @@ static inline uint64_t fjs_steal_delay(void)
  * re-requests one when the delay expires: nested hosted miniFE (child FJS, IDLE_DIRECT=1)
  * hung 10/10 with STEAL_DELAY_US=5 (GAPS B73). Set per dequeue in __thread_dequeue. */
 static __thread bool fjs_steal_delay_live;
-/* Under tqlock: may a hart other than the home one take this queued context? */
-static inline bool fjs_steal_ok(lithe_fork_join_context_t *f)
+/* Set around the yield callback's re-enqueue so the queued-since stamp can mark it. */
+static __thread bool fjs_enq_yield;
+/* LITHE_FJS_STEAL_GRADE_US="c,n,f" (2026-10-27, default unset = one delay for every
+ * thief): the steal delay by the thief's distance from the context's home hart --
+ * c = same L3 (on MI300A/EPYC that is the chiplet, CCD), n = same NUMA node on another
+ * chiplet, f = another NUMA node. What a move loses grows with that distance (L2 only;
+ * the whole L3 working set over Infinity Fabric; remote DRAM), so a farther hart should
+ * wait longer before it takes a context whose home will be free soon. Unknown placement
+ * (unpinned vcore) counts as same L3. Overrides LITHE_FJS_STEAL_DELAY_US where set.
+ *
+ * LITHE_FJS_STEAL_IMB (bit mask, default 0): when waiting for the home hart is not
+ * worth the cache, i.e. load imbalance --
+ *   1  home hart has left this sched or is blocked in the kernel: steal at once
+ *      (nobody at home will run it before the delay expires);
+ *   2  divide the delay by the home queue's depth: a backlog of k means the home hart
+ *      owes k bursts before it gets to the tail, so a persistent imbalance drains early;
+ *   4  home hart busy running a context: use the chiplet delay (c) for every thief,
+ *      since the context cannot run at home until that burst ends anyway. */
+static int fjs_grade_ready;
+static uint64_t fjs_grade_ns[3];
+static int fjs_steal_imb;
+static int8_t fjs_vc_l3[FJS_TOPO_MAX_VC], fjs_vc_nd[FJS_TOPO_MAX_VC];
+static void fjs_grade_init(void)
+{
+	const char *e = getenv("LITHE_FJS_STEAL_GRADE_US");
+	fjs_grade_ns[0] = fjs_grade_ns[1] = fjs_grade_ns[2] = (uint64_t)-1;
+	if (e && *e) {
+		double v[3] = { 0, 0, 0 };
+		int n = sscanf(e, "%lf,%lf,%lf", &v[0], &v[1], &v[2]);
+		for (int i = 0; i < 3; i++)
+			fjs_grade_ns[i] = (uint64_t)((i < n ? v[i] : v[n > 0 ? n - 1 : 0]) * 1000.0);
+	}
+	e = getenv("LITHE_FJS_STEAL_IMB");
+	fjs_steal_imb = (e && *e) ? atoi(e) : 0;
+	for (int v = 0; v < FJS_TOPO_MAX_VC; v++)
+		fjs_vc_l3[v] = -1;
+	__atomic_store_n(&fjs_grade_ready, 1, __ATOMIC_RELEASE);
+}
+/* A vcore's chiplet is known only once it has been mapped to a CPU; look it up
+ * until then (cheap: parlib's table), and cache it after. */
+static inline int fjs_vc_l3_of(int v)
+{
+	int g = fjs_vc_l3[v];
+	if (__builtin_expect(g < 0, 0)) {
+		g = parlib_vcore_l3_group(v);
+		if (g >= 0) {
+			fjs_vc_nd[v] = (int8_t)parlib_vcore_numa_node(v);
+			__atomic_store_n(&fjs_vc_l3[v], (int8_t)g, __ATOMIC_RELEASE);
+		}
+	}
+	return g;
+}
+static inline int fjs_vc_dist(int a, int b)
+{
+	if (a < 0 || b < 0 || a >= FJS_TOPO_MAX_VC || b >= FJS_TOPO_MAX_VC)
+		return 0;
+	int ga = fjs_vc_l3_of(a), gb = fjs_vc_l3_of(b);
+	if (ga < 0 || gb < 0 || ga == gb)
+		return 0;
+	return (fjs_vc_nd[a] >= 0 && fjs_vc_nd[a] == fjs_vc_nd[b]) ? 1 : 2;
+}
+/* Under tqlock: may hart `thief` take this context queued on hart `home`? */
+static inline bool fjs_steal_ok(lithe_fork_join_sched_t *s, lithe_fork_join_context_t *f,
+                                int thief, int home)
 {
 	uint64_t d = fjs_steal_delay();
-	return d == 0 || !fjs_steal_delay_live || f->lpt_enq_ns == 0 ||
-	       fjs_lpt_now() - f->lpt_enq_ns >= d;
+	if (__builtin_expect(!__atomic_load_n(&fjs_grade_ready, __ATOMIC_ACQUIRE), 0))
+		fjs_grade_init();
+	if (fjs_grade_ns[0] != (uint64_t)-1) {
+		/* A yielder (bit 0) has no cache worth waiting for -- it is a waiter cycling
+		 * through the queue -- so it gets the chiplet delay from every thief. Grading it
+		 * too made the plain barrier across 2 sockets 3.7 -> 22.6 us (waiters yield). */
+		int c = (f->lpt_enq_ns & 1) ? 0 : fjs_vc_dist(thief, home);
+		if ((fjs_steal_imb & 4) && c && home < FJS_TOPO_MAX_VC &&
+		    __atomic_load_n(&fjs_vc_busy[home], __ATOMIC_RELAXED))
+			c = 0;
+		d = fjs_grade_ns[c];
+	}
+	if (d == 0 || !fjs_steal_delay_live || f->lpt_enq_ns == 0)
+		return true;
+	if (fjs_steal_imb & 1) {
+		if (!vconline_s(s, home) ||
+		    (parlib_vcores_blocked() > 0 && parlib_vcore_blocked(home)))
+			return true;
+	}
+	if ((fjs_steal_imb & 2) && tqsize_s(s, home) > 1)
+		d /= (uint64_t)tqsize_s(s, home);
+	return fjs_lpt_now() - f->lpt_enq_ns >= d;
+}
+/* Is any steal delay in force (base delay or a graded one)? */
+static inline bool fjs_steal_delay_any(void)
+{
+	if (__builtin_expect(!__atomic_load_n(&fjs_grade_ready, __ATOMIC_ACQUIRE), 0))
+		fjs_grade_init();
+	return fjs_steal_delay() || fjs_grade_ns[0] != (uint64_t)-1;
 }
 
 /* LITHE_FJS_WAKE_LOCAL (GAPS B62, default 0). A wake in a child scheduler walked
@@ -1224,14 +1333,58 @@ static inline int fjs_spinner_leave(lithe_fork_join_sched_t *s)
 	return 1;
 }
 
+/* LITHE_FJS_ENQ_NEAR=1 (2026-10-27, default 0): a context whose home hart has left
+ * this sched is queued on the nearest online hart (same chiplet, then same NUMA node;
+ * an idle one before a busy one at the same distance) instead of the next one round
+ * robin, which on a 96-core MI300A node is usually on another chiplet or socket. */
+static int fjs_enq_near = -1;
+static inline int fjs_enq_near_on(void)
+{
+	int v = __atomic_load_n(&fjs_enq_near, __ATOMIC_RELAXED);
+	if (v < 0) {
+		const char *e = getenv("LITHE_FJS_ENQ_NEAR");
+		v = (e && *e == '1') ? 1 : 0;
+		__atomic_store_n(&fjs_enq_near, v, __ATOMIC_RELAXED);
+	}
+	return v;
+}
+static int fjs_nearest_online(lithe_fork_join_sched_t *sched, int home)
+{
+	if (home < 0 || home >= FJS_TOPO_MAX_VC)
+		return -1;
+	if (!__atomic_load_n(&fjs_topo_ready[home], __ATOMIC_ACQUIRE))
+		fjs_topo_build(home, (int)max_vcores());
+	if (__builtin_expect(!__atomic_load_n(&fjs_grade_ready, __ATOMIC_ACQUIRE), 0))
+		fjs_grade_init();
+	int first = -1, fc = -1;
+	for (int k = 0; k < fjs_topo_n[home]; k++) {
+		int v = fjs_topo_order[home][k];
+		if (!vconline_s(sched, v))
+			continue;
+		int c = fjs_vc_dist(home, v);
+		if (first < 0) {
+			first = v;
+			fc = c;
+		}
+		if (c != fc)
+			break;
+		if (!__atomic_load_n(&fjs_vc_busy[v], __ATOMIC_RELAXED))
+			return v;
+	}
+	return first;
+}
+
 static int __thread_enqueue_on(lithe_fork_join_sched_t *sched,
                                lithe_fork_join_context_t *ctx, bool athead)
 {
 	assert(ctx->context.sched == (lithe_sched_t *)sched);
 	ctx->state = FJS_CTX_RUNNABLE;
 
-	if (ctx->preferred_vcq == -1 || !vconline_s(sched, ctx->preferred_vcq))
-		ctx->preferred_vcq = get_next_queue_id_for(sched);
+	if (ctx->preferred_vcq == -1 || !vconline_s(sched, ctx->preferred_vcq)) {
+		int near = ctx->preferred_vcq >= 0 && fjs_enq_near_on()
+		           ? fjs_nearest_online(sched, ctx->preferred_vcq) : -1;
+		ctx->preferred_vcq = near >= 0 ? near : get_next_queue_id_for(sched);
+	}
 	/* B42: never queue on a vcore blocked in the kernel (nobody would drain it). */
 	if (parlib_vcores_blocked() > 0) {
 		for (int k = 0; k < (int)max_vcores() && parlib_vcore_blocked(ctx->preferred_vcq); k++)
@@ -1246,8 +1399,10 @@ static int __thread_enqueue_on(lithe_fork_join_sched_t *sched,
 		TAILQ_INSERT_TAIL(&tqueue_s(sched, vcoreid), &ctx->context, link);
 	tqsize_s(sched, vcoreid)++;
 	fjs_lpt_count_in(sched, ctx);
-	if (fjs_steal_delay() && !fjs_lpt_on())
-		ctx->lpt_enq_ns = fjs_lpt_now(); /* queued-since, as LPT records it */
+	if (fjs_steal_delay_any() && !fjs_lpt_on()) {
+		/* queued-since, as LPT records it; bit 0 marks a yield re-enqueue (see fjs_steal_ok) */
+		ctx->lpt_enq_ns = (fjs_lpt_now() & ~1ull) | (fjs_enq_yield ? 1 : 0);
+	}
 	/* CHANGE 1: bump the O(1) any-runnable indicator under tqlock, so any
 	 * vcore that could find this context in the queue also observes count>0. */
 	__atomic_fetch_add(&sched->runnable_count, 1, __ATOMIC_SEQ_CST);
@@ -1292,6 +1447,7 @@ static __thread int fjs_wake_batch_harts;
 static __thread int fjs_wake_batch_wake;
 
 static int fjs_clamp_hart_request(lithe_fork_join_sched_t *s, int h);
+static void fjs_ledger_floor_heal(lithe_fork_join_sched_t *sched); /* GAPS B77 */
 
 void lithe_fork_join_wake_batch_begin(void)
 {
@@ -1329,6 +1485,9 @@ void lithe_fork_join_wake_batch_end(void)
 	}
 	if (w)
 		fjs_maybe_reactor_wake();
+	cur = lithe_sched_current();
+	if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs)
+		fjs_ledger_floor_heal((lithe_fork_join_sched_t *)cur);
 }
 
 /* Clamp positive hart demand to soft_cap - owned. Returns 0 when at/over
@@ -1385,7 +1544,8 @@ static void fjs_request_harts(int h)
 		cur = lithe_sched_current();
 		if (cur != NULL && cur->funcs == &lithe_fork_join_sched_funcs) {
 			h = fjs_clamp_hart_request((lithe_fork_join_sched_t *)cur, h);
-			if (h > 0 && fjs_wake_local_on() && fjs_wake_batch_depth <= 0) {
+			if (h > 0 && fjs_wake_local_on() &&
+			    fjs_wake_batch_depth <= 0) {
 				h -= fjs_claim_spinners((lithe_fork_join_sched_t *)cur, h);
 				if (h <= 0)
 					return;
@@ -1446,6 +1606,9 @@ static void schedule_context(lithe_fork_join_context_t *ctx, bool athead)
 	} else {
 		fjs_request_harts(1);
 	}
+	if (fjs_wake_batch_depth <= 0 && owner != NULL &&
+	    owner->funcs == &lithe_fork_join_sched_funcs)
+		fjs_ledger_floor_heal((lithe_fork_join_sched_t *)owner);
 	if (lithe_sched_trace_enabled()) {
 		lithe_fork_join_sched_t *s =
 			(lithe_fork_join_sched_t *)ctx->context.sched;
@@ -1885,7 +2048,7 @@ static lithe_fork_join_context_t *__thread_dequeue()
 			lithe_context_t *c = TAILQ_FIRST(&tqueue(v));
 			for (int k = 0; c && k < FJS_LPT_SCAN; k++, c = TAILQ_NEXT(c, link)) {
 				lithe_fork_join_context_t *f = (lithe_fork_join_context_t *)c;
-				if (v != me && !fjs_steal_ok(f))
+				if (v != me && !fjs_steal_ok(cur, f, me, v))
 					continue;
 				if (!best || fjs_lpt_key(f) > fjs_lpt_key(best)) {
 					best = f;
@@ -1919,7 +2082,7 @@ static lithe_fork_join_context_t *__thread_dequeue()
 	lithe_fork_join_context_t *ctx = NULL;
 	int local_tq;
 
-	if (fjs_steal_delay())
+	if (fjs_steal_delay_any())
 		fjs_steal_delay_live = !fjs_idle_direct(cur);
 
 	/* ORPHANED QUEUES (B42, with PARLIB_SPARE_VCORES): a vcore whose OS thread is
@@ -1995,12 +2158,13 @@ static lithe_fork_join_context_t *__thread_dequeue()
 		{
 			lithe_fork_join_context_t *ctx = NULL;
 			int num_to_steal = (tqsize(vcoreid) + 1) / 2;
-			if (num_to_steal && fjs_steal_delay()) {
+			if (num_to_steal && fjs_steal_delay_any()) {
 				lithe_context_t *h;
 				bool ok;
 				spin_pdr_lock(&tqlock(vcoreid));
 				h = TAILQ_FIRST(&tqueue(vcoreid));
-				ok = h && fjs_steal_ok((lithe_fork_join_context_t *)h);
+				ok = h && fjs_steal_ok(cur, (lithe_fork_join_context_t *)h,
+				                       vcore_id(), vcoreid);
 				spin_pdr_unlock(&tqlock(vcoreid));
 				if (!ok)
 					return NULL;
@@ -2084,8 +2248,11 @@ static lithe_fork_join_context_t *__thread_dequeue()
 		}
 	}
 	if (yielder) {
-		if (ctx)
+		if (ctx) {
+			fjs_enq_yield = true;
 			__thread_enqueue_on(cur, yielder, false);  /* stays on this hart's queue */
+			fjs_enq_yield = false;
+		}
 		else
 			ctx = yielder;
 	}
@@ -2873,6 +3040,93 @@ static int fjs_any_child_needs_hart(lithe_fork_join_sched_t *sched)
 	return need;
 }
 
+/* GAPS B77 (2026-10-28) LITHE_FJS_RELEASE_LEDGER (DEFAULT 1, =0 restores the old rule): the
+ * idle-yield "surplus" release below decided on OWNED harts (owned > queued + 2) but
+ * decrements the NEEDED ledger -- which every context_block / context_exit has already
+ * lowered for the context that left. A worker that blocks paid -1, then its hart, finding the
+ * queue empty while the others still held their harts, paid -1 again on the way out. Base
+ * floors the root ledger at 0, so it settles below real demand: after a serial gap, the next
+ * fork's N unblocks brought needed to N-1 and one woken worker sat RUNNABLE with a hart
+ * parked offline (gdb: needed=3 granted=3 running=3 runnable=1). With libomp's own barriers
+ * that is latency -- the next hart into the scheduler picks it up -- but oneDNN's JIT kernels
+ * spin on a barrier of all team members, and nobody enters the scheduler: PyTorch resnet_train
+ * on Lithe libomp hung 3/3 since NOSPIN=2 parks workers each region (10-26);
+ * .build_logs/hpctk/baselines/hang_ai/spinbar.c hangs 11/12 in < 1 s. The release now also
+ * requires the ledger to exceed what the scheduler can use: contexts running on its harts,
+ * queued and warm work, children's needs. Unknown ledger (parent not FJS / base) = old rule. */
+/* Harts the scheduler can use now: contexts queued (`queued`, read first by the caller), in
+ * dispatch (fjs_vc_disp), running, and its children's holdings or wants -- read in the order
+ * contexts move (queue -> dispatch -> running), so one in transit is counted at least once. */
+static long fjs_ledger_use(lithe_fork_join_sched_t *sched, long queued)
+{
+	long use = queued;
+	int mv = __atomic_load_n(&fjs_vc_disp_hwm, __ATOMIC_SEQ_CST); /* set before the flag */
+	for (int v = 0; v < mv && v < FJS_TOPO_MAX_VC; v++)
+		use += __atomic_load_n(&fjs_vc_disp[v].on, __ATOMIC_SEQ_CST);
+	use += __atomic_load_n(&sched->running_count, __ATOMIC_SEQ_CST);
+	if (!TAILQ_EMPTY(&sched->child_sched_list)) {
+		lithe_sched_t *child;
+		spin_pdr_lock(&sched->child_sched_list_lock);
+		TAILQ_FOREACH(child, &sched->child_sched_list, link) {
+			long cg = *(uint16_t *)&child->parent_data;
+			long cn = *((uint16_t *)&child->parent_data + 1);
+			use += cn > cg ? cn : cg; /* harts it holds, or more if it wants them */
+		}
+		spin_pdr_unlock(&sched->child_sched_list_lock);
+	}
+	return use;
+}
+
+static int fjs_release_ledger = -1;
+static int fjs_ledger_has_surplus(lithe_fork_join_sched_t *sched, long queued)
+{
+	if (__builtin_expect(fjs_release_ledger < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_RELEASE_LEDGER");
+		fjs_release_ledger = !(e && e[0] == '0');
+	}
+	if (!fjs_release_ledger)
+		return 1;
+	long needed;
+	lithe_sched_t *p = sched->sched.parent;
+	if (p == NULL)
+		return 1;
+	if (p->funcs == &lithe_fork_join_sched_funcs)
+		needed = *((uint16_t *)&sched->sched.parent_data + 1);
+	else if ((void *)sched == (void *)lithe_root_fj_sched)
+		needed = lithe_root_harts_needed();
+	else
+		return 1;
+	return needed > fjs_ledger_use(sched, queued);
+}
+
+/* GAPS B77 ledger floor (LITHE_FJS_LEDGER_FLOOR, DEFAULT 1, =0 disables): on every wake of the
+ * root FJS (schedule_context, or the end of a team-release batch), raise base's needed ledger to
+ * what the scheduler can use if it has drifted below. The incremental +1/-1 accounting has
+ * several windows that each lose a unit (above, and the block / dispatch transits); a lost unit
+ * only strands work when a context becomes runnable while every owned hart is busy, i.e. at a
+ * wake -- so checking there closes all of them. Cost: max_vcores() byte loads per wake on the
+ * root only. Child schedulers keep the old accounting (their heals live in hart_enter). */
+static int fjs_ledger_floor = -1;
+static void fjs_ledger_floor_heal(lithe_fork_join_sched_t *sched)
+{
+	if (__builtin_expect(fjs_ledger_floor < 0, 0)) {
+		const char *e = getenv("LITHE_FJS_LEDGER_FLOOR");
+		fjs_ledger_floor = !(e && e[0] == '0');
+	}
+	if (!fjs_ledger_floor || sched == NULL || (void *)sched != (void *)lithe_root_fj_sched)
+		return;
+	long queued = __atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) +
+	              __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST);
+	long use = fjs_ledger_use(sched, queued);
+	long needed = lithe_root_harts_needed();
+	if (needed < use) {
+		if (lithe_sched_trace_enabled()) /* B77 ledger: -104 = floor heal by ctx_id */
+			lithe_sched_trace_emit(LITHE_ST_HART_REQUEST, sched, (uint32_t)(use - needed),
+			                       LITHE_ST_DEC_OK, -104);
+		lithe_hart_request_for(&sched->sched, (int)(use - needed));
+	}
+}
+
 /* Try to grant one hart to child; may not return if grant succeeds. */
 static void fjs_try_hart_grant_child(lithe_fork_join_sched_t *sched,
                                      lithe_sched_t *child)
@@ -2988,6 +3242,7 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
       }
     }
   }
+  fjs_vc_set_disp(1);
   if (__atomic_load_n(&sched->warm_ready_count, __ATOMIC_ACQUIRE) > 0) {
     lithe_fork_join_context_t *w = fjs_warm_claim(sched, vcore_id());
     if (w != NULL) {
@@ -2999,6 +3254,7 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
                                (uint32_t)w->context.id, LITHE_ST_DEC_OK, 0);
       fjs_stats_run_enter();
       __atomic_fetch_add(&sched->running_count, 1, __ATOMIC_SEQ_CST);
+      fjs_vc_set_disp(0);
       fjs_vc_set_busy(1);
       lithe_context_run(&w->context);
     }
@@ -3025,9 +3281,11 @@ static void fjs_hart_run_warm_or_dequeue(lithe_fork_join_sched_t *sched)
     fjs_lpt_start(ctx);
     fjs_stats_run_enter();
     __atomic_fetch_add(&sched->running_count, 1, __ATOMIC_SEQ_CST);
+    fjs_vc_set_disp(0);
       fjs_vc_set_busy(1);
     lithe_context_run(&ctx->context);
   }
+  fjs_vc_set_disp(0);
 }
 
 /* PARENT-STARVATION YIELD (2026-10-15, env LITHE_FJS_PARENT_STARVE_YIELD=1,
@@ -3575,8 +3833,9 @@ idle_park_again:
     soft_cap2 = fjs_soft_hart_cap;
     if (parlib_reactor_pending() > 0)
       demand2 += 1;
-    if (owned2 > demand2 + 1 ||
-        (soft_cap2 > 0 && owned2 > (long)soft_cap2)) {
+    if ((owned2 > demand2 + 1 ||
+         (soft_cap2 > 0 && owned2 > (long)soft_cap2)) &&
+        fjs_ledger_has_surplus(sched, demand2 - 1 /* queued + warm + reactor */)) {
       /* Deferred to after the LOST-WAKEUP GUARD below: releasing here and
        * then restarting either drains the needed ledger (no rebalance) or
        * pays a full lithe_hart_request(+1) tree walk + reactor-wake
@@ -3665,12 +3924,20 @@ fjs_idle_leave:
   /* Truly leaving: only now release surplus demand (see deferred note
    * above) so restarts never drain or churn the needed ledger. */
   if (idle_yield_released_demand) {
+    if (lithe_sched_trace_enabled()) /* B77 ledger: aux -101 = idle-yield release */
+      lithe_sched_trace_emit(LITHE_ST_HART_REQUEST, sched, (uint32_t)-1, LITHE_ST_DEC_OK, -101);
     lithe_hart_request(-1);
     if (fjs_interfere_on())
       __sync_fetch_and_add(&fjs_cnt_hart_request_release, 1);
   }
   vconline(vcore_id()) = false;
   lithe_hart_yield();
+}
+
+static inline void fjs_block_leave(lithe_fork_join_sched_t *sched)
+{
+	__atomic_fetch_sub(&sched->running_count, 1, __ATOMIC_SEQ_CST);
+	fjs_vc_set_busy(0);
 }
 
 void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
@@ -3689,13 +3956,14 @@ void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
 	if (lithe_wake_hint_enabled())
 		ctx->preferred_vcq = vcore_id();
 	fjs_stats_run_leave();
-	__atomic_fetch_sub(&((lithe_fork_join_sched_t *)__this)->running_count, 1,
-	                   __ATOMIC_SEQ_CST);
-	fjs_vc_set_busy(0);
 	if (lithe_sched_trace_enabled())
 		lithe_sched_trace_emit(LITHE_ST_CTX_BLOCK, __this,
 		                       (uint32_t)c->id, LITHE_ST_DEC_OK, 0);
-	/* NEEDED-LEDGER DRIFT FIX: wake-side +1s can be clamped at soft_cap
+	/* GAPS B77: the ledger release below comes BEFORE running_count drops (fjs_block_leave),
+	 * so fjs_ledger_has_surplus never sees this context gone from running_count while its
+	 * unit is still in `needed` -- it did, 3.5 us apart in the trace, and an idle hart
+	 * released that unit a second time (needed 0 under a running master; hang).
+	 * NEEDED-LEDGER DRIFT FIX: wake-side +1s can be clamped at soft_cap
 	 * while this -1 was unconditional, so the parent's harts_needed
 	 * drifted below true demand over clamped park/wake cycles and grants
 	 * stopped with RUNNABLE work queued (hosted miniFE P1K4 nx=80: live
@@ -3714,10 +3982,17 @@ void lithe_fork_join_sched_context_block(lithe_sched_t *__this,
 	{
 		lithe_fork_join_sched_t *sched = (lithe_fork_join_sched_t *)__this;
 		if (__atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) > 0 ||
-		    __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) > 0)
+		    __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) > 0) {
+			if (lithe_sched_trace_enabled()) /* B77 ledger: -103 = block kept demand */
+				lithe_sched_trace_emit(LITHE_ST_HART_REQUEST, sched, 0, LITHE_ST_DEC_OK, -103);
+			fjs_block_leave(sched);
 			return;
+		}
+		if (lithe_sched_trace_enabled()) /* B77 ledger: -102 = block released */
+			lithe_sched_trace_emit(LITHE_ST_HART_REQUEST, sched, (uint32_t)-1, LITHE_ST_DEC_OK, -102);
+		lithe_hart_request(-1);
+		fjs_block_leave(sched);
 	}
-	lithe_hart_request(-1);
 }
 
 void lithe_fork_join_sched_context_unblock(lithe_sched_t *__this,
@@ -3789,7 +4064,9 @@ void lithe_fork_join_sched_context_yield(lithe_sched_t *__this,
 	/* Enqueue only (no hart_request): the yielding hart reenters. Siblings
 	 * may be in timed idle park on wake_efd; without a poke they wait out
 	 * the timeout (HOSTED_FULLCORE soft_cap idle → ms-scale floors). */
+	fjs_enq_yield = true;
 	__thread_enqueue(ctx, false);
+	fjs_enq_yield = false;
 	fjs_maybe_reactor_wake();
 	/* LITHE_FJS_YIELD_REQUEST=1 (default 1 since 2026-10-27, B71): a yield is not
 	 * demand-aware -- it never requests a hart, so when waiters yield instead
@@ -3820,18 +4097,20 @@ void lithe_fork_join_sched_context_exit(lithe_sched_t *__this,
   lithe_fork_join_context_t *ctx = (void*)c;
   assert(ctx->state == FJS_CTX_RUNNING);
   fjs_stats_run_leave();
-  __atomic_fetch_sub(&sched->running_count, 1, __ATOMIC_SEQ_CST);
-  fjs_vc_set_busy(0);
   if (c != sched->sched.main_context) {
     /* NEEDED-LEDGER DRIFT FIX: same rule as context_block — keep the
-     * demand while RUNNABLE/warm work is queued (see comment there). */
+     * demand while RUNNABLE/warm work is queued (see comment there).
+     * GAPS B77: release before running_count drops, as in context_block. */
     if (__atomic_load_n(&sched->runnable_count, __ATOMIC_SEQ_CST) <= 0 &&
         __atomic_load_n(&sched->warm_ready_count, __ATOMIC_SEQ_CST) <= 0)
       lithe_hart_request(-1);
+    fjs_block_leave(sched);
     int daemon = __atomic_load_n(&ctx->daemon, __ATOMIC_ACQUIRE);
     lithe_fork_join_context_destroy(ctx);
     if (!daemon)
       lithe_fork_join_sched_join_one(sched);
+  } else {
+    fjs_block_leave(sched);
   }
 }
 

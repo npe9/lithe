@@ -26,6 +26,7 @@
 
 #include <parlib/parlib.h>
 #include <parlib/reactor.h>
+#include <parlib/tool.h>
 #include "lithe.h"
 #include "fatal.h"
 #include "internal/assert.h"
@@ -71,8 +72,15 @@ struct schedule_ops lithe_sched_ops = {
 static lithe_context_t lithe_main_context;
 
 /* A statically defined global used to assign the next id to a newly
- * initialized context */
-static size_t next_context_id = 0;
+ * initialized context. Starts at 1 (id 0 is the main context, which is never
+ * reinitialised and keeps its zero-initialised id) and is atomic. Until
+ * 2026-10-27 it started at 0, so the first created context shared id 0 with the
+ * main context, and the plain ++ could race between harts. The Perfetto trace
+ * keys contexts by id and merged two contexts into one "ctx 0" that seemed to
+ * change hart ~2x per region (LULESH T8: 20k "moves"; debug counters showed two
+ * contexts, each dequeued on its own hart). Fork staleness (lithe_fork_keep) and
+ * the blocked-site table key by id as well. */
+static size_t next_context_id = 1;
 
 /* Lithe's base scheduler functions */
 static void base_hart_request(lithe_sched_t *this, lithe_sched_t *child, int h);
@@ -140,6 +148,15 @@ static __thread struct {
 static pthread_once_t lithe_lib_once = PTHREAD_ONCE_INIT;
 static bool lithe_initialized = false;
 
+/* Profiling tools (parlib/tool.h) ask Lithe what a uthread is; both init paths. */
+static void lithe_tool_register(void)
+{
+  extern int lithe_tool_describe(struct uthread *u, struct parlib_tool_uthread_info *out);
+  extern void __lithe_context_start_base(void);
+  parlib_tool_set_describer(lithe_tool_describe);
+  parlib_tool_add_stack_base((void *)__lithe_context_start_base);
+}
+
 static void lithe_lib_init_impl(void)
 {
   /* Create a lithe context for the main thread to run in */
@@ -151,6 +168,8 @@ static void lithe_lib_init_impl(void)
 
   /* Publish our sched_ops, overriding the defaults */
   sched_ops = &lithe_sched_ops;
+
+  lithe_tool_register();
 
   /* fork() support: reset schedulers in the child (see lithe_fork_child). */
   {
@@ -240,6 +259,7 @@ void lithe_lib_init_real()
 
   /* Publish our sched_ops, overriding the defaults */
   sched_ops = &lithe_sched_ops;
+  lithe_tool_register();
 
   /* Handle syscall events. */
   /* These functions are declared in parlib for simulating async syscalls on linux */
@@ -402,6 +422,16 @@ static void lithe_handle_syscall(struct event_msg *ev_msg, unsigned int ev_type)
 }
 
 static void __lithe_hart_grant(lithe_sched_t *child, void (*unlock_func) (void *), void *lock);
+static inline int base_yield_recheck_on(void)
+{
+  static int v = -1;
+  if (__builtin_expect(v < 0, 0)) {
+    const char *e = getenv("LITHE_BASE_YIELD_RECHECK");
+    v = !(e && e[0] == '0');
+  }
+  return v;
+}
+
 static void base_hart_enter(lithe_sched_t *__this)
 {
   // This function will never return.  Either we eventually yield the vcore
@@ -452,6 +482,24 @@ static void base_hart_enter(lithe_sched_t *__this)
     // to the root scheduler again
     atomic_add(&__this->harts, -1);
     current_sched = NULL;
+    // GAPS B77 (2026-10-28) LITHE_BASE_YIELD_RECHECK (default 1, =0 disables): the
+    // speculative root->harts +1 above makes the grant check one-sided. A concurrent
+    // base_hart_request adds to `needed` after our read of it, then reads `have` while
+    // our +1 is still counted, sees no deficit and wakes nobody; we undo the +1 and
+    // park. The request is lost: 4 OpenMP workers on 4 harts, one woken worker
+    // RUNNABLE with needed=4 granted=3 and the fourth vcore parked, a hang under
+    // oneDNN's spin barriers (.build_logs/hpctk/baselines/hang_ai). Re-reading
+    // `needed` after the undo closes it: the requester's add precedes its read of
+    // `have`, which precedes our undo, so we see the add and loop to grant.
+    if (base_yield_recheck_on() &&
+        parlib_atomic_read(&root_sched_ref_count) > 0 && root_sched &&
+        (long)parlib_atomic_read(&root_sched_harts_needed) >
+            (long)parlib_atomic_read(&root_sched->harts)) {
+      current_sched = &base_sched;
+      atomic_add(&__this->harts, 1);
+      cpu_relax();
+      continue;
+    }
     maybe_vcore_yield();
     current_sched = &base_sched;
     atomic_add(&__this->harts, 1);
@@ -633,14 +681,20 @@ static void base_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h
 
   if (h < 0) {
     /* Floor at 0: idle-yield release must not underflow the demand ceiling. */
+    long cur, neu;
     for (;;) {
-      long cur = parlib_atomic_read(&root_sched_harts_needed);
-      long neu = cur + (long)h;
+      cur = parlib_atomic_read(&root_sched_harts_needed);
+      neu = cur + (long)h;
       if (neu < 0)
         neu = 0;
       if (parlib_atomic_cas(&root_sched_harts_needed, cur, neu))
         break;
     }
+    if (lithe_sched_trace_enabled())
+      lithe_sched_trace_emit(LITHE_ST_BASE_REQUEST, root_sched,
+                             (uint32_t)(((neu & 0xffff) << 16) |
+                                        ((root_sched ? parlib_atomic_read(&root_sched->harts) : 0) & 0xffff)),
+                             0, (int32_t)(h - 1000)); /* aux <= -1001: release of -h */
     return;
   }
 
@@ -1122,6 +1176,10 @@ static void __lithe_context_finished(uthread_t *uthread, void *__arg)
   current_sched->funcs->context_exit(current_sched, context);
 }
 
+static void __lithe_context_start();
+/* The base of every Lithe context stack, for profilers (parlib/tool.h). */
+void __lithe_context_start_base(void) __attribute__((alias("__lithe_context_start")));
+
 static void __lithe_context_start()
 {
   assert(current_context);
@@ -1145,7 +1203,7 @@ static inline void __lithe_context_reinit(lithe_context_t *context, lithe_sched_
   uthread_init(&context->uth);
 
   /* Assign the context a new id */
-  context->id = next_context_id++;
+  context->id = (int)__atomic_fetch_add(&next_context_id, 1, __ATOMIC_RELAXED);
 
   /* Initialize the fields associated with a lithe context */
   __lithe_context_fields_init(context, sched);
@@ -1342,7 +1400,7 @@ extern void lithe_fork_join_after_fork(lithe_sched_t *root, lithe_sched_t *cur,
 void lithe_fork_child(int vcoreid)
 {
   lithe_context_t *cur = vcoreid >= 0 ? current_context : NULL;
-  lithe_fork_thresh = (int)next_context_id;
+  lithe_fork_thresh = (int)__atomic_load_n(&next_context_id, __ATOMIC_RELAXED);
   lithe_fork_keep = cur ? cur->id : -1;
   {
     extern void lithe_futex_after_fork(void);

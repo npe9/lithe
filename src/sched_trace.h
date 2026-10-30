@@ -159,6 +159,9 @@ uint32_t lithe_sched_trace_ctx_key(void);
  * table is full or tracing is off). phase_begin/end: emit PHASE_BEGIN/END for the current
  * context. All are no-ops when tracing is off; call intern once and keep the id. */
 void lithe_sched_trace_label_self(const char *label);
+/* Tag the current context with an application rank (hosted MPI rank), for profiling
+ * tools (parlib/tool.h). Kept when tracing is on or a tool is registered. */
+void lithe_context_rank_self(int rank);
 int32_t lithe_sched_trace_intern(const char *name);
 void lithe_sched_trace_phase_begin(int32_t id);
 void lithe_sched_trace_phase_end(void);
