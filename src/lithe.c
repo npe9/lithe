@@ -19,10 +19,12 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 #include <parlib/parlib.h>
 #include <parlib/reactor.h>
@@ -1108,14 +1110,38 @@ void lithe_sched_exit()
 struct lithe_fork_join_sched;
 struct lithe_fork_join_sched *lithe_root_fork_join_sched_if_any(void);
 
+/* A foreign thread under a running Lithe scheduler is a porting gap (CLAUDE.md rule 10): report
+ * it once. LITHE_FOREIGN_WARN: 1 (default) one line on stderr, 0 silent, 2 abort (find the
+ * creator in the core). */
+static void lithe_foreign_caller_report(const char *where)
+{
+  static int reported;
+  const char *e = getenv("LITHE_FOREIGN_WARN");
+  long mode = e && *e ? atol(e) : 1;
+  char msg[256];
+  int n;
+
+  if (mode == 0 || __atomic_exchange_n(&reported, 1, __ATOMIC_RELAXED))
+    return;
+  n = snprintf(msg, sizeof msg, "lithe: foreign thread (tid %ld, not a hart or Lithe context) "
+               "in %s: port its creator to lithe context create (CLAUDE.md rule 10)\n",
+               (long)syscall(SYS_gettid), where);
+  if (n > 0 && write(2, msg, (size_t)n < sizeof msg ? (size_t)n : sizeof msg - 1) < 0)
+    { /* nothing to do */ }
+  if (mode == 2)
+    abort();
+}
+
 void lithe_hart_request(int h)
 {
   if (current_sched == NULL) {
-    /* A foreign thread (a plain pthread, e.g. a Python thread calling into an OpenMP
-     * runtime) has no current scheduler. The runtimes put such a caller's workers in the
-     * process's root fork-join scheduler, so attribute the demand there. Lithe libomp's
-     * fork barrier reached here and dereferenced NULL (PyTorch concurrent inference,
-     * scikit-learn under joblib threads; bench/ai/omp_foreign_roots.c). */
+    /* A foreign thread (a plain pthread, e.g. a stock Python thread calling into an OpenMP
+     * runtime) has no current scheduler. Correctness guard, not a supported mode: the runtimes
+     * put such a caller's workers in the process's root fork-join scheduler, so attribute the
+     * demand there rather than dereference NULL (Lithe libomp's fork barrier did: PyTorch
+     * concurrent inference, scikit-learn under joblib threads; bench/ai/omp_foreign_roots.c),
+     * and report it. On the lithified arms (lpys, lpysg, lith, lithg) no caller reaches here. */
+    lithe_foreign_caller_report("lithe_hart_request");
     lithe_sched_t *root = (lithe_sched_t *)lithe_root_fork_join_sched_if_any();
     if (root != NULL)
       lithe_hart_request_for(root, h);
